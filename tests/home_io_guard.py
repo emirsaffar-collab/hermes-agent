@@ -58,6 +58,20 @@ class HomeIOGuard:
             if metadata and absolute.is_relative_to("/proc"):
                 return
             roots = self.roots()
+            # estate-guard-allows (26/9): default-install-layouten (install.sh
+            # INSTALL_DIR=$HERMES_HOME/hermes-agent, repot INUTI hemmet — upstreams CI
+            # kör aldrig så och ser aldrig dessa; kvitto 26/9: 100 testfel på riktiga
+            # trädet, 0 på ren upstream i /tmp-worktree). Två probeklasser måste vara
+            # lagliga där, annars dör hela suiten vid import (hermes_bootstrap ->
+            # pm.activate_dependencies):
+            #   (a) pm/environments.payload_venv probe:ar <hem>/manifest.json —
+            #       installer-skriven fil, ej användartillstånd; endast metadata-stat.
+            #   (b) uppdateringstest-scratch under utcheckningens egna .git, inkl.
+            #       .git/worktrees/... admin-kataloger för länkade worktrees.
+            if metadata and any(absolute == Path(root) / "manifest.json" for root in roots):
+                return
+            if any(absolute.is_relative_to(prefix / ".git") for prefix in _INTERPRETER_PREFIXES):
+                return
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
@@ -81,6 +95,10 @@ class HomeIOGuard:
             if any(absolute.is_relative_to(root) for root in roots):
                 self.refuse(value)
             resolved = absolute.resolve()
+            if metadata and any(resolved == Path(root) / "manifest.json" for root in roots):
+                return
+            if any(resolved.is_relative_to(prefix / ".git") for prefix in _INTERPRETER_PREFIXES):
+                return
             if metadata and resolved in roots:
                 return
             # A fixture symlink to the running interpreter resolves into its installation.
