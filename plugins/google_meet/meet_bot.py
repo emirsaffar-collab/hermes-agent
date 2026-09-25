@@ -28,6 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
+from hermes_cli.browser_runtime import chromium_executable
 from utils import atomic_json_write
 
 # Short three-segment code, a lookup URL, or /new. Anything else is rejected.
@@ -718,7 +719,7 @@ def run_bot() -> int:
     except ImportError as e:
         state.set(error=f"playwright not installed: {e}", exited=True)
         sys.stderr.write("google_meet bot: playwright is not installed. Run "
-                         "`pip install playwright && python -m playwright install chromium`\n")
+                         "`hermes meet install`\n")
         if rt["bridge"]:
             rt["bridge"].teardown()
         return 3
@@ -767,7 +768,8 @@ def run_bot() -> int:
                 launch_kwargs["ignore_default_args"] = ["--mute-audio"]
                 chrome_args.append("--autoplay-policy=no-user-gesture-required")
                 launch_kwargs["args"] = chrome_args
-            browser = pw.chromium.launch(**launch_kwargs)
+            browser = pw.chromium.launch(
+                channel="chromium", executable_path=chromium_executable(), **launch_kwargs)
             context = browser.new_context(**context_args)
             if cfg.rtc_audio:
                 context.add_init_script(_RTC_HOOK_JS)
