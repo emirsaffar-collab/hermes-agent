@@ -25,6 +25,25 @@ _INTERPRETER_PREFIXES = tuple({
     # trips on its first traceback.
     Path(__file__).resolve().parent.parent,
 })
+# The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
+# Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
+# resolve once at import, as before: they are fixed for the process lifetime.
+_normcase = os.path.normcase
+_INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
+
+
+def _within(path: str, prefix: str) -> bool:
+    """``Path(path).is_relative_to(prefix)`` for two normalized, case-folded absolute strings."""
+    if path == prefix:
+        return True
+    return path.startswith(prefix) if prefix == os.sep else path.startswith(prefix + os.sep)
+
+
+def _contains(path: str, prefix: str) -> bool:
+    """``Path(prefix).is_relative_to(path)``: *path* is *prefix* or one of its ancestors."""
+    if path == prefix:
+        return True
+    return prefix.startswith(path) if path == os.sep else prefix.startswith(path + os.sep)
 
 
 class HomeIOGuard:
@@ -38,26 +57,26 @@ class HomeIOGuard:
             return
         self.checking.active = True
         try:
-            candidate = Path(os.fsdecode(value))
-            if candidate.parts and candidate.parts[0].startswith("~"):
+            candidate = os.fsdecode(value)
+            if candidate.startswith("~"):
                 # A test may have patched Path.expanduser to fail; the guard must not
                 # turn that into its own crash — the unexpanded path is checked instead.
                 try:
-                    candidate = candidate.expanduser()
+                    candidate = os.fspath(Path(candidate).expanduser())
                 except Exception:
                     pass
-            if dir_fd is not None and not candidate.is_absolute():
+            if dir_fd is not None and not os.path.isabs(candidate):
                 parent = self.directories.get(dir_fd)
                 if parent is None:
                     raise AssertionError("TEST BUG: untracked dir_fd in guarded filesystem I/O")
-                candidate = parent / candidate
-            absolute = Path(os.path.abspath(candidate))
+                candidate = os.path.join(os.fspath(parent), candidate)
+            absolute = _normcase(os.path.abspath(candidate))
             # /proc/<pid>/fd/N is descriptor inspection (deleted-WAL holder scans stat the magic
             # link to compare inode identity); resolving it names whatever file that fd holds,
             # which is not I/O against the home.
-            if metadata and absolute.is_relative_to("/proc"):
+            if metadata and (absolute == "/proc" or absolute.startswith("/proc" + os.sep)):
                 return
-            roots = self.roots()
+            roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
             # estate-guard-allows (26/9): default-install-layouten (install.sh
             # INSTALL_DIR=$HERMES_HOME/hermes-agent, repot INUTI hemmet — upstreams CI
             # kör aldrig så och ser aldrig dessa; kvitto 26/9: 100 testfel på riktiga
@@ -68,10 +87,13 @@ class HomeIOGuard:
             #       installer-skriven fil, ej användartillstånd; endast metadata-stat.
             #   (b) uppdateringstest-scratch under utcheckningens egna .git, inkl.
             #       .git/worktrees/... admin-kataloger för länkade worktrees.
-            if metadata and any(absolute == Path(root) / "manifest.json" for root in roots):
+            # Strängidom (upstream 02f57212 "strings, not pathlib"): samma
+            # tillstånd, normcase-jämförelser istället för pathlib.
+            if metadata and any(absolute == _normcase(os.path.join(root, "manifest.json")) for root in roots):
                 return
-            if any(absolute.is_relative_to(prefix / ".git") for prefix in _INTERPRETER_PREFIXES):
+            if any(_within(absolute, os.path.join(prefix, ".git")) for prefix in _INTERPRETER_PREFIX_STRS):
                 return
+
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
@@ -82,30 +104,37 @@ class HomeIOGuard:
             if metadata:
                 path = os.environ.get("PATH", "")
                 cwd = os.getcwd() if self._relative_path_entries(path) else None
-                if absolute.parent in self._path_entries(path, cwd):
+                if os.path.dirname(absolute) in self._path_entries(path, cwd):
                     return
             # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
             # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
             # realpath() walking up through its ancestors.
-            if any(absolute.is_relative_to(prefix) or (metadata and prefix.is_relative_to(absolute))
-                   for prefix in _INTERPRETER_PREFIXES):
-                return
+            for prefix in _INTERPRETER_PREFIX_STRS:
+                if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
+                    return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
-            if any(absolute.is_relative_to(root) for root in roots):
-                self.refuse(value)
-            resolved = absolute.resolve()
-            if metadata and any(resolved == Path(root) / "manifest.json" for root in roots):
+            for root in roots:
+                if _within(absolute, root):
+                    self.refuse(value)
+            resolved = _normcase(os.path.realpath(absolute))
+            # estate-guard-allows (26/9), resolved-sida: manifest.json-probe och
+            # uppdateringsscratch under utcheckningens .git gäller även efter
+            # realpath (länkade worktrees pekar mot huvudträdets .git-admin).
+            if metadata and any(resolved == _normcase(os.path.join(root, "manifest.json")) for root in roots):
                 return
-            if any(resolved.is_relative_to(prefix / ".git") for prefix in _INTERPRETER_PREFIXES):
+            if any(_within(resolved, os.path.join(prefix, ".git")) for prefix in _INTERPRETER_PREFIX_STRS):
                 return
+
             if metadata and resolved in roots:
                 return
             # A fixture symlink to the running interpreter resolves into its installation.
-            if any(resolved.is_relative_to(prefix) for prefix in _INTERPRETER_PREFIXES):
-                return
-            if any(resolved.is_relative_to(root) for root in roots):
-                self.refuse(value)
+            for prefix in _INTERPRETER_PREFIX_STRS:
+                if _within(resolved, prefix):
+                    return
+            for root in roots:
+                if _within(resolved, root):
+                    self.refuse(value)
         finally:
             self.checking.active = False
 
@@ -126,7 +155,7 @@ class HomeIOGuard:
     def _path_entries(path: str, cwd: str | None):
         # Relative PATH entries change meaning after chdir; absolute ones need no cwd.
         return frozenset(
-            Path(os.path.normpath(os.path.join(cwd or "", entry)))
+            _normcase(os.path.normpath(os.path.join(cwd or "", entry)))
             for entry in path.split(os.pathsep) if entry
         )
 
