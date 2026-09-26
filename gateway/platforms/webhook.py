@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import subprocess
+import stat
 import time
 from collections import deque
 from contextlib import nullcontext, suppress
@@ -82,6 +83,32 @@ def _hmac_str_equal(provided: str, expected: str) -> bool:
 
 def _hex_hmac(secret: str, data: bytes) -> str:
     return hmac.new(secret.encode(), data, hashlib.sha256).hexdigest()
+
+
+def _read_secret_file(path: str, where: str):
+    """Externalized HMAC secrets (2026-09-26, RCA-secret-watchdog-locksteal): config.yaml may
+    point at a secret file via ``secret_file:`` instead of carrying the raw value inline, so a
+    config dump can never leak the secret (night class: raw HMAC in a transcript broke an
+    OpenRouter key). One non-empty line → str; multiple lines → list (rotation support).
+    Fail closed: unreadable/empty file raises ValueError at startup — same crash-early
+    contract as ``_validate_route``."""
+    p = os.path.expanduser(str(path))
+    # Regular-file gate (reviewer-fynd 26/9 04:51): a FIFO/device in the config path would
+    # block startup reads indefinitely and a directory raises IsADirectoryError (an OSError,
+    # caught below) — but only after an open() attempt. Fail closed on anything non-regular.
+    try:
+        if not stat.S_ISREG(os.stat(p).st_mode):
+            raise ValueError(f"[webhook] {where} 'secret_file' {path!r} is not a regular file.")
+    except OSError as e:
+        raise ValueError(f"[webhook] {where} 'secret_file' {path!r} is unreadable: {e}") from e
+    try:
+        with open(p, encoding="utf-8") as fh:
+            lines = [ln.strip() for ln in fh.read().splitlines() if ln.strip()]
+    except OSError as e:
+        raise ValueError(f"[webhook] {where} 'secret_file' {path!r} is unreadable: {e}") from e
+    if not lines:
+        raise ValueError(f"[webhook] {where} 'secret_file' {path!r} is empty.")
+    return lines[0] if len(lines) == 1 else lines
 
 
 def _timestamp_fresh(raw: str, stale_msg: str, *args) -> bool:
@@ -169,7 +196,16 @@ class WebhookAdapter(BasePlatformAdapter):
         # Empty string / null host normalises to None ("bind all families").
         self._host: Optional[str] = extra.get("host", DEFAULT_HOST) or None
         self._port: int = int(extra.get("port", DEFAULT_PORT))
-        self._global_secret: str = extra.get("secret", "")
+        self._global_secret: Any = extra.get("secret", "")
+        # Global externalized secret (see _read_secret_file): resolved ONCE at startup so no
+        # request path re-reads the file. 'secret' and 'secret_file' at the same level is an
+        # ambiguity operators will regret (stale inline value silently winning) — refuse it.
+        if extra.get("secret_file"):
+            if extra.get("secret"):
+                raise ValueError("[webhook] platforms.webhook.extra sets both 'secret' and "
+                                 "'secret_file' — pick one.")
+            self._global_secret = _read_secret_file(extra["secret_file"],
+                                                    "platforms.webhook.extra")
         # Config-shape tolerance (2026-09-24 RCA): a LIST-form `routes:` crashed every
         # gateway start for 5h with a cryptic ValueError('dictionary update sequence
         # element #0 has length 4; 2 is required') at the dict() below — one bad config
@@ -219,6 +255,24 @@ class WebhookAdapter(BasePlatformAdapter):
                 + (f" with non-mapping value(s) {bad_keys!r}" if bad_keys else "")
                 + ". Fix config.yaml or use 'hermes webhook subscribe <name>'."
             )
+        # Route-level externalized secrets (see _read_secret_file): resolve each route's
+        # `secret_file` once at startup into a shallow COPY of the route dict — the original
+        # config object is never mutated and no request path re-reads the file. Routes
+        # without `secret_file` keep their original dict object (zero behaviour change).
+        # Same-level 'secret' + 'secret_file' is refused (crash early, not stale-inline-wins).
+        resolved_routes: Dict[str, dict] = {}
+        for _rname, _rcfg in routes_cfg.items():
+            if not _rcfg.get("secret_file"):
+                resolved_routes[_rname] = _rcfg
+                continue
+            if _rcfg.get("secret"):
+                raise ValueError(f"[webhook] Route '{_rname}' sets both 'secret' and "
+                                 "'secret_file' — pick one.")
+            _rcopy = dict(_rcfg)
+            _rcopy["secret"] = _read_secret_file(_rcfg["secret_file"], f"route '{_rname}'")
+            del _rcopy["secret_file"]
+            resolved_routes[_rname] = _rcopy
+        routes_cfg = resolved_routes
         self._static_routes: Dict[str, dict] = routes_cfg
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
@@ -251,7 +305,13 @@ class WebhookAdapter(BasePlatformAdapter):
         if not secret:
             raise ValueError(f"[webhook] Route '{name}' has no HMAC secret. Set 'secret' on the route or globally. "
                              f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'.")
-        if secret == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
+        # Rotation-aware check (reviewer-fynd 26/9 04:51): the request path treats the secret
+        # as a LIST (`_INSECURE_NO_AUTH not in secrets` skips HMAC entirely), so a rotation
+        # list CONTAINING INSECURE_NO_AUTH must fail startup on non-loopback too — otherwise
+        # an inline/secret_file list smuggles an auth-bypass past this equality check.
+        # (list, tuple) mirrors the request path's normalization exactly (reviewer rond-2).
+        _secret_values = list(secret) if isinstance(secret, (list, tuple)) else [secret]
+        if _INSECURE_NO_AUTH in _secret_values and not _is_loopback_host(self._host):
             raise ValueError(f"[webhook] Route '{name}' uses INSECURE_NO_AUTH secret but is bound to non-loopback "
                              f"host '{self._host}'. INSECURE_NO_AUTH is for local testing only. "
                              f"Refusing to start to prevent accidental exposure.")
@@ -435,8 +495,23 @@ class WebhookAdapter(BasePlatformAdapter):
             data = json.loads(subs_path.read_text(encoding="utf-8-sig"))
             if not isinstance(data, dict):
                 return
-            self._dynamic_routes = {  # static routes take precedence
-                k: v for k, v in data.items() if k not in self._static_routes and self._dynamic_route_allowed(k, v)}
+            self._dynamic_routes = {}  # static routes take precedence
+            for _k, _v in data.items():
+                if _k in self._static_routes or not isinstance(_v, dict):
+                    continue
+                # Same secret_file externalization as static routes (see _read_secret_file);
+                # hot-reload contract: a bad block skips the route, never 500s the request.
+                if _v.get("secret_file"):
+                    try:
+                        if _v.get("secret"):
+                            raise ValueError("sets both 'secret' and 'secret_file' — pick one.")
+                        _v["secret"] = _read_secret_file(_v["secret_file"], f"dynamic route '{_k}'")
+                        del _v["secret_file"]
+                    except ValueError as e:
+                        logger.warning("[webhook] Dynamic route '%s' skipped: %s", _k, e)
+                        continue
+                if self._dynamic_route_allowed(_k, _v):
+                    self._dynamic_routes[_k] = _v
             self._routes = {**self._dynamic_routes, **self._static_routes}
             self._dynamic_routes_mtime = mtime
             logger.info("[webhook] Reloaded %d dynamic route(s): %s", len(self._dynamic_routes),
