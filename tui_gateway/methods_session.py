@@ -518,7 +518,16 @@ def _(rid, params: dict, db) -> dict:
         limit = int(params.get("limit", 200) or 200)
         # Over-fetch: per-source filtering + tip merging must not leave us short. ``include_hidden`` is for
         # surfaces that OWN hidden sessions (Bots pane, pickers).
-        rows = _listing_rows(db, max(limit * 2, 200), include_hidden=_flag(params, "include_hidden"))[:limit]
+        from pathlib import Path
+
+        from hermes_cli.session_listing import show_subagent_sessions
+
+        # ``sessions.show_subagents`` (the store's own profile config) re-admits delegate runs (#97202).
+        # A store without a path has no profile config to read, so it keeps the default shape.
+        db_path = getattr(db, "db_path", None)
+        include_subagents = bool(db_path) and show_subagent_sessions(Path(db_path).parent)
+        rows = _listing_rows(db, max(limit * 2, 200), include_hidden=_flag(params, "include_hidden"),
+                             include_subagents=include_subagents)[:limit]
         return _ok(rid, {"sessions": [_session_row_summary(s) for s in rows]})
     except Exception as e:
         return _err(rid, 5006, str(e))
@@ -843,7 +852,8 @@ def _resume_deferred(ctx: _Resume) -> dict:
     sid, source, cwd = ctx.mint()
     with _profile_build_scope(ctx.profile_home):
         overrides = _stored_session_runtime_overrides(ctx.found)
-    record = ctx.record(source, cwd, [], overrides)
+    record = ctx.record(source, cwd, [], overrides,
+                        todo_state=_todo_state_from_db(ctx.db, ctx.target))
     record.update(resume_history_ready=threading.Event(), resume_hydrating=True,
                   resume_message_count=int(ctx.found.get("message_count") or 0))
     if (reused := ctx.claim(sid, record)) is not None:
@@ -1065,6 +1075,8 @@ def _(rid, params: dict, session: dict) -> dict:
 @method("session.delete")
 def _(rid, params: dict) -> dict:
     """Delete a stored session + transcripts; refused while live here (FK trips on the agent's next flush)."""
+    from hermes_state_errors import SessionActiveWriteGuardError  # body runs on server.py globals
+
     if not (target := params.get("session_id", "")):
         return _err(rid, 4006, "session_id required")
     snapshot, err = _snapshot_sessions(rid)
@@ -1078,7 +1090,9 @@ def _(rid, params: dict) -> dict:
             return _db_unavailable_error(rid, code=5036)
         try:
             home = Path(profile_home) if profile_home is not None else get_hermes_home()
-            deleted = db.delete_session(target, sessions_dir=home / "sessions")
+            deleted = db.delete_session(target, sessions_dir=home / "sessions", exclude_active_write_guards=True)
+        except SessionActiveWriteGuardError:
+            return _err(rid, 4023, "cannot delete an active session")
         except Exception as e:
             return _err(rid, 5036, f"delete failed: {e}")
     return _ok(rid, {"deleted": target}) if deleted else _err(rid, 4007, "session not found")
@@ -1833,6 +1847,7 @@ def _(rid, params: dict, session: dict) -> dict:
         model=mirror.get("model") or getattr(live_agent, "model", None),
         provider=mirror.get("provider") or getattr(live_agent, "provider", None),
         tokens=_session_usage_snapshot(session).get("total"), agent_running=bool(session.get("running")),
+        home=session.get("profile_home"),
     )
     project = _project_info_for_cwd(_display_session_cwd(session))
     lines = [

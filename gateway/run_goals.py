@@ -460,7 +460,7 @@ class GatewayGoalsMixin:
         store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
         profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
         and each hit is fired against that profile's adapters."""
-        from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
+        from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
         from gateway.run_idle_gates import profile_has_active_loop
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
@@ -485,18 +485,11 @@ class GatewayGoalsMixin:
             for sid, state in active_loops:
                 await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
 
-        offload = getattr(self, "_run_in_executor_with_context", None)
         while self._running:
             try:
-                # Resolve watch scopes OFF the loop: _handoff_watch_scopes -> profiles_to_serve()
-                # walks the filesystem (realpath chains + profile-dir scans) every pass; on a
-                # thrashing host that stalls the loop past the liveness watchdog's 10s probe and
-                # the gateway self-exits 75 (mini 27/9 wedges: [hermes] caught in posixpath.realpath).
-                # Stand-in runners without the executor hop keep the historical on-loop resolve
-                # (same defensive idiom as run_idle_gates.off_loop_gate).
-                scopes = (await offload(_handoff_watch_scopes, self) if callable(offload)
-                          else _handoff_watch_scopes(self))
-                for profile_name, profile_home in scopes:
+                # Multiplex resolution walks the filesystem off-loop; a stalled walk on the loop
+                # trips the loop-liveness watchdog (exit 75).
+                for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
                     # Idle gate (run_idle_gates): skip the scope entry when the profile's store holds
                     # no active loop. The root scan (None) is unscoped and stays cheap.
                     if profile_home is not None and not await self._run_in_executor_with_context(
