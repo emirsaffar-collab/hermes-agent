@@ -618,7 +618,12 @@ class SessionCompressionMixin:
                 "UPDATE session_turn_leases SET expires_at = ? "
                 "WHERE conversation_id = ? AND holder = ?", (expires_at, conversation_id, holder),
             ).rowcount > 0
-        return bool(self._execute_write(_do))
+        # Storm-class patience (RCA 2026-09-28): the refresh write used to give up at the
+        # routine 20s budget, letting the row lapse mid-hold; a rival writer could then
+        # legally take over the expired row while this turn still waited, killing it via
+        # `turn_lease` instead of `locked`. A refreshed row never becomes reclaimable, so
+        # waiting out the hold here is strictly the safer failure mode.
+        return bool(self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S))
 
     def get_session_turn_lease_owner(self, session_id: str) -> Optional[Tuple[str, float]]:
         """Read-only ``(holder, expires_at)`` of the conversation-root turn lease; None if absent.

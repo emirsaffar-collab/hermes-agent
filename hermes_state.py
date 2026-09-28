@@ -448,6 +448,28 @@ def _foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
 # one-shots, recovery flows, and read-only cross-profile opens use SessionDB() directly with their own close().
 
 
+# ── Write-retry receipt (2026-09-28, RCA-state-db-lock-child-death) ──
+# Every jittered lock-retry sleep stamps this process-wide timestamp so the turn-liveness
+# watchdog can distinguish "blocked in a persistence flush, still retrying" from a silent
+# wedge. With the transcript patience at storm-class scale (240s), a turn waiting out a
+# sibling's hold must not accrue "no progress" toward its liveness abort. The stamp is
+# deliberately process-global: while retries land continuously, the writer queue IS the
+# process's forward progress. Reader: agent/turn_liveness.py.
+_LAST_WRITE_RETRY_MONOTONIC = 0.0
+_WRITE_RETRY_RECEIPT_FRESH_S = 2.0
+
+
+def note_write_retry() -> None:
+    """Receipt: a state.db write-lock retry sleep starts now (jittered, GIL-releasing)."""
+    global _LAST_WRITE_RETRY_MONOTONIC
+    _LAST_WRITE_RETRY_MONOTONIC = time.monotonic()
+
+
+def write_retry_in_progress(max_age_s: float = _WRITE_RETRY_RECEIPT_FRESH_S) -> bool:
+    """True when a write-lock retry landed within the freshness window (best-effort)."""
+    return (time.monotonic() - _LAST_WRITE_RETRY_MONOTONIC) < max_age_s
+
+
 class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
@@ -471,7 +493,16 @@ class SessionDB(
     # optimize); attempt-counted budgets destroyed turns on a healthy store. Transcript
     # writes (failure aborts the turn) get the long budget; observation-only activity
     # writes sit on the response-critical path and get a sub-second one.
-    _WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 60.0, 0.5
+    # Transcript budget raised 60→240s (2026-09-28, RCA-state-db-lock-child-death): four
+    # turns died when their 60s budget ran out ~77s before a GIL-starved holder let go
+    # (observed holds: 8.2/9.3/15.2/276.3s). 240s keeps a full storm-class wait inside
+    # the turn-lease TTL (300s, agent/turn_facade_lease.LEASE_TTL_SECONDS) minus headroom
+    # for the turn's remaining work — a patient flush must never outlive its own lease
+    # and trade one kill for another. Retry sleeps are jittered and GIL-releasing, so
+    # waiting writers starve nobody; exhaustion still raises the classified locked-error
+    # (loud failure intact), and the liveness watchdog treats fresh write-retry receipts
+    # as progress (hermes_state.note_write_retry / write_retry_in_progress).
+    _WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 240.0, 0.5
     # A live compression lock gets a short wait (compression publishes in seconds), but the lease
     # is a correctness boundary: a writer still locked out afterwards is refused.
     # Observation-only activity heartbeat/label writes (#76354 review S1): these run on (or adjacent to) the
@@ -1461,6 +1492,7 @@ class SessionDB(
             (self._WRITE_RETRY_SLOW_MIN_S, self._WRITE_RETRY_SLOW_MAX_S) if slow
             else (self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S)
         ))
+        note_write_retry()  # liveness receipt: waiting on the lock is progress, not a silent wedge
         time.sleep(min(jitter, max(deadline - now, 0.001)))
         return True
 
