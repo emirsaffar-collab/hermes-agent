@@ -111,7 +111,7 @@ def _connect() -> sqlite3.Connection:
     mkdir_under_hermes_home(path.parent)
     _secure_state_db_files(path, create_main=True)
     # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
-    conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
+    conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=60_000,
                    wal=False, row_factory=None, initialize=_initialize_schema)
     _secure_state_db_files(path)
     return conn
