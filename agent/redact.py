@@ -514,6 +514,10 @@ _TELEGRAM_RE = re.compile(r"(?<!\d)(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})")
 
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
 
+# Content filter secret markers (e.g. OpenRouter/z-ai "[SECRET:ethereum-private-key]")
+# Redacted so log lines and agent error summaries don't echo back into future LLM contexts
+_CONTENT_FILTER_SECRET_RE = re.compile(r"\[SECRET:[^\]\r\n]+\]")
+
 # Database connection strings: protocol://user:PASSWORD@host. The userinfo and
 # password groups forbid whitespace so a match can never span a line break (a
 # greedy ``[^@]+`` once ran to a decorator's ``@`` on the next code line).
@@ -962,6 +966,9 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 
     if "BEGIN" in text and "-----" in text:
         text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
+
+    if "[SECRET:" in text:
+        text = _CONTENT_FILTER_SECRET_RE.sub("[REDACTED_CONTENT_FILTER]", text)
 
     # Database connection string passwords. With code_file=True, a password group that is a pure ``{...}``
     # brace expression is an f-string template reference (e.g. f"postgresql://{user}:{pass}@{host}"), not a

@@ -268,6 +268,12 @@ class TestBareSecretEnvSuffixes:
         assert "opaqueValue" not in result
         assert "username=bob" in result
 
+    def test_content_filter_secret_masks(self):
+        text = "Request blocked by content filter: [SECRET:ethereum-private-key]"
+        result = redact_sensitive_text(text, force=True)
+        assert "[SECRET:ethereum-private-key]" not in result
+        assert "[REDACTED_CONTENT_FILTER]" in result
+
 
 class TestControlCharSplitTokens:
     """Tokens split by control/zero-width chars must still mask — #77484."""
