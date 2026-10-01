@@ -872,10 +872,11 @@ class CLICommandsMixin:
         from hermes_cli.backup import prune_quick_snapshots
         keep = 20
         if len(parts) > 2:
-            try:
-                keep = int(parts[2])
-            except ValueError:
+            # isdecimal() also rejects "-1": a negative keep would slice away the
+            # newest snapshots instead of the oldest.
+            if not parts[2].isdecimal():
                 return print(f"  {_t('snapshot.usage_prune')}")
+            keep = int(parts[2])
         deleted = prune_quick_snapshots(keep=keep)
         print(f"  {_t('snapshot.pruned', deleted=deleted, keep=keep)}")
 
@@ -1928,7 +1929,9 @@ class CLICommandsMixin:
         """Handle /init — generate or update AGENTS.md from a project scan performed by the
         live agent with its own read-only tools."""
         from hermes_cli.init_command import build_init_prompt_for_cwd
-        msg = build_init_prompt_for_cwd(extra=_command_arg(cmd))  # optional user emphasis
+        # session_key="" targets the single-session CLI's "default" cwd record, which tracks
+        # `cd` and workspace switches, so /init follows the directory the user works in.
+        msg = build_init_prompt_for_cwd(extra=_command_arg(cmd), session_key="")  # optional user emphasis
         print("\n" + _t("init.updating" if "UPDATE the existing AGENTS.md" in msg else "init.generating"))
         self._queue_prompt_turn(msg, "/init")
 
@@ -1987,6 +1990,9 @@ class CLICommandsMixin:
                             self._app.invalidate()
 
                 bg_agent.thinking_callback = _bg_thinking
+                # /bg prompts paint on this terminal: they wait until answered, like the foreground turn's.
+                from tools.approval_context import reset_prompts_wait_for_answer, set_prompts_wait_for_answer
+                prompts_token = set_prompts_wait_for_answer()
                 try:
                     result = bg_agent.run_conversation(user_message=prompt, task_id=task_id)
                     response = result.get("final_response", "") if result else ""
@@ -1994,6 +2000,7 @@ class CLICommandsMixin:
                         response = _gt("model.error_prefix", error=result["error"])
                     return response
                 finally:
+                    reset_prompts_wait_for_answer(prompts_token)
                     # One agent per /bg task in a long-lived CLI process: close()
                     # is the owner boundary (memory shutdown, tool subprocesses,
                     # httpx clients); an unclosed side agent leaks all of them
@@ -2392,10 +2399,16 @@ class CLICommandsMixin:
                 if initial_text:
                     fh.write(initial_text)
             try:
-                subprocess.call([*shlex.split(editor), path])
-            except Exception:
-                # Fall back to a bare invocation (editor value may not be argv-splittable everywhere).
-                subprocess.call(f"{editor} {shlex.quote(path)}", shell=True)
+                editor_argv = [*shlex.split(editor), path]
+            except ValueError:
+                return ""  # unbalanced quotes in $EDITOR: cancel, never retry through a shell
+            try:
+                status = subprocess.call(editor_argv)
+            except OSError:
+                return ""  # editor not runnable: cancel the compose (#81364)
+            # A failed editor may leave seeded or abandoned text in the buffer.
+            if status != 0:
+                return ""
             with open(path, "r", encoding="utf-8-sig") as fh:
                 raw = fh.read()
         finally:
