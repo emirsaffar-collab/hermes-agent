@@ -1516,8 +1516,7 @@ export const deOverrides = {
       fileReadMaxChars: 'Maximale Zeichenzahl, die Hermes aus einer Dateianfrage lesen kann.',
       approvals: {
         mode: 'Wie Hermes Befehle behandelt, die eine explizite Genehmigung benötigen.',
-        timeout:
-          'Wie lange Genehmigungsaufforderungen auf Messaging-Plattformen warten, bevor sie ablaufen. App und Terminal warten, bis du antwortest.'
+        timeout: 'Wie lange Genehmigungsaufforderungen warten, bevor sie ablaufen.'
       },
       security: {
         redactSecrets: 'Erkannte Geheimnisse nach Möglichkeit aus modellsichtbarem Inhalt ausblenden.'
@@ -4295,7 +4294,7 @@ export const deOverrides = {
       '/init': 'AGENTS.md-Projektanweisungen aus einem Repo-Scan erzeugen oder aktualisieren',
       '/suggestions': 'Vorgeschlagene Automatisierungen prüfen (annehmen/verwerfen)',
       '/blueprint': 'Eine Automatisierung aus einer Blueprint-Vorlage einrichten',
-      '/browser': 'Browser-CDP-Verbindung verwalten [connect|disconnect|status] (nur lokales Gateway)',
+      '/browser': 'Browser des Agenten verwalten [connect|disconnect|status|use]',
       '/palette': 'Die unscharfe Befehlspalette öffnen (auch Strg+P)',
       '/usage': 'Token-Nutzung und Ratenlimits anzeigen; `reset` löst ein angespartes Codex-Limit-Reset ein',
       '/subscription': 'Ihren Nous-Tarif ansehen und im Browser ändern',
@@ -5248,6 +5247,8 @@ export const deOverrides = {
   },
   preview: {
     tab: 'Vorschau',
+    pin: 'An Arbeitsbereich anheften',
+    unpin: 'Vom Arbeitsbereich lösen',
     closePane: 'Vorschau-Fenster schließen',
     loading: 'Vorschau wird geladen',
     unavailable: 'Vorschau nicht verfügbar',

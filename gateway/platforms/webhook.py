@@ -300,7 +300,7 @@ class WebhookAdapter(BasePlatformAdapter):
         routes_cfg = resolved_routes
         self._static_routes: Dict[str, dict] = routes_cfg
         self._dynamic_routes: Dict[str, dict] = {}
-        self._dynamic_routes_mtime: float = 0.0
+        self._dynamic_routes_stat: Optional[tuple] = None
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
         self._v1_signature_warned: set[str] = set()  # routes already warned about legacy V1 (once per route)
@@ -506,22 +506,39 @@ class WebhookAdapter(BasePlatformAdapter):
         return True
 
     def _reload_dynamic_routes(self) -> None:
-        """Reload agent-created subscriptions from disk if the file changed."""
+        """Reload agent-created subscriptions when the file's stat identity changes.
+
+        Runs on every POST before auth, so it never takes the CLI writer lock: writers publish via
+        atomic rename, which also gives the file a new inode, so a restored mtime cannot hide a change.
+        """
         from hermes_constants import get_hermes_home
         subs_path = get_hermes_home() / _DYNAMIC_ROUTES_FILENAME
-        if not subs_path.exists():
+        try:
+            st = subs_path.stat()
+        except FileNotFoundError:
             if self._dynamic_routes:
                 self._dynamic_routes, self._routes = {}, dict(self._static_routes)
                 logger.debug("[webhook] Dynamic subscriptions file removed, cleared dynamic routes")
+            self._dynamic_routes_stat = None
+            return
+        stat_key = (st.st_mtime_ns, st.st_size, st.st_ino)
+        if stat_key == self._dynamic_routes_stat:
+            return  # No change
+        try:
+            data = json.loads(subs_path.read_text(encoding="utf-8-sig"))
+        except ValueError as e:
+            # Keep the last good snapshot, and remember this version so it is parsed once, not per POST.
+            self._dynamic_routes_stat = stat_key
+            logger.error("[webhook] Failed to parse dynamic routes: %s", e)
+            return
+        except OSError as e:
+            logger.error("[webhook] Failed to read dynamic routes: %s", e)
+            return
+        if not isinstance(data, dict):
+            self._dynamic_routes_stat = stat_key  # keep the last good snapshot; parse this version once
             return
         try:
-            mtime = subs_path.stat().st_mtime
-            if mtime <= self._dynamic_routes_mtime:
-                return  # No change
-            data = json.loads(subs_path.read_text(encoding="utf-8-sig"))
-            if not isinstance(data, dict):
-                return
-            self._dynamic_routes = {}  # static routes take precedence
+            self._dynamic_routes = {}  # static routes take precedence; bad blocks skip, never 500 the request
             for _k, _v in data.items():
                 if _k in self._static_routes or not isinstance(_v, dict):
                     continue
@@ -539,7 +556,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 if self._dynamic_route_allowed(_k, _v):
                     self._dynamic_routes[_k] = _v
             self._routes = {**self._dynamic_routes, **self._static_routes}
-            self._dynamic_routes_mtime = mtime
+            self._dynamic_routes_stat = stat_key
             logger.info("[webhook] Reloaded %d dynamic route(s): %s", len(self._dynamic_routes),
                         ", ".join(self._dynamic_routes.keys()) or "(none)")
         except Exception as e:
@@ -690,7 +707,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
     def _resolve_route(self, request: "web.Request") -> "tuple[str, Optional[dict], Any, Optional[web.Response]]":
         """Route + profile lookup for a POST; ``(route_name, route_config, profile, error_response)``."""
-        self._reload_dynamic_routes()  # hot-reload dynamic subscriptions (mtime-gated, cheap)
+        self._reload_dynamic_routes()  # hot-reload dynamic subscriptions (stat-gated, lock-free)
         route_name = request.match_info.get("route_name", "")
         route_config = self._routes.get(route_name)
         profile = self._resolve_request_profile(request)

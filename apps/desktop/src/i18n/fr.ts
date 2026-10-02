@@ -1521,8 +1521,7 @@ export const frOverrides = {
       fileReadMaxChars: 'Nombre maximal de caractères que Hermes peut lire dans une demande de fichier.',
       approvals: {
         mode: 'Comment Hermes gère les commandes nécessitant une approbation explicite.',
-        timeout:
-          "Durée d'attente des invites d'approbation sur les plateformes de messagerie avant expiration. L'app et le terminal attendent votre réponse."
+        timeout: "Durée d'attente des invites d'approbation avant expiration."
       },
       security: {
         redactSecrets: "Masque les secrets détectés du contenu visible par le modèle lorsque c'est possible."
@@ -4307,7 +4306,7 @@ export const frOverrides = {
       '/init': 'Générer ou mettre à jour les instructions de projet AGENTS.md à partir d’une analyse du dépôt',
       '/suggestions': 'Examiner les automatisations suggérées (accepter/ignorer)',
       '/blueprint': 'Configurer une automatisation à partir d’un modèle',
-      '/browser': 'Gérer la connexion CDP du navigateur [connect|disconnect|status] (gateway local uniquement)',
+      '/browser': 'Gérer le navigateur de l’agent [connect|disconnect|status|use]',
       '/palette': 'Ouvrir la palette de commandes floue (aussi Ctrl+P)',
       '/usage':
         'Afficher l’utilisation des jetons et les limites de débit ; `reset` utilise une réinitialisation de limite Codex en réserve',
@@ -5262,6 +5261,8 @@ export const frOverrides = {
   },
   preview: {
     tab: 'Aperçu',
+    pin: "Épingler à l'espace de travail",
+    unpin: "Détacher de l'espace de travail",
     closePane: "Fermer le panneau d'aperçu",
     loading: "Chargement de l'aperçu",
     unavailable: 'Aperçu indisponible',

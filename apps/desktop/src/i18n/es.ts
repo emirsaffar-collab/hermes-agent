@@ -1517,8 +1517,7 @@ export const esOverrides = {
       fileReadMaxChars: 'Máximo de caracteres que Hermes puede leer en una solicitud de archivo.',
       approvals: {
         mode: 'Cómo maneja Hermes los comandos que necesitan aprobación explícita.',
-        timeout:
-          'Cuánto esperan los prompts de aprobación en plataformas de mensajería antes de vencer. La app y la terminal esperan hasta que respondas.'
+        timeout: 'Cuánto esperan los prompts de aprobación antes de vencer.'
       },
       security: {
         redactSecrets: 'Oculta secretos detectados del contenido visible para el modelo cuando sea posible.'
@@ -4287,7 +4286,7 @@ export const esOverrides = {
       '/init': 'Generar o actualizar las instrucciones de proyecto AGENTS.md a partir de un análisis del repositorio',
       '/suggestions': 'Revisar las automatizaciones sugeridas (aceptar/descartar)',
       '/blueprint': 'Configurar una automatización a partir de una plantilla',
-      '/browser': 'Gestionar la conexión CDP del navegador [connect|disconnect|status] (solo gateway local)',
+      '/browser': 'Gestionar el navegador del agente [connect|disconnect|status|use]',
       '/palette': 'Abrir la paleta de comandos aproximada (también Ctrl+P)',
       '/usage':
         'Mostrar el uso de tokens y los límites de frecuencia; `reset` canjea un restablecimiento de límite de Codex acumulado',
@@ -5239,6 +5238,8 @@ export const esOverrides = {
   },
   preview: {
     tab: 'Vista previa',
+    pin: 'Fijar al espacio de trabajo',
+    unpin: 'Desfijar del espacio de trabajo',
     closePane: 'Cerrar panel de vista previa',
     loading: 'Cargando vista previa',
     unavailable: 'Vista previa no disponible',
@@ -5691,7 +5692,7 @@ export const esOverrides = {
     },
     approval: {
       gatewayDisconnected:
-        'Hermes está sin conexión ahora mismo. El comando sigue esperando tu respuesta. Reconéctate y vuelve a enviarla.',
+        'Hermes está sin conexión ahora mismo. El comando sigue esperando tu respuesta (hasta que se agote el tiempo de aprobación). Reconéctate y vuelve a enviarla.',
       sendFailed: 'No se pudo enviar tu respuesta',
       reconnect: 'Reconectar',
       timedOutSystemLine:
