@@ -208,6 +208,10 @@ def record_response_usage(
         prompt_tokens, completion_tokens, total_tokens,
         api_duration, _cache_pct, _ident,
     )
+    if _upstream and isinstance(api_duration, (int, float)):
+        with suppress(Exception):
+            from agent.provider_latency_circuit_breaker import record_provider_latency
+            record_provider_latency(agent.model, _upstream, float(api_duration))
     # nous.anthropic_wire=auto: the session's wire is decided once, from this first response.
     if agent.session_api_calls == 1 and (agent.provider or "") == "nous":
         with suppress(Exception):

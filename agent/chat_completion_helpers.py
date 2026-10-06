@@ -484,6 +484,10 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     merged = {**flat, **{k: v for k, v in per_model.items() if k in flat}}
     merged["sort"] = _validated_openrouter_provider_sort(merged["sort"])
     merged["require_parameters"] = True if merged["require_parameters"] else None
+    if merged.get("order") and isinstance(merged["order"], (list, tuple)):
+        with contextlib.suppress(Exception):
+            from agent.provider_latency_circuit_breaker import adjust_provider_order
+            merged["order"] = adjust_provider_order(agent.model, merged["order"])
     return {key: value for key, value in merged.items() if value}
 
 
