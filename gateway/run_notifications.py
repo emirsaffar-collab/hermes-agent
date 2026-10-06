@@ -2028,7 +2028,14 @@ class GatewayNotificationsMixin:
                 # Completions whose owner process died while this gateway runs (#97202).
                 if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
                     last_orphan_sweep = time.monotonic()
-                    await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
+                    offload = getattr(self, "_run_housekeeping_in_executor", None)
+                    try:
+                        if callable(offload):
+                            await asyncio.wait_for(offload(self._sweep_orphaned_completion_ledgers), timeout=10.0)
+                        else:
+                            await asyncio.wait_for(asyncio.to_thread(self._sweep_orphaned_completion_ledgers), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        logger.debug("Orphaned async completion sweep timed out (>10s); will retry next interval")
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.

@@ -190,10 +190,16 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
     if status.stdout.strip():
         return False, "dirty"
     cherry = _git_run(git_cmd, ["cherry", f"origin/{target_branch}"], cwd)
-    if cherry.returncode != 0:
-        return False, "unverifiable"
-    unmerged = [line for line in cherry.stdout.splitlines() if line.startswith("+")]
-    return True, f"unmerged:{len(unmerged)}" if unmerged else ""
+    if cherry.returncode == 0:
+        unmerged = [line for line in cherry.stdout.splitlines() if line.startswith("+")]
+        return True, f"unmerged:{len(unmerged)}" if unmerged else ""
+    # Partial-clone (tree:0) fallback: git cherry hangs/fails computing patch-ids without blobs;
+    # rev-list inspects commit headers only in sub-seconds.
+    rev_count = _git_stdout(git_cmd, ["rev-list", f"origin/{target_branch}..HEAD", "--count"], cwd)
+    if rev_count is not None and rev_count.strip().isdigit():
+        n = int(rev_count.strip())
+        return True, f"unmerged:{n}" if n > 0 else ""
+    return False, "unverifiable"
 
 
 _PARKED_SKIP_WHY = {

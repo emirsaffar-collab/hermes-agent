@@ -42,6 +42,28 @@ def profile_serve_signature(home: "Path") -> tuple:
     return tuple(sig)
 
 
+def _scan_profiles_diff(config: Any, active: str, known_homes: Optional[Dict[str, "Path"]], known_sigs: Optional[Dict[str, tuple]]) -> tuple:
+    """Off-loop filesystem scan for served-profile changes: walks profiles/ and computes signatures."""
+    from gateway.run import _multiplex_profile_homes
+    from gateway.status import live_gateway_pid_for_home
+
+    current = {str(name): Path(home) for name, home in _multiplex_profile_homes(config)}
+    known = dict(known_homes or {})
+    blocked = set()
+    for name in list(current):
+        if name == active or name in known:
+            continue
+        if live_gateway_pid_for_home(current[name]) is not None:
+            blocked.add(name)
+            del current[name]
+    sigs = known_sigs or {}
+    added = [n for n in current if n not in known and n != active]
+    removed = [n for n in known if n not in current and n != active]
+    changed = [n for n in current if n in known and n != active and n not in added
+               and profile_serve_signature(current[n]) != sigs.get(n)]
+    return current, added, removed, changed, blocked
+
+
 class GatewayProfileReconcileMixin:
     """Runtime reconciliation of the multiplexed served-profile set (hot add / unroute / credential-add)."""
 
@@ -102,29 +124,23 @@ class GatewayProfileReconcileMixin:
         if not self._running or self._served_profile_homes is None:
             # Startup enumerates profiles/ itself; a rescan before it finishes has nothing to diff against.
             return {**result, "pending": True, "served_profiles": self.served_profile_names()}
+        active = getattr(self, "_primary_profile_name", None) or "default"
+        offload = getattr(self, "_run_housekeeping_in_executor", None)
+        if callable(offload):
+            current, added, removed, changed, blocked = await offload(
+                _scan_profiles_diff, self.config, active, self._served_profile_homes, self._served_profile_signatures
+            )
+        else:
+            current, added, removed, changed, blocked = _scan_profiles_diff(
+                self.config, active, self._served_profile_homes, self._served_profile_signatures
+            )
         async with self._reconcile_lock():
-            active = getattr(self, "_primary_profile_name", None) or "default"
-            current = {str(name): Path(home) for name, home in _multiplex_profile_homes(self.config)}
-            known = dict(self._served_profile_homes or {})
-            from gateway.status import live_gateway_pid_for_home
-
-            blocked = set()
             warned = self._profile_own_gateway_warned or set()
-            for name in list(current):
-                if name == active or name in known:
-                    continue
-                if live_gateway_pid_for_home(current[name]) is not None:
-                    blocked.add(name)
-                    if name not in warned:
-                        logger.warning("[MULTIPLEX] Profile '%s' still runs its own gateway; "
-                                       "stop it before the host can serve this profile", name)
-                    del current[name]
+            for name in blocked:
+                if name not in warned:
+                    logger.warning("[MULTIPLEX] Profile '%s' still runs its own gateway; "
+                                   "stop it before the host can serve this profile", name)
             self._profile_own_gateway_warned = blocked
-            sigs = self._served_profile_signatures or {}
-            added = [n for n in current if n not in known and n != active]
-            removed = [n for n in known if n not in current and n != active]
-            changed = [n for n in current if n in known and n != active and n not in added
-                       and profile_serve_signature(current[n]) != sigs.get(n)]
             return await self._apply_profile_changes(current, added, removed, changed, reason=reason)
 
     async def _apply_profile_changes(self, current, added, removed, changed, *, reason):
