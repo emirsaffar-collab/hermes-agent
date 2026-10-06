@@ -5253,6 +5253,50 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
         server._sessions.pop("delegating-turn", None)
 
 
+def test_ws_orphan_reap_defers_running_turn_when_activity_summary_none(monkeypatch):
+    callbacks = []
+    interrupted = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    def _interrupt():
+        interrupted.append("interrupted")
+        session["running"] = False
+
+    session = _session(
+        agent=types.SimpleNamespace(
+            interrupt=_interrupt,
+            get_activity_summary=lambda: {"seconds_since_activity": None},
+        ),
+        transport=server._detached_ws_transport,
+        running=True,
+        _run_thread=_LiveThread(),
+    )
+    server._sessions["fresh-startup-turn"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    try:
+        server._schedule_ws_orphan_reap("fresh-startup-turn")
+        callbacks.pop(0)()
+
+        # Should defer because running=True and elapsed is None (startup / waiting for first API response)
+        assert interrupted == []
+        assert len(callbacks) == 1
+    finally:
+        server._sessions.pop("fresh-startup-turn", None)
+
+
 def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
     callbacks = []
     interrupted = []

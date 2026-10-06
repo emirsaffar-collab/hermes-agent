@@ -869,7 +869,11 @@ def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
         return False
     try:
         elapsed = summary_fn().get("seconds_since_activity")
-        return elapsed is not None and float(elapsed) < _WS_ORPHAN_ACTIVITY_STALE_S
+        if elapsed is None:
+            # If the turn is running, lack of an activity stamp yet means it is
+            # in startup or waiting on its first API response, NOT wedged.
+            return bool(session.get("running"))
+        return float(elapsed) < _WS_ORPHAN_ACTIVITY_STALE_S
     except Exception:
         return False
 
