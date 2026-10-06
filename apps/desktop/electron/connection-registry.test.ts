@@ -958,6 +958,11 @@ test('shouldRetrySshInventory: first try, cooldown, then retry; cache never retr
   assert.equal(shouldRetrySshInventory(false, 1_000, 30_000, 60_000), false)
   assert.equal(shouldRetrySshInventory(false, 1_000, 61_000, 60_000), true)
   assert.equal(shouldRetrySshInventory(true, 1_000, 120_000, 60_000), false)
+  // Exponential backoff on consecutive failures:
+  assert.equal(shouldRetrySshInventory(false, 1_000, 70_000, 60_000, 1), false) // 1 failure -> 120s backoff
+  assert.equal(shouldRetrySshInventory(false, 1_000, 130_000, 60_000, 1), true)
+  assert.equal(shouldRetrySshInventory(false, 1_000, 200_000, 60_000, 2), false) // 2 failures -> 240s backoff
+  assert.equal(shouldRetrySshInventory(false, 1_000, 250_000, 60_000, 2), true)
 })
 
 test('parseRemoteProfileListing: Mini/Spark dirs become roster names and drop rollbacks', () => {

@@ -688,7 +688,8 @@ export function shouldRetrySshInventory(
   hasCache: boolean,
   lastAttemptMs: null | number | undefined,
   nowMs: number,
-  retryAfterMs = 60_000
+  retryAfterMs = 60_000,
+  consecutiveFailures = 0
 ): boolean {
   if (hasCache) {
     return false
@@ -698,7 +699,10 @@ export function shouldRetrySshInventory(
     return true
   }
 
-  return nowMs - lastAttemptMs >= retryAfterMs
+  const multiplier = consecutiveFailures > 0 ? Math.min(Math.pow(2, Math.min(consecutiveFailures, 4)), 10) : 1
+  const effectiveRetryMs = Math.min(retryAfterMs * multiplier, 300_000)
+
+  return nowMs - lastAttemptMs >= effectiveRetryMs
 }
 
 const PROFILE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
