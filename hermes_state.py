@@ -1063,8 +1063,11 @@ class SessionDB(
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    _txn_t0 = time.monotonic()
+                    assert self._conn is not None
+                    _wait_t0 = time.monotonic()
                     self._conn.execute("BEGIN IMMEDIATE")
+                    _txn_t0 = time.monotonic()
+                    _wait_s = _txn_t0 - _wait_t0
                     try:
                         fn_started = True
                         result = fn(self._conn)
@@ -1088,6 +1091,12 @@ class SessionDB(
                             )
                         raise
                     _txn_hold_s = time.monotonic() - _txn_t0
+                if _wait_s > self._SLOW_TXN_HOLD_WARN_S:
+                    logger.warning(
+                        "state.db write txn waited %.1fs to acquire lock (>%ss budget) before %s",
+                        _wait_s, self._SLOW_TXN_HOLD_WARN_S,
+                        getattr(fn, "__qualname__", getattr(fn, "__name__", "<fn>")),
+                    )
                 if _txn_hold_s > self._SLOW_TXN_HOLD_WARN_S:
                     logger.warning(
                         "state.db write txn held the lock %.1fs (>%ss budget) via %s — "
