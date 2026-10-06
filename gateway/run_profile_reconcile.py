@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _PROFILE_RESCAN_INTERVAL_SECS = 30.0
 _PROFILE_SIGNATURE_FILES = ("config.yaml", ".env")
+_OWN_GATEWAY_PROBE_TIMEOUT_SECS = 5.0
 
 
 def profile_serve_signature(home: "Path") -> tuple:
@@ -45,23 +46,15 @@ def profile_serve_signature(home: "Path") -> tuple:
 def _scan_profiles_diff(config: Any, active: str, known_homes: Optional[Dict[str, "Path"]], known_sigs: Optional[Dict[str, tuple]]) -> tuple:
     """Off-loop filesystem scan for served-profile changes: walks profiles/ and computes signatures."""
     from gateway.run import _multiplex_profile_homes
-    from gateway.status import live_gateway_pid_for_home
 
     current = {str(name): Path(home) for name, home in _multiplex_profile_homes(config)}
     known = dict(known_homes or {})
-    blocked = set()
-    for name in list(current):
-        if name == active or name in known:
-            continue
-        if live_gateway_pid_for_home(current[name]) is not None:
-            blocked.add(name)
-            del current[name]
     sigs = known_sigs or {}
     added = [n for n in current if n not in known and n != active]
     removed = [n for n in known if n not in current and n != active]
     changed = [n for n in current if n in known and n != active and n not in added
                and profile_serve_signature(current[n]) != sigs.get(n)]
-    return current, added, removed, changed, blocked
+    return current, added, removed, changed
 
 
 class GatewayProfileReconcileMixin:
@@ -127,20 +120,49 @@ class GatewayProfileReconcileMixin:
         active = getattr(self, "_primary_profile_name", None) or "default"
         offload = getattr(self, "_run_housekeeping_in_executor", None)
         if callable(offload):
-            current, added, removed, changed, blocked = await offload(
+            current, added, removed, changed = await offload(
                 _scan_profiles_diff, self.config, active, self._served_profile_homes, self._served_profile_signatures
             )
         else:
-            current, added, removed, changed, blocked = _scan_profiles_diff(
+            current, added, removed, changed = _scan_profiles_diff(
                 self.config, active, self._served_profile_homes, self._served_profile_signatures
             )
         async with self._reconcile_lock():
-            warned = self._profile_own_gateway_warned or set()
-            for name in blocked:
-                if name not in warned:
-                    logger.warning("[MULTIPLEX] Profile '%s' still runs its own gateway; "
-                                   "stop it before the host can serve this profile", name)
+            from gateway.status import live_gateway_pid_for_home
+
+            blocked = set()
+            timed_out = set()
+            warned = getattr(self, "_profile_own_gateway_warned", None) or set()
+            timeout_warned = getattr(self, "_profile_probe_timeout_warned", None) or set()
+            for name in list(added):
+                try:
+                    if callable(offload):
+                        pid = await asyncio.wait_for(
+                            self._run_housekeeping_in_executor(live_gateway_pid_for_home, current[name]),
+                            timeout=_OWN_GATEWAY_PROBE_TIMEOUT_SECS)
+                    else:
+                        pid = live_gateway_pid_for_home(current[name])
+                except asyncio.TimeoutError:
+                    timed_out.add(name)
+                    log = logger.debug if name in timeout_warned else logger.warning
+                    log("[MULTIPLEX] Own-gateway probe for profile '%s' timed out; "
+                        "not serving it this cycle", name)
+                    if name in current:
+                        del current[name]
+                    if name in added:
+                        added.remove(name)
+                    continue
+                if pid is not None:
+                    blocked.add(name)
+                    if name not in warned:
+                        logger.warning("[MULTIPLEX] Profile '%s' still runs its own gateway; "
+                                       "stop it before the host can serve this profile", name)
+                    if name in current:
+                        del current[name]
+                    if name in added:
+                        added.remove(name)
             self._profile_own_gateway_warned = blocked
+            self._profile_probe_timeout_warned = timed_out
             return await self._apply_profile_changes(current, added, removed, changed, reason=reason)
 
     async def _apply_profile_changes(self, current, added, removed, changed, *, reason):
@@ -272,6 +294,13 @@ class GatewayProfileReconcileMixin:
             with _log_suppressed(logging.DEBUG, "memory-store release failed", exc_info=True):
                 from plugins.memory.holographic.store import MemoryStore
                 MemoryStore.release_all_under(home)
+            with _log_suppressed(logging.DEBUG, "scoped MCP shutdown failed", exc_info=True):
+                from hermes_constants import hermes_home_key
+                from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+                await asyncio.to_thread(shutdown_mcp_servers, scope=hermes_home_key(home))
+            with _log_suppressed(logging.DEBUG, "profile log handler release failed", exc_info=True):
+                from hermes_logging import release_profile_log_handlers
+                await asyncio.to_thread(release_profile_log_handlers, home)
             logger.info("[MULTIPLEX] Profile '%s' unserved — %d adapter(s) stopped and unrouted", name, len(adapters))
 
 

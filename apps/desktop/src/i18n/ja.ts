@@ -2,6 +2,8 @@ import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale } from './define-locale'
 import { introJa } from './intro-ja'
+import { jaModelMenu } from './ja_model_menu'
+import { jaPluginSettings } from './ja_plugins'
 
 export const ja = defineLocale({
   externalOpenFailed: {
@@ -283,7 +285,7 @@ export const ja = defineLocale({
       inputTitleNamed: session => `入力が必要です — ${session}`,
       inputBody: 'Hermes が応答を待っています。',
       turnDoneTitle: 'Hermes が完了しました',
-      turnDoneBody: '',
+      turnDoneBody: 'メッセージが完了しました。',
       turnErrorTitle: 'ターンが失敗しました',
       backgroundDoneTitle: 'バックグラウンドタスクが完了しました',
       backgroundFailedTitle: 'バックグラウンドタスクが失敗しました',
@@ -439,22 +441,7 @@ export const ja = defineLocale({
       billingOverview: '概要',
       billingPlans: 'プラン'
     },
-    plugins: {
-      openFolder: 'デスクトッププラグインフォルダーを開く',
-      installModal: {
-        installUncertain:
-          'Hermes はインストール結果の待機を終了しましたが、プラグインのインストールはまだ進行中の可能性があります。この画面を閉じ、再インストールする前にプラグイン一覧を再スキャンしてください。',
-        installFromGit: 'Git からインストール',
-        reviewRepository: 'リポジトリを確認',
-        repoPlaceholder: 'https://github.com/owner/repo',
-        toolsConnected: n => `${n} 個のツールを接続しました`,
-        skillsReady: names =>
-          names.length === 1 ? `スキル ${names[0]} の準備ができました` : `${names.length} 個のスキルの準備ができました`,
-        nextChat: 'ほかのツールは次のチャットで使えます',
-        serverNotConnected: (server, reason) =>
-          `MCP サーバー ${server} は接続されていません${reason ? `: ${reason}` : '。'}`
-      }
-    },
+    plugins: jaPluginSettings.plugins,
     closeSettings: '設定を閉じる',
     exportConfig: '設定を書き出す',
     importConfig: '設定を読み込む',
@@ -462,6 +449,7 @@ export const ja = defineLocale({
     resetConfirm: 'すべての設定を Hermes のデフォルトに戻しますか？',
     exportFailed: '書き出しに失敗しました',
     resetFailed: 'リセットに失敗しました',
+    pluginPages: jaPluginSettings.pluginPages,
     nav: {
       providers: 'プロバイダー',
       providerAccounts: 'アカウント',
@@ -479,7 +467,8 @@ export const ja = defineLocale({
       about: '情報',
       billing: '請求',
       notifications: '通知',
-      vault: 'パスワードとログイン'
+      vault: 'パスワードとログイン',
+      plugins: 'プラグイン'
     },
     vault: {
       title: 'パスワードとログイン',
@@ -1052,7 +1041,11 @@ export const ja = defineLocale({
       imported: '設定をインポートしました',
       invalidJson: '設定 JSON が無効です',
       keepAwakeTitle: 'コンピューターをスリープさせない',
-      keepAwakeDesc: '本体のスリープを防ぎ、長時間や夜通しの実行を継続します。画面は暗転できます。',
+      keepAwakeDesc:
+        '本体のスリープを防ぎます。「実行中のみ」はターンの実行中だけ有効になるため、夜通しの実行を継続しつつ、ノートPCを一週間つけたままにはしません。画面は暗転できます。',
+      keepAwakeOff: 'オフ',
+      keepAwakeWhileWorking: '実行中のみ',
+      keepAwakeAlways: '常に',
       voiceShortcutHintTitle: '音声録音ショートカット',
       voiceShortcutHintDesc:
         '「設定 → キーボードショートカット」で音声録音ショートカット（「Start / stop voice conversation」）を設定します。voice.record_key は CLI と TUI 専用です。'
@@ -1238,6 +1231,8 @@ export const ja = defineLocale({
         'サポートされていないリモートプラットフォームです。Hermes Desktop の SSH モードは Linux、macOS、Windows のリモートホストに対応しています。',
       sshErrTimeout: 'SSH 接続がタイムアウトしました。ホストが到達不能、またはスリープ中の可能性があります。',
       sshErrUpdateRequired: 'Desktop SSH で接続する前に、リモートホストの Hermes を更新してください。',
+      sshErrInteractiveAuth:
+        'Tailscale SSH では対話的なブラウザー確認が必要です。ターミナルで `ssh <host> true` を実行して確認を完了し、再試行してください。Hermes は SSH を非対話的に実行します。',
       sshErrUnknown: 'SSH 接続に失敗しました。'
     },
     keys: {
@@ -1981,6 +1976,9 @@ export const ja = defineLocale({
     replaceValue: '現在の値を置き換え',
     openDocs: 'ドキュメントを開く',
     clearField: key => `${key} をクリア`,
+    addListEntry: '追加',
+    removeListEntry: '削除',
+    listEntryPlaceholder: 'ID を入力',
     enableAria: name => `${name} を有効にする`,
     disableAria: name => `${name} を無効にする`,
     platformEnabled: name => `${name} を有効にしました`,
@@ -2003,7 +2001,7 @@ export const ja = defineLocale({
       },
       TELEGRAM_ALLOWED_USERS: {
         label: '許可する Telegram ユーザー ID',
-        help: '推奨。@userinfobot の数値 ID をカンマ区切りで。設定しないと誰でもボットに DM できます。'
+        help: '推奨。@userinfobot の数値 ID（1 欄に 1 件）。設定しないと誰でもボットに DM できます。'
       },
       TELEGRAM_PROXY: { label: 'プロキシ URL', help: 'Telegram がブロックされているネットワークでのみ必要です。' },
       DISCORD_BOT_TOKEN: {
@@ -2012,7 +2010,7 @@ export const ja = defineLocale({
       },
       DISCORD_ALLOWED_USERS: {
         label: '許可する Discord ユーザー ID',
-        help: '推奨。カンマ区切りの Discord ユーザー ID。'
+        help: '推奨。Discord ユーザー ID（1 欄に 1 件）。'
       },
       DISCORD_REPLY_TO_MODE: { label: '返信スタイル', help: 'first、all、または off。' },
       DISCORD_ALLOW_ALL_USERS: {
@@ -2048,20 +2046,20 @@ export const ja = defineLocale({
       },
       SLACK_ALLOWED_USERS: {
         label: '許可する Slack ユーザー ID',
-        help: '推奨。カンマ区切りの Slack ユーザー ID。'
+        help: '推奨。Slack ユーザー ID（1 欄に 1 件）。'
       },
       MATTERMOST_URL: { label: 'サーバー URL', placeholder: 'https://mattermost.example.com' },
       MATTERMOST_TOKEN: { label: 'ボットトークン' },
       MATTERMOST_ALLOWED_USERS: {
         label: '許可するユーザー ID',
-        help: '推奨。カンマ区切りの Mattermost ユーザー ID。'
+        help: '推奨。Mattermost ユーザー ID（1 欄に 1 件）。'
       },
       MATRIX_HOMESERVER: { label: 'ホームサーバー URL', placeholder: 'https://matrix.org' },
       MATRIX_ACCESS_TOKEN: { label: 'アクセストークン' },
       MATRIX_USER_ID: { label: 'ボットユーザー ID', placeholder: '@hermes:example.org' },
       MATRIX_ALLOWED_USERS: {
         label: '許可する Matrix ユーザー ID',
-        help: '推奨。@user:server 形式のカンマ区切りユーザー ID。'
+        help: '推奨。@user:server 形式のユーザー ID（1 欄に 1 件）。'
       },
       SIGNAL_HTTP_URL: {
         label: 'Signal ブリッジ URL',
@@ -2071,7 +2069,7 @@ export const ja = defineLocale({
       SIGNAL_ACCOUNT: { label: '電話番号', help: 'signal-cli ブリッジに登録した番号。' },
       SIGNAL_ALLOWED_USERS: {
         label: '許可する Signal ユーザー',
-        help: '推奨。カンマ区切りの Signal 識別子。'
+        help: '推奨。Signal 識別子（1 欄に 1 件）。'
       },
       WHATSAPP_ENABLED: {
         label: 'WhatsApp ブリッジを有効にする',
@@ -2080,7 +2078,7 @@ export const ja = defineLocale({
       WHATSAPP_MODE: { label: 'ブリッジモード' },
       WHATSAPP_ALLOWED_USERS: {
         label: '許可する WhatsApp ユーザー',
-        help: '推奨。カンマ区切りの電話番号または WhatsApp ID。'
+        help: '推奨。電話番号または WhatsApp ID（1 欄に 1 件）。'
       }
     },
     platformIntro: {}
@@ -3343,27 +3341,14 @@ export const ja = defineLocale({
     windowControls: 'ウィンドウコントロール',
     paneControls: 'ペインコントロール',
     appControls: 'アプリコントロール',
-    modelMenu: {
-      search: 'モデルを検索',
-      noModels: 'モデルが見つかりません',
-      editModels: 'モデルを編集…',
-      followDefault: '設定のデフォルトを使用',
-      refreshModels: 'モデルを更新',
-      favorites: 'お気に入り',
-      addFavorite: 'お気に入りに追加',
-      removeFavorite: 'お気に入りから削除',
-      favoriteShortcut: '⇧ クリック',
-      fast: '高速',
-      free: '無料',
-      cacheRead: 'キャッシュ読み取り',
-      priceTitle: (input: string, output: string, cache: string) =>
-        `入力 ${input}/Mtok · 出力 ${output}/Mtok` + (cache ? ` · キャッシュ読み取り ${cache}/Mtok` : '')
-    },
+    modelMenu: jaModelMenu,
     modelOptions: {
       noOptions: 'このモデルにはオプションがありません',
       options: 'オプション',
       thinking: '思考',
       fast: '高速',
+      ultrafast: 'Ultrafast',
+      useStandardSpeed: '標準速度を使用',
       effort: '努力度',
       minimal: '最小',
       low: '低',
@@ -3425,6 +3410,9 @@ export const ja = defineLocale({
       showTerminal: 'ターミナルを表示',
       hideTerminal: 'ターミナルを非表示',
       gateway: 'ゲートウェイ',
+      backend: 'バックエンド',
+      messagingStopped: 'メッセージング停止',
+      messagingDegraded: name => `${name} 停止`,
       gatewayReady: '準備完了',
       gatewayNeedsSetup: '設定が必要',
       gatewayUnavailable: '推論を利用できません',
@@ -4085,9 +4073,6 @@ export const ja = defineLocale({
     sessionUnavailable: 'セッションが利用できません',
     createSessionFailed: '新しいセッションを作成できませんでした',
     promptFailed: 'プロンプトに失敗しました',
-    staleSessionTitle: 'チャットが最新ではありません',
-    staleSessionBody:
-      'このウィンドウは同じチャットの別ビューより遅れています。最新のメッセージを読み込みました。送信する場合はもう一度送ってください。',
     providerCredentialRequired: '最初のメッセージを送信する前にプロバイダー認証情報を追加してください。',
     emptySlashCommand: '空のスラッシュコマンド',
     slashCommandIgnoredTitle: 'コマンドが送信されませんでした',
