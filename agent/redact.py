@@ -167,6 +167,8 @@ _PREFIX_PATTERNS = [
                                         # request-dump redaction pass never matched it)
     r"1//[A-Za-z0-9_.\-]{35,}",          # Google OAuth refresh token — raw form starts "1//" (2026-09-13: a
                                         # live refresh token reached state.db unredacted)
+    r"ya29\.[A-Za-z0-9_.\-]{20,}",       # Google OAuth access token — raw form starts "ya29." (2026-10-06 RCA:
+                                        # dynamic access token leaked in ps command stdout)
     r"sk_live_[A-Za-z0-9]{10,}",        # Stripe secret key (live)
     r"sk_test_[A-Za-z0-9]{10,}",        # Stripe secret key (test)
     r"rk_live_[A-Za-z0-9]{10,}",        # Stripe restricted key

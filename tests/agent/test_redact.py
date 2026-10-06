@@ -45,6 +45,15 @@ class TestKnownPrefixes:
         for secret_tail in ("abcdefgh1234567890_XYZ", "ZpSh99", "MEUCIQC6UnD", "EEPXREE"):
             assert secret_tail not in read, read
 
+    def test_google_oauth_access_token(self):
+        """Google OAuth access token (ya29. prefix) must be redacted in terminal output (2026-10-06 RCA)."""
+        from agent.redact import redact_terminal_output
+
+        raw = "ps output: cloud-sql-proxy --token ya29.a0AWY7Ckm1234567890abcdefghijklmnopqrstuvwxyz --port 3307"
+        term = redact_terminal_output(raw)
+        assert "ya29.a" in term
+        assert "ya29.a0AWY7Ckm1234567890abcdefghijklmnopqrstuvwxyz" not in term
+
     def test_dotted_and_prefixless_matchers_leave_benign_tokens_alone(self):
         """The Zhipu matcher is provider-shaped, not a generic dotted-token sweep:
         content-hash filenames (incl. ``<sha>.bundle`` / ``<md5>.sqlite3``), bare
