@@ -110,6 +110,35 @@ def _hex_hmac(secret: str, data: bytes) -> str:
     return hmac.new(secret.encode(), data, hashlib.sha256).hexdigest()
 
 
+def _is_usable_secret(secret: object) -> bool:
+    """True when ``secret`` is a string with at least one non-space character.
+
+    A whitespace-only value is what an unset key looks like in config. It is
+    falsy to a person and truthy to ``if not secret``, so a bare falsy check
+    lets it through. Non-strings are rejected for the same reason.
+    """
+    return isinstance(secret, str) and bool(secret.strip())
+
+
+def _normalized_secrets(secret: object) -> list:
+    """Merge resolution (2026-10-07, carried+upstream): rotation-aware usable-secret view.
+
+    carried (26/9): a secret may be a rotation LIST (str|list|tuple) — the request path
+    accepts a signature valid for ANY entry. upstream (2943ee6f19): blank/whitespace-only
+    and non-string secrets are unset-in-disguise and must fail closed (_is_usable_secret).
+    This helper applies upstream's guard PER ENTRY without regressing the rotation contract:
+    str → [str]; list/tuple → entries; anything else → []. Blank/non-string entries drop
+    out; an all-blank value normalizes to [] (= "no usable secret") so both guards hold.
+    """
+    if isinstance(secret, (list, tuple)):
+        raw = list(secret)
+    elif isinstance(secret, str):
+        raw = [secret]
+    else:
+        raw = []
+    return [s for s in raw if _is_usable_secret(s)]
+
+
 def _read_secret_file(path: str, where: str):
     """Externalized HMAC secrets (2026-09-26, RCA-secret-watchdog-locksteal): config.yaml may
     point at a secret file via ``secret_file:`` instead of carrying the raw value inline, so a
@@ -190,6 +219,10 @@ def _validate_svix_signature(body: bytes, secret: str, msg_id: str, timestamp: s
             key = base64.b64decode(secret.removeprefix("whsec_"), validate=True)
         except (binascii.Error, ValueError):
             logger.debug("[webhook] Invalid whsec_ Svix signing secret")
+            return False
+        # "whsec_" alone decodes to b"": a public HMAC key, same as a blank secret. HMAC zero-pads the
+        # key, so an all-NUL key signs exactly like b"" and is refused with it.
+        if not key.strip(b"\x00 \t\r\n\x0b\x0c"):
             return False
     else:
         # Some providers document Svix-style headers but hand out raw shared secrets.
@@ -328,8 +361,12 @@ class WebhookAdapter(BasePlatformAdapter):
     def _validate_route(self, name: str, route: dict) -> None:
         """Startup validation: secret required; INSECURE_NO_AUTH only on loopback (crash early on a public footgun)."""
         secret = route.get("secret", self._global_secret)
-        if not secret:
-            raise ValueError(f"[webhook] Route '{name}' has no HMAC secret. Set 'secret' on the route or globally. "
+        # Merge resolution (2026-10-07): upstream's blank/non-string guard (_is_usable_secret
+        # via _normalized_secrets) applied ROTATION-AWARE — a plain `not _is_usable_secret(secret)`
+        # would reject a legitimate rotation list ("not a string") and regress the carried fix.
+        if not _normalized_secrets(secret):
+            raise ValueError(f"[webhook] Route '{name}' HMAC secret is missing, blank, or not a string. Set 'secret' "
+                             f"on the route or globally. "
                              f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'.")
         # Rotation-aware check (reviewer-fynd 26/9 04:51): the request path treats the secret
         # as a LIST (`_INSECURE_NO_AUTH not in secrets` skips HMAC entirely), so a rotation
@@ -487,11 +524,12 @@ class WebhookAdapter(BasePlatformAdapter):
         """An empty effective secret would make _handle_webhook skip HMAC validation → reject such
         dynamic routes; INSECURE_NO_AUTH is loopback-only."""
         effective_secret = route.get("secret", self._global_secret)
-        raw_secrets = [effective_secret] if isinstance(effective_secret, str) else (list(effective_secret) if isinstance(effective_secret, (list, tuple)) else [])
-        secrets = [s for s in raw_secrets if s]
+        # Merge resolution (2026-10-07): rotation-aware + upstream blank/non-string guard.
+        secrets = _normalized_secrets(effective_secret)
         if not secrets:
-            logger.warning("[webhook] Dynamic route '%s' skipped: 'secret' is missing or empty. Set a valid HMAC "
-                           "secret, or use '%s' to explicitly disable auth (testing only).", name, _INSECURE_NO_AUTH)
+            logger.warning("[webhook] Dynamic route '%s' skipped: 'secret' is missing, blank, or not a string. "
+                           "Set a valid HMAC secret, or use '%s' to explicitly disable auth (testing only).",
+                           name, _INSECURE_NO_AUTH)
             return False
         if _INSECURE_NO_AUTH in secrets and not _is_loopback_host(self._host):
             logger.warning("[webhook] Dynamic route '%s' skipped: INSECURE_NO_AUTH is only allowed on loopback "
@@ -627,10 +665,12 @@ class WebhookAdapter(BasePlatformAdapter):
         # Missing/empty secrets fail closed here too (not only in connect()), so direct handler reuse
         # cannot become an unauthenticated dispatch surface.
         secret_val = route_config.get("secret", self._global_secret)
-        raw_secrets = [secret_val] if isinstance(secret_val, str) else (list(secret_val) if isinstance(secret_val, (list, tuple)) else [])
-        secrets = [s for s in raw_secrets if s]
+        # Merge resolution (2026-10-07): rotation-aware + upstream blank/non-string guard — a
+        # request signed with a whitespace-only secret fails closed here (upstream's test).
+        secrets = _normalized_secrets(secret_val)
         if not secrets:
-            logger.error("[webhook] Route %s has no HMAC secret; refusing request", route_name)
+            logger.error("[webhook] Route %s HMAC secret is missing, blank, or not a string; refusing request",
+                         route_name)
             return None, _json_error("Webhook route is missing an HMAC secret", 403)
         if _INSECURE_NO_AUTH not in secrets and not any(self._validate_signature(request, raw_body, s) for s in secrets):
             logger.warning("[webhook] Invalid signature for route %s", route_name)

@@ -89,12 +89,27 @@ class HomeIOGuard:
             # lagliga där, annars dör hela suiten vid import (hermes_bootstrap ->
             # pm.activate_dependencies):
             #   (a) pm/environments.payload_venv probe:ar <hem>/manifest.json —
-            #       installer-skriven fil, ej användartillstånd; endast metadata-stat.
+            #       installer-skriven fil, ej användartillstånd; stat OCH läsning.
+            #       Upstream (10-04, payload-manifest-parsning) bytte proben från
+            #       metadata-stat till read_text — 26/9-kvittons "endast metadata-stat"
+            #       matchade inte längre och dödade orakel-grinden i huvudträdet
+            #       (208 fel × 4 nätter, kvitto 7/10: 426/426 grön i /tmp-worktree,
+            #       208 röda i huvudträdet på IDENTISKT innehåll). Läsning av exakt
+            #       denna fil är fortfarande "not a payload, never an error" i pm:s
+            #       design; destruktiva operationer vägras som förut.
             #   (b) uppdateringstest-scratch under utcheckningens egna .git, inkl.
             #       .git/worktrees/... admin-kataloger för länkade worktrees.
             # Strängidom (upstream 02f57212 "strings, not pathlib"): samma
             # tillstånd, normcase-jämförelser istället för pathlib.
-            if metadata and any(absolute == _normcase(os.path.join(root, "manifest.json")) for root in roots):
+            if not destructive and any(absolute == _normcase(os.path.join(root, "manifest.json")) for root in roots):
+                # Reviewer-tätning 7/10 (HIGH: symlink-bypass): allow bara om
+                # sista komponenten INTE är en symlink (lstat på exakt denna
+                # sökväg, följer inte länken). Vanlig fil / saknad fil → allow
+                # (pm-proben); symlink → refuse oavsett mål — läsning via
+                # symlink till annat innehåll är aldrig pm-proben. Jämförelse
+                # mot realpath vore falskt positiv på macOS (/var→/private/var).
+                if os.path.islink(absolute):
+                    self.refuse(value)
                 return
             if any(_within(absolute, os.path.join(prefix, ".git")) for prefix in _INTERPRETER_PREFIX_STRS):
                 return
@@ -123,7 +138,7 @@ class HomeIOGuard:
                     self.refuse(value)
             if resolved is None:
                 resolved = _normcase(os.path.realpath(absolute))
-            if metadata and any(resolved == _normcase(os.path.join(root, "manifest.json")) for root in roots):
+            if not destructive and any(resolved == _normcase(os.path.join(root, "manifest.json")) for root in roots):
                 return
             if any(_within(resolved, os.path.join(prefix, ".git")) for prefix in _INTERPRETER_PREFIX_STRS):
                 return
