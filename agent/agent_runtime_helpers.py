@@ -2689,11 +2689,23 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     _norm = lambda s: s.lower().replace("-", "_").replace(" ", "_")  # noqa: E731
     _camel_snake = lambda s: re.sub(r"(?<!^)(?=[A-Z])", "_", s).lower()  # noqa: E731
 
+    _WELL_KNOWN_ALIASES = {
+        "google:python_interpreter": "execute_code",
+        "google_python_interpreter": "execute_code",
+        "python_interpreter": "execute_code",
+        "python": "execute_code",
+        "bash": "terminal",
+        "sh": "terminal",
+        "shell": "terminal",
+    }
+    lowered = tool_name.lower()
+    if lowered in _WELL_KNOWN_ALIASES and _WELL_KNOWN_ALIASES[lowered] in agent.valid_tool_names:
+        return _WELL_KNOWN_ALIASES[lowered]
+
     def _strip_tool_suffix(s: str) -> str | None:
         lc = s.lower()
         return next((s[: -len(sfx)].rstrip("_-") for sfx in ("_tool", "-tool", "tool") if lc.endswith(sfx)), None)
     # Cheap fast-paths first.
-    lowered = tool_name.lower()
     if lowered in agent.valid_tool_names:
         return lowered
     normalized = _norm(tool_name)
