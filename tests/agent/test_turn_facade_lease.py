@@ -121,6 +121,119 @@ def test_timeout_and_interrupt_early_results():
     assert admission.early_result["interrupt_message"] == "stop"
 
 
+def _active_lease(db):
+    agent = _agent(db)
+    calls = []
+    agent.interrupt = lambda msg, **kw: calls.append(msg)
+    lease = DurableTurnLease(agent, db, "s1", "h")
+    lease.turn_active = True
+    return lease, calls
+
+
+def test_refresh_tick_sqlite_lock_keeps_the_turn():
+    db = _Db()
+
+    def locked(session_id, holder, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    db.refresh_session_turn_lease = locked
+    lease, calls = _active_lease(db)
+
+    # False would cancel the refresher; a lock is a missed tick, not a lost lease.
+    assert lease.refresh_tick() is None
+    assert calls == []
+    assert lease.interrupt_message is None
+    assert lease.stop.is_set() is False
+
+
+class _MovingClock:
+    """Wall clock that runs at real speed from a chosen instant, so the store's expiry stamps and
+    the lease's deadline arithmetic see the same time while real lock waits elapse."""
+
+    def __init__(self, at):
+        self._at, self._anchor = at, time.monotonic()
+
+    def time(self):
+        return self._at + (time.monotonic() - self._anchor)
+
+    def set(self, at):
+        self._at, self._anchor = at, time.monotonic()
+
+
+def test_lock_tolerance_never_outlives_the_committed_row_expiry(tmp_path, monkeypatch):
+    """Real SessionDB + a real second-connection write lock. The local deadline never runs past the
+    row's committed expiry (a renewal that waited for the lock), and a renewal blocked near expiry
+    gives up and stops the turn BEFORE the row becomes reclaimable, never after a successor could
+    take it. Control: the lock clearing lets the delayed renewal succeed with no interrupt."""
+    import hermes_state
+    import hermes_state_compression
+    from agent import turn_facade_lease
+
+    clock = _MovingClock(1000.0)
+    fake_time = SimpleNamespace(time=clock.time, monotonic=time.monotonic, sleep=time.sleep)
+    monkeypatch.setattr(turn_facade_lease, "time", fake_time)
+    monkeypatch.setattr(hermes_state_compression, "time", fake_time)
+
+    path = tmp_path / "state.db"
+    db = hermes_state.SessionDB(path)
+    db.create_session("s1", source="test")
+    assert db.try_acquire_session_turn_lease("s1", "h")
+    events = []
+    agent = SimpleNamespace(session_id="s1", interrupt=lambda msg, **kw: events.append((clock.time(), msg)))
+    lease = DurableTurnLease(agent, db, "s1", "h", expires_at=db.session_turn_lease_expires_at("s1", "h"))
+    lease.turn_active = True
+
+    def row_expiry() -> float:
+        committed = db.session_turn_lease_expires_at("s1", "h")
+        assert committed is not None, "the turn lost its lease row"
+        return committed
+
+    def write_lock():
+        conn = sqlite3.connect(path, timeout=0)
+        conn.execute("BEGIN IMMEDIATE")
+        return conn
+
+    # A renewal that waits on the lock still succeeds, and the deadline it adopts is not later than
+    # the expiry the store committed (stamped before the wait). The lock is released only once the
+    # renewal has provably been refused by it (its first retry sleep), never on a timer.
+    clock.set(1060.0)
+    admitted_expiry = row_expiry()
+    blocker = write_lock()
+    refused = threading.Event()
+    real_retry_sleep = db._sleep_before_write_retry
+
+    def retry_sleep(deadline, patience_s):
+        refused.set()
+        return real_retry_sleep(deadline, patience_s)
+
+    monkeypatch.setattr(db, "_sleep_before_write_retry", retry_sleep)
+    worker = threading.Thread(target=lease.refresh_tick)
+    worker.start()
+    assert refused.wait(10), "renewal never reached the locked write"
+    blocker.rollback()
+    blocker.close()
+    worker.join(10)
+    assert not worker.is_alive()
+    assert events == []
+    assert row_expiry() > admitted_expiry, "the delayed renewal must have renewed the row"
+    assert lease._authority_deadline <= row_expiry()
+
+    # Near expiry with the lock held throughout: the renewal must give up and interrupt while the
+    # row is still unexpired, so no successor can reclaim it under a running turn.
+    clock.set(lease._authority_deadline - 3.0)
+    blocker = write_lock()
+    try:
+        assert lease.refresh_tick() is False
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert [msg for _, msg in events] == [
+        "Session turn lease could not be refreshed; stopping to protect the transcript."
+    ]
+    assert events[0][0] < row_expiry()
+    db.close()
+
+
 def test_interrupt_turn_only_while_active():
     agent = _agent(_Db())
     calls = []
@@ -165,7 +278,7 @@ class _ContendedDb(_Db):
         return (self.owner_holder, time.time() + 300.0)
 
 
-def _active_lease(agent, db):
+def _active_contended_lease(agent, db):
     agent.interrupt = lambda msg, **kw: agent.statuses.append(("interrupt", msg))
     lease = DurableTurnLease(agent, db, "s1", "h")
     lease.turn_active = True
@@ -176,7 +289,7 @@ def test_refresh_tick_contention_does_not_interrupt_owned_turn():
     """A 'database is locked' refresh failure with ownership intact continues the turn."""
     db = _ContendedDb(owner_holder="h")
     agent = _agent(db)
-    lease = _active_lease(agent, db)
+    lease = _active_contended_lease(agent, db)
     assert lease.refresh_tick() is None  # timer stays alive
     assert lease.interrupt_message is None
     assert not lease.stop.is_set()
@@ -188,7 +301,7 @@ def test_refresh_tick_interrupts_when_holder_changed():
     """A refresh failure PLUS read-verify showing a different holder interrupts."""
     db = _ContendedDb(owner_holder="someone-else")
     agent = _agent(db)
-    lease = _active_lease(agent, db)
+    lease = _active_contended_lease(agent, db)
     assert lease.refresh_tick() is False  # timer stops
     assert lease.interrupt_message is not None
     assert ("interrupt", lease.interrupt_message) in agent.statuses
@@ -199,7 +312,7 @@ def test_refresh_tick_interrupts_when_lease_row_gone():
     """A refresh failure PLUS absent lease row interrupts (lease no longer exists)."""
     db = _ContendedDb(owner_holder=None)
     agent = _agent(db)
-    lease = _active_lease(agent, db)
+    lease = _active_contended_lease(agent, db)
     assert lease.refresh_tick() is False
     assert lease.interrupt_message is not None
     lease.stop_refresher()
@@ -209,7 +322,7 @@ def test_refresh_tick_interrupts_when_ownership_unverifiable():
     """Fail closed: an unreachable store (owner probe raises) must not run unsynchronized."""
     db = _ContendedDb(owner_holder="h", owner_probe_raises=True)
     agent = _agent(db)
-    lease = _active_lease(agent, db)
+    lease = _active_contended_lease(agent, db)
     assert lease.refresh_tick() is False
     assert lease.interrupt_message is not None
     lease.stop_refresher()
@@ -225,7 +338,7 @@ def test_refresh_tick_refresh_false_still_interrupts():
 
     db.refresh_session_turn_lease = refresh_false
     agent = _agent(db)
-    lease = _active_lease(agent, db)
+    lease = _active_contended_lease(agent, db)
     assert lease.refresh_tick() is False
     assert lease.interrupt_message is not None
     lease.stop_refresher()
