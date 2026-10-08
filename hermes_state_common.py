@@ -900,7 +900,7 @@ CREATE VIEW IF NOT EXISTS messages_fts_trigram_src AS
     SELECT m.id, m.role, m.content, m.tool_name
     FROM messages AS m
     JOIN sessions AS s ON s.id = m.session_id
-    WHERE m.role <> 'tool' AND {fts_trigram_session_sql('s')};
+    WHERE m.active = 1 AND m.role <> 'tool' AND {fts_trigram_session_sql('s')};
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
     content,
