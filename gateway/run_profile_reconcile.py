@@ -292,8 +292,18 @@ class GatewayProfileReconcileMixin:
                 from hermes_state_registry import close_all_under
                 close_all_under(home)
             with _log_suppressed(logging.DEBUG, "memory-store release failed", exc_info=True):
-                from plugins.memory.holographic.store import MemoryStore
-                MemoryStore.release_all_under(home)
+                from plugins.memory import import_provider_module  # catalog plugin since it left core
+                import_provider_module("holographic", "store").MemoryStore.release_all_under(home)
+            # The gateway process is a second holder the CLI-side delete cannot reach: its routed
+            # log files (logs/.__agent.lock, logs/.__errors.lock) and its scoped MCP servers'
+            # mcp-stderr.log handle live HERE, so unserve must release them in this process too
+            # (#130244) — the same two calls ``delete_profile`` makes for the deleting process.
+            # Both calls BLOCK (the log release stops/joins the QueueListener, which can be inside
+            # a ConcurrentRotatingFileHandler emit waiting on another process's rotation lock; the
+            # MCP shutdown waits on future.result for the MCP loop), so they run off the loop in a
+            # worker thread — otherwise every other served profile's events stall behind them.
+            # ``asyncio.to_thread`` copies the context, so the surrounding
+            # ``_profile_runtime_scope`` home/secret override stays visible in the worker.
             with _log_suppressed(logging.DEBUG, "scoped MCP shutdown failed", exc_info=True):
                 from hermes_constants import hermes_home_key
                 from tools.mcp_tool_lifecycle import shutdown_mcp_servers
