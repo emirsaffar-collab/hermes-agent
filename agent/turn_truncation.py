@@ -445,6 +445,48 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
     )
 
 
+def _runaway_repetition_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[TruncationVerdict]:
+    """Runaway repetition stream cut → fallback. The loop is model-intrinsic — the cut is
+    Hermes' own guard firing on a degenerate model (both flash tiers loop, overwhelmingly in
+    the reasoning channel), so retrying the primary re-enters it. Escalate to the fallback
+    chain BEFORE ending the turn, mirroring ``_content_filter_fallback``; the chain walk is
+    bounded by its length, and once it is exhausted the caller ends the turn as before."""
+    agent = st.agent
+    if not (
+        agent.api_mode in _CONTINUABLE_MODES
+        and agent._fallback_index < len(agent._fallback_chain)
+    ):
+        return None
+    agent._vprint(
+        f"{agent.log_prefix}🔁 Repetition loop cut the stream — activating fallback provider...",
+        force=True, diagnostic=True,
+    )
+    agent._emit_diagnostic_status("Repetition loop cut the stream; switching to fallback...")
+    if agent._try_activate_fallback():
+        # Roll partial content back to the last clean turn so the fallback gets a
+        # coherent continuation point; unmark survivors (their text left the partial).
+        if st.truncated_response_parts:
+            st.messages = agent._get_messages_up_to_last_assistant(st.messages)
+        for _frag in st.messages:
+            if isinstance(_frag, dict):
+                _frag.pop("_length_continuation_fragment", None)
+                _frag.pop("_length_continuation_nudge", None)
+        agent._session_messages = st.messages
+        st.length_continue_retries = 0
+        st.truncated_response_parts = []
+        st.retry_count = 0
+        st.compression_attempts = 0
+        _retry.primary_recovery_attempted = False
+        _retry.restart_with_rebuilt_messages = True
+        return st.done("break")
+    agent._vprint(
+        f"{agent.log_prefix}⚠️  No fallback provider activated — ending the turn "
+        f"(retrying {agent.model} would only re-enter the loop)",
+        force=True, diagnostic=True,
+    )
+    return None
+
+
 def recover_from_truncation(
     agent: Any, response: Any, finish_reason: str, _retry: TurnRetryState, *,
     messages: list[dict[str, Any]], conversation_history: Any, api_kwargs: Any, api_call_count: int,
@@ -467,7 +509,11 @@ def recover_from_truncation(
     )
     if getattr(response, "_runaway_repetition", False):
         # The streaming call cut a live repetition loop: a continuation would only re-enter it,
-        # whatever the partial or its tool calls look like.
+        # whatever the partial or its tool calls look like. But the loop is model-intrinsic —
+        # escalate to the fallback chain once before ending the turn on this mark.
+        _rep_fb = _runaway_repetition_fallback(st, _retry)
+        if _rep_fb is not None:
+            return _rep_fb
         line, user_response, error = _REPETITION_STREAM_CUT
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
         return st.end_turn(user_response, error)
