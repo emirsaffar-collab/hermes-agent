@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import gateway.wake as wake
+from gateway import wake
 from gateway.config import Platform
 from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.wake import WakeNotAccepted
@@ -85,7 +85,8 @@ def test_lease_fence_wake_maps_to_defer_settlement(runner, monkeypatch):
 
     async def preflight(evt):
         return SimpleNamespace(
-            proceed=True, early_result=None, delegation_id="deleg_x", claim_id="claim_x"
+            proceed=True, early_result=None, delegation_id="deleg_x", claim_id="claim_x",
+            owner_session_id=None, proven_session_id=None, defer=False,
         )
 
     monkeypatch.setattr(runner, "_inject_watch_notification", inject)
@@ -163,7 +164,7 @@ def test_lease_fence_deferred_before_claim_in_preflight():
     runner.adapters[Platform.API_SERVER] = _Adapter()
     runner._session_db = _LeaseActiveDB()
 
-    async def _classify(parent):
+    async def _classify(parent, session_key=""):
         return "deliver"
 
     runner._classify_completion_target = _classify
@@ -203,7 +204,7 @@ def test_lease_probe_fails_open_on_errors():
     runner.adapters[Platform.API_SERVER] = _Adapter()
     runner._session_db = _BrokenDB()
 
-    async def _classify(parent):
+    async def _classify(parent, session_key=""):
         return "deliver"
 
     runner._classify_completion_target = _classify
