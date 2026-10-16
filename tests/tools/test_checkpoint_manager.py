@@ -1386,3 +1386,21 @@ class TestSessionDiff:
         assert result["success"] is True
         assert "feature.py" in result["diff"]
         assert "+x = 1" in result["diff"]
+
+    def test_stale_index_lock_is_reaped_before_git_add(self, mgr, work_dir, checkpoint_base):
+        """An orphaned indexes/<hash>.lock left by a killed git add -A must be reaped
+        once past the stale window so subsequent checkpoints do not wedge with rc=128."""
+        mgr.ensure_checkpoint(str(work_dir), "baseline")
+        store = _store_path(checkpoint_base)
+        dir_hash = _project_hash(str(work_dir))
+        lock_file = store / "indexes" / f"{dir_hash}.lock"
+        lock_file.write_bytes(b"")
+        stale_ts = time.time() - 600
+        os.utime(lock_file, (stale_ts, stale_ts))
+
+        (work_dir / "after_lock.py").write_text("y = 2\n")
+        mgr.new_turn()
+        cp = mgr.ensure_checkpoint(str(work_dir), "after stale lock")
+        assert cp is True
+        assert not lock_file.exists()
+

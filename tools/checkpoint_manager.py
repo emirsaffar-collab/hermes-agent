@@ -379,6 +379,18 @@ def _run_git(
         logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
         return False, "", msg
 
+    if index_file is not None:
+        lock_file = Path(f"{index_file}.lock")
+        try:
+            st = lock_file.stat()
+            if (time.time() - st.st_mtime) > max(timeout * 2, 120):
+                lock_file.unlink()
+                logger.warning("Reaped stale checkpoint index lock: %s", lock_file)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
     env = _git_env(store, str(normalized_working_dir), index_file=index_file)
     if extra_env:
         env.update(extra_env)

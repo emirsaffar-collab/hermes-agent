@@ -88,10 +88,22 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
-def _job_route_pinned(job: dict) -> bool:
+def _job_route_pinned(job: dict, cfg: Any = None) -> bool:
     """True when the job carries its own provider, model or endpoint. Unpinned jobs store none of
-    these (they follow the main model at fire time), so any value is an explicit operator pin."""
-    return any(isinstance(job.get(k), str) and job[k].strip() for k in ("provider", "model", "base_url"))
+    these (they follow the main model at fire time), so any value is an explicit operator pin —
+    except when ``job["model"]`` merely repeats the fleet-wide ``cron.model`` default (with no
+    provider or endpoint pin), which is a fleet-default stamp rather than a custom route pin."""
+    if any(isinstance(job.get(k), str) and job[k].strip() for k in ("provider", "base_url")):
+        return True
+    raw_model = job.get("model")
+    job_model = raw_model.strip() if isinstance(raw_model, str) else ""
+    if not job_model:
+        return False
+    cron_cfg = (cfg.get("cron") if isinstance(cfg, dict) else None) or {}
+    cron_default_model = str(cron_cfg.get("model") or "").strip() if isinstance(cron_cfg, dict) else ""
+    if cron_default_model and job_model == cron_default_model:
+        return False
+    return True
 
 
 def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
@@ -100,10 +112,17 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     A pinned job never borrows the global ``fallback_providers`` chain, the same rule a pinned
     ``delegate_task`` child follows (``scoped_fallback_chain``): a chain entry is a different
     provider and usually a different model, which is exactly what the pin ruled out. Same-provider
-    credential-pool rotation is not the chain and still applies. Unpinned jobs inherit the chain.
+    credential-pool rotation is not the chain and still applies. Unpinned jobs (and jobs whose
+    model merely matches the fleet ``cron.model`` default) inherit the chain.
     """
+    cron_cfg = (cfg.get("cron") if isinstance(cfg, dict) else None) or {}
+    declared = (
+        job.get("fallback_providers")
+        if isinstance(job, dict) and job.get("fallback_providers") is not None
+        else (cron_cfg.get("fallback_providers") if isinstance(cron_cfg, dict) else None)
+    )
     return scoped_fallback_chain(
-        get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
+        get_fallback_chain(cfg), declared, pinned=_job_route_pinned(job, cfg), owner="cron job")
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
@@ -111,14 +130,19 @@ def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
     failed too" vs "none configured" (most installs). Fails open to "the backups failed too" if
     config can't be read — never crash delivery.
     """
-    if job is not None and _job_route_pinned(job):
+    try:
+        cfg = load_config() or {}
+    except Exception:
+        cfg = None
+    if job is not None and _job_route_pinned(job, cfg):
         return (
             "This job is pinned to its own provider/model, so it does not fall back to "
             f"`fallback_providers`; `hermes cron edit {job.get('id')} --unpin` lets it follow the "
             "main model and its fallback chain."
         )
+    if cfg is None:
+        return "No backup provider succeeded either."
     try:
-        cfg = load_config() or {}
         chain = get_fallback_chain(cfg)
     except Exception:
         return "No backup provider succeeded either."
@@ -1793,7 +1817,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             "Job '%s': primary provider resolve failed (%s: %s), %s",
             job_id, "auth" if is_auth else "transient network", resolve_exc,
             "trying fallback" if chain else (
-                "not falling back: the job is pinned" if _job_route_pinned(job) else "no fallback configured"))
+                "not falling back: the job is pinned" if _job_route_pinned(job, jc.cfg) else "no fallback configured"))
         for entry in chain:
             if not isinstance(entry, dict):
                 continue

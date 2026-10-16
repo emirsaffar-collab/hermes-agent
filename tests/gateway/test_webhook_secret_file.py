@@ -46,6 +46,8 @@ def _generic_signature(body: bytes, secret: str) -> str:
 
 def _create_app(adapter: WebhookAdapter) -> web.Application:
     app = web.Application(client_max_size=adapter._max_body_bytes)
+    from tests.gateway.fixtures.webhook_route_authority import mount_authority
+    mount_authority(app, adapter)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
     return app
