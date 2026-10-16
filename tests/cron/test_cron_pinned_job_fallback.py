@@ -241,5 +241,18 @@ def test_job_matching_fleet_cron_default_model_inherits_fallback_chain():
     provider_pinned = _job(provider="anthropic", model="z-ai/glm-5.3-flash")
     assert scheduler._job_route_pinned(provider_pinned, cfg_with_cron_fb) is True
     assert scheduler._job_fallback_chain(provider_pinned, cfg_with_cron_fb) is None
+    # Inherited global chain strips entries matching cron.model so cron failover does not
+    # emit 'Fallback skip: chain entry ... resolves to the same backend as the current one'.
+    cfg_self_in_global = {
+        "cron": {"model": "z-ai/glm-5.3-flash"},
+        "fallback_providers": [
+            {"provider": "openrouter", "model": "z-ai/glm-5.3-flash"},
+            {"provider": "openrouter", "model": "google/gemini-2.5-flash-lite"},
+        ],
+    }
+    assert scheduler._job_fallback_chain(job, cfg_self_in_global) == [
+        {"provider": "openrouter", "model": "google/gemini-2.5-flash-lite"}
+    ]
+
 
 

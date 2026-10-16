@@ -58,8 +58,14 @@ def test_provider_latency_circuit_breaker_suppresses_repeat_warnings_while_demot
         record_provider_latency("google/gemini-4-argon", "Google", 28.0)  # transitions to demoted -> 1st WARNING
         record_provider_latency("google/gemini-4-argon", "Google", 31.0)  # already demoted -> must NOT warn again
         record_provider_latency("google/gemini-4-argon", "Google", 24.0)  # already demoted -> must NOT warn again
+        # Flapping across the 20.0s boundary within the same 600s window must also NOT re-warn:
+        record_provider_latency("google/gemini-4-argon", "Google", 10.0)
+        record_provider_latency("google/gemini-4-argon", "Google", 10.0)
+        record_provider_latency("google/gemini-4-argon", "Google", 10.0)  # avg drops to 17.0s < 20s (early recovery)
+        record_provider_latency("google/gemini-4-argon", "Google", 35.0)
+        record_provider_latency("google/gemini-4-argon", "Google", 35.0)  # avg jumps to 20.0s >= 20s again within 600s
 
     warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1, f"Expected exactly 1 transition warning while in cooldown, got {len(warnings)}: {warnings}"
+    assert len(warnings) == 1, f"Expected exactly 1 transition warning while in 600s window, got {len(warnings)}: {warnings}"
     assert is_provider_demoted("google/gemini-4-argon", "Google")
 

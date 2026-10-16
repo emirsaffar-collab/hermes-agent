@@ -122,8 +122,21 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
         if isinstance(job, dict) and job.get("fallback_providers") is not None
         else (None if pinned else (cron_cfg.get("fallback_providers") if isinstance(cron_cfg, dict) else None))
     )
-    return scoped_fallback_chain(
+    chain = scoped_fallback_chain(
         get_fallback_chain(cfg), declared, pinned=pinned, owner="cron job")
+    if chain and declared is None:
+        eff_model = str(
+            (job.get("model") if isinstance(job, dict) else None)
+            or (cron_cfg.get("model") if isinstance(cron_cfg, dict) else None)
+            or ""
+        ).strip().lower()
+        if eff_model:
+            filtered = [
+                entry for entry in chain
+                if not (isinstance(entry, dict) and str(entry.get("model") or "").strip().lower() == eff_model)
+            ]
+            return filtered or None
+    return chain
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:

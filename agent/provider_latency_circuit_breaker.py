@@ -24,6 +24,8 @@ _lock = threading.Lock()
 _history: dict[tuple[str, str], collections.deque[float]] = {}
 # (model, provider) -> demoted_until_timestamp
 _demoted_until: dict[tuple[str, str], float] = {}
+# (model, provider) -> warning_suppressed_until_timestamp (prevents flapping across 20s within 600s from re-warning)
+_warned_until: dict[tuple[str, str], float] = {}
 
 
 def record_provider_latency(model: str, provider: str, duration_s: float) -> None:
@@ -40,9 +42,14 @@ def record_provider_latency(model: str, provider: str, duration_s: float) -> Non
         avg = sum(_history[key]) / len(_history[key])
         if len(_history[key]) >= 2 and avg >= _DEGRADED_LATENCY_THRESHOLD_S:
             prev_until = _demoted_until.get(key)
-            already_demoted = prev_until is not None and now < prev_until
+            warn_until = _warned_until.get(key)
+            already_demoted = (prev_until is not None and now < prev_until) or (
+                warn_until is not None and now < warn_until
+            )
             until = now + _COOLDOWN_SECONDS
             _demoted_until[key] = until
+            if not already_demoted:
+                _warned_until[key] = until
             log_fn = logger.debug if already_demoted else logger.warning
             log_fn(
                 "provider circuit-breaker: %s @ %s degraded (avg=%.1fs over %d calls); demoting for %.0fs",
@@ -160,4 +167,5 @@ def reset_circuit_breaker() -> None:
     with _lock:
         _history.clear()
         _demoted_until.clear()
+        _warned_until.clear()
         _last_escalation_attempt.clear()
