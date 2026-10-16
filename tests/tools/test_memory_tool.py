@@ -491,6 +491,26 @@ class TestMemoryToolDispatcher:
         assert result["success"] is False
         assert "Missing required parameter" in result["error"]
 
+    def test_dropped_action_with_patch_shape_is_repaired(self, store):
+        # Fallback models drop the `action` key while keeping old_text+content and
+        # never re-read the error (state.db 16/10: 3 identical rejects in one
+        # session, zero retries). {old_text, content} without action can only mean
+        # patch (add takes no old_text, remove takes no content) — repair it.
+        store.add("memory", "old fact")
+        result = json.loads(memory_tool(
+            target="memory", old_text="old fact", content="new fact", store=store))
+        assert result["success"] is True, result
+        assert store.memory_entries == ["new fact"]
+
+    def test_dropped_action_with_ambiguous_shape_still_rejected(self, store):
+        # content-only or old_text-only without action stays ambiguous (add?
+        # remove? patch?) — keep the actionable error.
+        for kwargs in ({"content": "new fact"}, {"old_text": "some anchor"},
+                       {"old_text": "some anchor", "content": ""}):
+            result = json.loads(memory_tool(target="memory", store=store, **kwargs))
+            assert result["success"] is False, kwargs
+            assert "Missing required parameter" in result["error"], kwargs
+
 
 
     def test_replace_is_refused_and_points_at_patch(self, store):

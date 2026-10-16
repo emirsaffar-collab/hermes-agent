@@ -292,10 +292,20 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
     # "Unknown action 'None'" error, which gives the model no signal about
     # *why* the call was malformed and can trigger repeated retries. (#64291)
     if not action and not operations:
-        return _invalid(
-            "Missing required parameter: provide 'action' (add/patch/remove) "
-            "or 'operations' (batch list). Got neither."
-        )
+        if old_text and content:
+            # Unambiguous patch shape with the action key dropped: repair instead
+            # of rejecting. Fallback models omit `action` while keeping the rest
+            # of the arguments and never re-read the error (state.db 16/10: 3
+            # identical rejects in one session, zero retries). `patch` is the
+            # only action a {old_text, content} pair can mean — `add` takes no
+            # old_text, `remove` takes no content — so this cannot misfire, and
+            # every downstream gate (delete gate, write gate) still applies.
+            action = "patch"
+        else:
+            return _invalid(
+                "Missing required parameter: provide 'action' (add/patch/remove) "
+                "or 'operations' (batch list). Got neither."
+            )
     if action == "replace":
         return _invalid(_REPLACE_REMOVED)
     if action not in _STORE_ACTIONS:
