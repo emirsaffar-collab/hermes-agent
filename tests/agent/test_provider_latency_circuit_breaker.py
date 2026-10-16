@@ -43,3 +43,23 @@ def test_provider_latency_circuit_breaker_case_insensitive():
     record_provider_latency("z-ai/glm-5.3-flash", "NOVITA", 40.0)
     assert is_provider_demoted("z-ai/glm-5.3-flash", "Novita")
     assert adjust_provider_order("z-ai/glm-5.3-flash", ["Novita", "Relace"]) == ["Relace", "Novita"]
+
+
+def test_provider_latency_circuit_breaker_suppresses_repeat_warnings_while_demoted(caplog):
+    """Once a (model, provider) pair enters active cooldown, subsequent slow calls
+    refresh the cooldown without re-emitting WARNING on every turn (prevents 70+
+    warnings/10m on single-provider reasoning models like google/gemini-4-argon @ Google
+    from tripping provider-latency-storm-watchdog)."""
+    import logging
+
+    reset_circuit_breaker()
+    with caplog.at_level(logging.WARNING, logger="agent.provider_latency_circuit_breaker"):
+        record_provider_latency("google/gemini-4-argon", "Google", 25.0)
+        record_provider_latency("google/gemini-4-argon", "Google", 28.0)  # transitions to demoted -> 1st WARNING
+        record_provider_latency("google/gemini-4-argon", "Google", 31.0)  # already demoted -> must NOT warn again
+        record_provider_latency("google/gemini-4-argon", "Google", 24.0)  # already demoted -> must NOT warn again
+
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"Expected exactly 1 transition warning while in cooldown, got {len(warnings)}: {warnings}"
+    assert is_provider_demoted("google/gemini-4-argon", "Google")
+

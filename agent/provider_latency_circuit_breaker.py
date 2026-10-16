@@ -39,9 +39,12 @@ def record_provider_latency(model: str, provider: str, duration_s: float) -> Non
         # Check if rolling average exceeds threshold
         avg = sum(_history[key]) / len(_history[key])
         if len(_history[key]) >= 2 and avg >= _DEGRADED_LATENCY_THRESHOLD_S:
+            prev_until = _demoted_until.get(key)
+            already_demoted = prev_until is not None and now < prev_until
             until = now + _COOLDOWN_SECONDS
             _demoted_until[key] = until
-            logger.warning(
+            log_fn = logger.debug if already_demoted else logger.warning
+            log_fn(
                 "provider circuit-breaker: %s @ %s degraded (avg=%.1fs over %d calls); demoting for %.0fs",
                 model, provider, avg, len(_history[key]), _COOLDOWN_SECONDS,
             )
