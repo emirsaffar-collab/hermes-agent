@@ -65,6 +65,9 @@ _orphan_lock = threading.Lock()
 # that copy is alive. A consumer that discards its copy with the row still pending hands it back
 # (``return_completion_offer``); the delivery claim stays the only thing that settles the row.
 _offered: set = set()
+# Delegation ids this process first offered from its startup replay. Their copies carry
+# ``startup_replay`` on the sweep's later re-offers too, so a refused one stays gated.
+_startup_replayed: set = set()
 _last_orphan_sweep: dict[str, float] = {}
 
 # ── Stale-delegation detection (progress-based, on by default) ──────────────
@@ -351,10 +354,10 @@ def restore_undelivered_completions(target_queue) -> int:
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
-        return _replay_pending(conn, rows, target_queue, now)
+        return _replay_pending(conn, rows, target_queue, now, startup=True)
 
 
-def _replay_pending(conn, rows, target_queue, now: float) -> int:
+def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = False) -> int:
     """Put each pending ``(delegation_id, event_json, completed_at, dispatched_at)`` row on ``target_queue``
     stamped ``restored``, or terminally drop it past ``_MAX_COMPLETION_REPLAY_AGE_S``. Records the offer so
     the orphan sweep skips the row until the copy is handed back (``return_completion_offer``)."""
@@ -378,7 +381,13 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
         evt = json.loads(payload)
         if isinstance(evt, dict):
             evt = redact_completion_event(evt)
-            evt["restored"] = True
+        with _orphan_lock:
+            if startup:
+                _startup_replayed.add(delegation_id)
+            if isinstance(evt, dict):
+                evt["restored"] = True
+                if delegation_id in _startup_replayed:
+                    evt["startup_replay"] = True
         target_queue.put(evt)
         with _orphan_lock:
             _offered.add((home, delegation_id))
@@ -585,6 +594,8 @@ def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
             return False
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchall()
+        with _orphan_lock:  # an admitted copy already had its consumer: requeue keeps live routing
+            _startup_replayed.discard(delegation_id)
         return _replay_pending(conn, rows, target_queue, now) == 1
 
 
@@ -1288,4 +1299,5 @@ def _reset_for_tests() -> None:
         _records.clear()
     with _orphan_lock:
         _offered.clear()
+        _startup_replayed.clear()
         _last_orphan_sweep.clear()
