@@ -112,3 +112,30 @@ def test_response_between_restarts_resets_the_bound(flag):
         restart_count = verdict.restart_count
     assert actions == ["continue"] * (3 * MAX_RETRIES)
     assert agent.steered == []
+
+
+def test_rebuilt_restarts_allow_full_fallback_chain_when_max_retries_is_one():
+    """CF-20: When api_max_retries=1 but _fallback_chain has 3 entries, each fallback hop
+    arms restart_with_rebuilt_messages once; the cap must allow len(_fallback_chain) hops
+    before breaking with rebuilt_restart_limit_exceeded."""
+    agent = _agent()
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "z-ai/glm-5.3-flash"},
+        {"provider": "openrouter", "model": "google/gemini-2.5-flash-lite"},
+        {"provider": "openrouter", "model": "z-ai/glm-5.3"},
+    ]
+    restart_count, verdicts = 0, []
+    for _ in range(4):
+        _retry = TurnRetryState(restart_with_rebuilt_messages=True)
+        v = apply_retry_restarts(
+            agent, _retry=_retry, response=None, interrupted=False, messages=[],
+            conversation_history=[], user_message="hi", api_kwargs={}, current_turn_user_idx=0,
+            final_response=None, retry_count=0, max_retries=1, api_call_count=1,
+            restart_count=restart_count, length_continue_retries=0,
+            _preflight_compression_blocked=True, _turn_exit_reason="unknown",
+        )
+        verdicts.append(v)
+        restart_count = v.restart_count
+    assert [v.action for v in verdicts] == ["continue", "continue", "continue", "break"]
+    assert verdicts[-1]._turn_exit_reason == "rebuilt_restart_limit_exceeded"
+
