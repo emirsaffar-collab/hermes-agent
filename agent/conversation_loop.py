@@ -40,7 +40,7 @@ from agent.turn_retry_state import TurnRetryState
 from agent.turn_scripted_prelude import Prelude, play_prelude
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
-from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call, provider_latency_escalation_guard
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, failed_turn_notice, site_copy
@@ -1512,6 +1512,10 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
         if _ng.action == "return":
             return _ng.result
         if _ng.action == "break":
+            return None
+        # DQ #218: all providers of the current model latency-demoted → escalate MODEL.
+        _lg = _run_phase(provider_latency_escalation_guard, agent, s)
+        if _lg.action == "break":
             return None
         try:
             _run_phase(build_api_request, agent, s)

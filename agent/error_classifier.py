@@ -42,6 +42,7 @@ class FailoverReason(enum.Enum):
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
     server_error = "server_error"        # 500/502 — internal server error, retry
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    provider_latency = "provider_latency"  # Every provider of the model is breaker-demoted for latency — escalate the model, providers are the broken layer
     ssl_cert_verification = "ssl_cert_verification"  # Deterministic TLS chain failure — fail fast with guidance
     context_overflow = "context_overflow"  # Context too large — compress, not failover
     payload_too_large = "payload_too_large"  # 413 — compress payload

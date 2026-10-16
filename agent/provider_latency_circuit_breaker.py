@@ -99,8 +99,62 @@ def adjust_provider_order(model: str, order: Sequence[str]) -> list[str]:
     return list(order)
 
 
+def all_providers_demoted(model: str, order: Sequence[str] | None = None) -> bool:
+    """True when every provider available to *model* is in latency cooldown.
+
+    With a pinned provider ``order`` (``provider_routing.models.<id>.order``) the verdict
+    covers that full population — including providers never observed this session. Without
+    one, it covers the providers the breaker has actually seen for the model (history ∪
+    cooldowns) and requires at least two, so a single flaky provider never escalates the
+    model. Companion to the model-escalation guard (DQ #218): the breaker alone only
+    reorders providers, so an all-demoted model would keep stalling.
+    """
+    if not model:
+        return False
+    now = time.monotonic()
+    m = model.lower()
+    with _lock:
+        # Same lazy expiry as is_provider_demoted: drop lapsed cooldowns first.
+        for key in [k for k, until in _demoted_until.items() if now >= until]:
+            del _demoted_until[key]
+        if order:
+            providers = [str(p).lower() for p in order if str(p)]
+            if not providers:
+                return False
+            return all((m, p) in _demoted_until for p in providers)
+        seen = {p for (mm, p) in set(_demoted_until) | set(_history) if mm == m}
+        return len(seen) >= 2 and all((m, p) in _demoted_until for p in seen)
+
+
+_ESCALATION_RETRY_S = 60.0
+# model -> monotonic timestamp of the last model-escalation attempt
+_last_escalation_attempt: dict[str, float] = {}
+
+
+def latency_escalation_due(model: str) -> bool:
+    """True when the model-escalation guard may attempt a fallback switch for *model*.
+
+    Throttles repeat attempts (exhausted chains, flapping providers) to one per
+    ``_ESCALATION_RETRY_S`` so the retry loop and parallel sessions don't walk a dead
+    fallback chain on every pass.
+    """
+    if not model:
+        return False
+    with _lock:
+        last = _last_escalation_attempt.get(model.lower())
+        return last is None or (time.monotonic() - last) >= _ESCALATION_RETRY_S
+
+
+def mark_latency_escalation(model: str) -> None:
+    """Record that a model-escalation attempt was made for *model* now."""
+    if model:
+        with _lock:
+            _last_escalation_attempt[model.lower()] = time.monotonic()
+
+
 def reset_circuit_breaker() -> None:
     """Testing helper to clear all in-memory breaker state."""
     with _lock:
         _history.clear()
         _demoted_until.clear()
+        _last_escalation_attempt.clear()

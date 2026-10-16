@@ -1823,6 +1823,7 @@ _FALLBACK_REASON_LABELS = {
     FailoverReason.overloaded: "provider overloaded",
     FailoverReason.server_error: "provider server error",
     FailoverReason.timeout: "request timeout",
+    FailoverReason.provider_latency: "all providers latency-demoted (breaker)",
     FailoverReason.ssl_cert_verification: "TLS certificate verification failed",
     FailoverReason.context_overflow: "context window exceeded",
     FailoverReason.payload_too_large: "request payload too large",
