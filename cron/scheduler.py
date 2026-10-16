@@ -109,20 +109,21 @@ def _job_route_pinned(job: dict, cfg: Any = None) -> bool:
 def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     """The fallback chain this job may walk, at credential resolution AND mid-run (#100437).
 
-    A pinned job never borrows the global ``fallback_providers`` chain, the same rule a pinned
-    ``delegate_task`` child follows (``scoped_fallback_chain``): a chain entry is a different
-    provider and usually a different model, which is exactly what the pin ruled out. Same-provider
-    credential-pool rotation is not the chain and still applies. Unpinned jobs (and jobs whose
-    model merely matches the fleet ``cron.model`` default) inherit the chain.
+    A pinned job never borrows the global or cron-wide ``fallback_providers`` chain, the same rule
+    a pinned ``delegate_task`` child follows (``scoped_fallback_chain``): a chain entry is a
+    different provider and usually a different model, which is exactly what the pin ruled out.
+    Same-provider credential-pool rotation is not the chain and still applies. Unpinned jobs (and
+    jobs whose model merely matches the fleet ``cron.model`` default) inherit the chain.
     """
+    pinned = _job_route_pinned(job, cfg)
     cron_cfg = (cfg.get("cron") if isinstance(cfg, dict) else None) or {}
     declared = (
         job.get("fallback_providers")
         if isinstance(job, dict) and job.get("fallback_providers") is not None
-        else (cron_cfg.get("fallback_providers") if isinstance(cron_cfg, dict) else None)
+        else (None if pinned else (cron_cfg.get("fallback_providers") if isinstance(cron_cfg, dict) else None))
     )
     return scoped_fallback_chain(
-        get_fallback_chain(cfg), declared, pinned=_job_route_pinned(job, cfg), owner="cron job")
+        get_fallback_chain(cfg), declared, pinned=pinned, owner="cron job")
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
@@ -133,15 +134,13 @@ def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
     try:
         cfg = load_config() or {}
     except Exception:
-        cfg = None
+        return "No backup provider succeeded either."
     if job is not None and _job_route_pinned(job, cfg):
         return (
             "This job is pinned to its own provider/model, so it does not fall back to "
             f"`fallback_providers`; `hermes cron edit {job.get('id')} --unpin` lets it follow the "
             "main model and its fallback chain."
         )
-    if cfg is None:
-        return "No backup provider succeeded either."
     try:
         chain = get_fallback_chain(cfg)
     except Exception:

@@ -139,3 +139,46 @@ def test_rebuilt_restarts_allow_full_fallback_chain_when_max_retries_is_one():
     assert [v.action for v in verdicts] == ["continue", "continue", "continue", "break"]
     assert verdicts[-1]._turn_exit_reason == "rebuilt_restart_limit_exceeded"
 
+
+def test_interleaved_redirect_and_rebuilt_restarts_do_not_starve_each_other():
+    """MAJOR-1 & MINOR-1: A user redirect during a failover walk must not starve the 3rd
+    fallback hop, and a completed 3-hop failover walk must still allow a user redirect
+    before tripping redirect_restart_limit_exceeded; max_retries=0 disables both."""
+    agent = _agent()
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "z-ai/glm-5.3-flash"},
+        {"provider": "openrouter", "model": "google/gemini-2.5-flash-lite"},
+        {"provider": "openrouter", "model": "z-ai/glm-5.3"},
+    ]
+    restart_count, actions = 0, []
+    for flag in [
+        "restart_with_redirected_messages",
+        "restart_with_rebuilt_messages",
+        "restart_with_rebuilt_messages",
+        "restart_with_rebuilt_messages",
+        "restart_with_redirected_messages",
+    ]:
+        _retry = TurnRetryState(**{flag: True})
+        v = apply_retry_restarts(
+            agent, _retry=_retry, response=None, interrupted=False, messages=[],
+            conversation_history=[], user_message="hi", api_kwargs={}, current_turn_user_idx=0,
+            final_response=None, retry_count=0, max_retries=1, api_call_count=1,
+            restart_count=restart_count, length_continue_retries=0,
+            _preflight_compression_blocked=True, _turn_exit_reason="unknown",
+        )
+        actions.append((v.action, v._turn_exit_reason))
+        restart_count = v.restart_count
+    assert [a[0] for a in actions] == ["continue", "continue", "continue", "continue", "break"]
+    assert actions[-1][1] == "redirect_restart_limit_exceeded"
+
+    # max_retries=0 disables rebuilt restarts even when _fallback_chain is non-empty.
+    v0 = apply_retry_restarts(
+        agent, _retry=TurnRetryState(restart_with_rebuilt_messages=True), response=None,
+        interrupted=False, messages=[], conversation_history=[], user_message="hi",
+        api_kwargs={}, current_turn_user_idx=0, final_response=None, retry_count=0,
+        max_retries=0, api_call_count=1, restart_count=0, length_continue_retries=0,
+        _preflight_compression_blocked=True, _turn_exit_reason="unknown",
+    )
+    assert (v0.action, v0._turn_exit_reason) == ("break", "rebuilt_restart_limit_exceeded")
+
+

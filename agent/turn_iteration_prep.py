@@ -446,14 +446,18 @@ def apply_retry_restarts(
     assistant item; ``restart_with_rebuilt_messages`` is the single consumer that clears
     ``_preflight_compression_blocked`` so the fallback gets a fresh preflight (#84733).
 
-    The two refunding restart paths (redirect and rebuilt-for-fallback) are bounded by
-    ``max_retries`` via ``restart_count`` (restarts since the last response) so a runaway
-    interrupt/redirect that keeps re-arming a restart flag cannot refund the budget
-    forever and hold the turn lease indefinitely."""
+    ``restart_with_redirected_messages`` is bounded by ``max_retries`` (redirect restarts since the
+    last response) and ``restart_with_rebuilt_messages`` (fallback-chain hops and truncation rebuilds)
+    is bounded by ``max(max_retries, len(agent._fallback_chain))`` on its own counter so an
+    interleaved user steer neither starves the last fallback hop nor gets starved by a completed
+    fallback walk (#106108, CF-20)."""
 
     from agent.conversation_loop import (
         _HANDOFF_SKIP_FINAL_RESPONSE, _should_skip_model_call_for_reference_handoff
     )
+
+    if restart_count == 0:
+        agent._rebuilt_restarts_since_response = 0
 
     def _verdict(action: str) -> RetryRestartVerdict:
         return RetryRestartVerdict(
@@ -466,7 +470,8 @@ def apply_retry_restarts(
 
     if _retry.restart_with_redirected_messages:
         restart_count += 1
-        if restart_count > max_retries:
+        _redirect_count = restart_count - getattr(agent, "_rebuilt_restarts_since_response", 0)
+        if _redirect_count > max_retries:
             # A redirect/interrupt keeps re-arming this flag: stop refunding the iteration
             # budget and re-issuing the same logical iteration, or a runaway turn holds the
             # turn lease indefinitely (redirect restarts previously had no bound).
@@ -524,8 +529,12 @@ def apply_retry_restarts(
 
     if _retry.restart_with_rebuilt_messages:
         restart_count += 1
-        _rebuilt_limit = max(int(max_retries or 1), len(getattr(agent, "_fallback_chain", None) or ()))
-        if restart_count > _rebuilt_limit:
+        _rebuilt_count = getattr(agent, "_rebuilt_restarts_since_response", 0) + 1
+        agent._rebuilt_restarts_since_response = _rebuilt_count
+        _base_retries = int(max_retries) if max_retries is not None else 1
+        _chain_len = len(getattr(agent, "_fallback_chain", None) or ())
+        _rebuilt_limit = max(_base_retries, _chain_len) if _base_retries > 0 else 0
+        if _rebuilt_count > _rebuilt_limit:
             # A stall/failure keeps re-escalating to the fallback chain: stop refunding the
             # iteration budget and re-issuing, or a runaway turn holds the turn lease
             # indefinitely (rebuilt restarts previously had no bound).
@@ -564,4 +573,5 @@ def apply_retry_restarts(
     # Counting every mid-turn correction for the whole turn ended healthy interactive
     # turns on the (max_retries + 1)th message (#128000).
     restart_count = 0
+    agent._rebuilt_restarts_since_response = 0
     return _verdict("fallthrough")

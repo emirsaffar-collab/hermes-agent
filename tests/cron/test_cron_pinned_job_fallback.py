@@ -234,4 +234,12 @@ def test_job_matching_fleet_cron_default_model_inherits_fallback_chain():
     custom_job = _job(model="claude-sonnet-5")
     assert scheduler._job_route_pinned(custom_job, cfg) is True
     assert scheduler._job_fallback_chain(custom_job, cfg) is None
+    # MAJOR-2: A provider-pinned job must NOT inherit cron.fallback_providers unless job-scoped.
+    cfg_with_cron_fb = {
+        "cron": {"model": "z-ai/glm-5.3-flash", "fallback_providers": list(_CHAIN)},
+    }
+    provider_pinned = _job(provider="anthropic", model="z-ai/glm-5.3-flash")
+    assert scheduler._job_route_pinned(provider_pinned, cfg_with_cron_fb) is True
+    assert scheduler._job_fallback_chain(provider_pinned, cfg_with_cron_fb) is None
+
 
