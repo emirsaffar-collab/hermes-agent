@@ -38,6 +38,11 @@ _executor_max_workers: int = 0
 _records_lock = threading.Lock()
 # delegation_id -> record dict; kept for the run plus a short completed tail.
 _records: dict[str, dict[str, Any]] = {}
+# A closed session's token -> the (field, value) selectors a new dispatch is refused for (``refuse_for_session``),
+# and each selector -> the tokens refusing it, so a dispatch checks its own selectors, not every fence.
+_refused: dict[Any, frozenset] = {}
+_refused_by: dict[tuple, set] = {}
+_FENCED_FIELDS = ("session_key", "parent_session_id")
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # Completed records retained (in memory and in the ledger) for status queries.
@@ -842,6 +847,8 @@ def _dispatch_admitted(
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
     with _records_lock:
+        if any((field, record[field]) in _refused_by for field in _FENCED_FIELDS):
+            return {"status": "rejected", "error": "This session was closed (exit or /new): no new background work."}
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
             return {"status": "rejected", "error": capacity_error}
@@ -1282,6 +1289,33 @@ def interrupt_for_session(
         targets, "interrupt_for_session", reason, "Interrupted %d async delegation(s) for ending session (%s)")
 
 
+def refuse_for_session(token: Any, *, session_key: str = "", parent_session_ids=()) -> None:
+    """Refuse new dispatches for ONE closing session (any selector matches) until ``allow_for_session``.
+    Set before ``interrupt_for_session``: a dispatch registered first is interrupted, a later one refused."""
+    fence = {("session_key", session_key)} if session_key else set()
+    fence.update(("parent_session_id", parent) for parent in parent_session_ids if parent)
+    with _records_lock:
+        _unfence(token)
+        _refused[token] = frozenset(fence)
+        for selector in fence:
+            _refused_by.setdefault(selector, set()).add(token)
+
+
+def allow_for_session(token: Any) -> None:
+    """Lift ONE session's refusal: a viewer attached again, or the owner retired its live state."""
+    with _records_lock:
+        _unfence(token)
+
+
+def _unfence(token: Any) -> None:
+    """Drop *token*'s refusal; caller holds ``_records_lock``."""
+    for selector in _refused.pop(token, ()):
+        tokens = _refused_by[selector]
+        tokens.discard(token)
+        if not tokens:
+            del _refused_by[selector]
+
+
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor + monitor."""
     global _executor, _executor_max_workers, _monitor_thread
@@ -1297,6 +1331,8 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+        _refused.clear()
+        _refused_by.clear()
     with _orphan_lock:
         _offered.clear()
         _startup_replayed.clear()
