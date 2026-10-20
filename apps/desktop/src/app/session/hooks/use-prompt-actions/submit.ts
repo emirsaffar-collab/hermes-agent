@@ -27,7 +27,7 @@ import { noteMessageSent } from '@/store/desktop-metrics'
 import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
-import { trackPendingSubmission } from '@/store/pending-submissions'
+import { dropPendingSubmission, trackPendingSubmission } from '@/store/pending-submissions'
 import { isStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import {
   $activeSessionId,
@@ -64,6 +64,7 @@ import {
   type GatewayRequest,
   inlineErrorMessage,
   isForwardedReceipt,
+  isGatewayTimeoutError,
   isProviderSetupError,
   isSessionBusyError,
   isTargetSessionBusy,
@@ -1213,6 +1214,14 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // Validate the admission receipt and bind it to the optimistic bubble.
           // Returns false when the receipt is not this send's admission.
           const applySubmitReceipt = (result: SubmitReceipt, receiptSessionId: string): boolean => {
+            // A receipt that names no admission identity for this send — a voice
+            // stop, or a legacy `hermes serve` ACK — leaves the pre-tracked
+            // journal entry statusless forever. No card exists for it, so drop
+            // the pre-track now instead of leaking one per send (#ATLAS-125).
+            if (isVoiceStoppedReceipt(result) || legacyAccepted) {
+              dropPendingSubmission(targetStoredSessionId ?? liveSessionId, submissionId)
+            }
+
             if (isVoiceStoppedReceipt(result)) {
               // Settled with no turn: the stop phrase ended the voice chat another viewer runs. No
               // turn holds the bubble, so it goes, and nothing is tracked as pending.
@@ -1354,6 +1363,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         return true
       } catch (err) {
         releaseBusy()
+
+        // No admission came of a definite rejection (refusal, transport failure,
+        // busy retry): the pre-tracked journal entry would sit statusless forever
+        // (#ATLAS-125). Keep the pre-track after an ambiguous timeout so the
+        // owner's pending fanout preserves displayText if the send landed; a
+        // fenced snapshot that does not list it (or the next startup sweep)
+        // retires it.
+        if (!isGatewayTimeoutError(err)) {
+          dropPendingSubmission(targetStoredSessionId ?? sessionId, submissionId)
+        }
 
         unstageRefusedImages(err, usingComposerAttachments, scope, attachments)
 
