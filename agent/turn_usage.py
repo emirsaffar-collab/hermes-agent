@@ -218,7 +218,10 @@ def record_response_usage(
     if _upstream and isinstance(api_duration, (int, float)):
         with suppress(Exception):
             from agent.provider_latency_circuit_breaker import record_provider_latency
-            record_provider_latency(agent.model, _upstream, float(api_duration))
+            # context_tokens: DQ #500 — threshold scales with input size so healthy
+            # long-context generation time does not demote the provider.
+            record_provider_latency(agent.model, _upstream, float(api_duration),
+                                    context_tokens=prompt_tokens or None)
     # nous.anthropic_wire=auto: the session's wire is decided once, from this first response.
     if agent.session_api_calls == 1 and (agent.provider or "") == "nous":
         with suppress(Exception):

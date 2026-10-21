@@ -51,6 +51,18 @@ def test_all_demoted_with_pinned_order():
     assert all_providers_demoted("z-ai/glm-5.3", ["Phala", "Baidu", "Novita"])
 
 
+def test_all_demoted_with_tag_pinned_order_matches_served_names():
+    reset_circuit_breaker()
+    # DQ #500: argon's pinned order uses endpoint tags (google-ai-studio/flex, ...),
+    # while the API reports served names ("Google AI Studio", "Google") — both must
+    # count as the same population for the escalation verdict.
+    order = ["google-ai-studio/flex", "google-ai-studio", "google-vertex"]
+    record_provider_failure("google/gemini-4-argon", "Google AI Studio")
+    assert not all_providers_demoted("google/gemini-4-argon", order)
+    record_provider_failure("google/gemini-4-argon", "Google")
+    assert all_providers_demoted("google/gemini-4-argon", order)
+
+
 def test_not_all_demoted_with_pinned_order_unseen_healthy():
     reset_circuit_breaker()
     # Only two of the three pinned providers have ever served; the third is healthy
