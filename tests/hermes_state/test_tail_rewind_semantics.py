@@ -280,3 +280,60 @@ class TestCompressTagsCarriedTail:
         originals = {m["content"] for m in history[-len(tagged):]}
         assert {m["content"] for m in tagged} <= originals
         assert not any(m.get(_COMPACTION_TAIL_MARKER) for m in out[:2])
+
+    def test_archive_and_compact_marks_demoted_tail_tool_originals_compacted_1(self, tmp_path):
+        """ATLAS-129 / DQ #515: When a protected-tail tool output (>500 chars) is demoted
+        to a compaction stub, archive_and_compact must keep the pre-demotion full-text
+        original row at (active=0, compacted=1) so session_search can recall it, while
+        verbatim carried tail rows stay (active=0, compacted=0)."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "s_tail_demote"
+        db.create_session(sid, source="cli")
+        id_u1 = db.append_message(sid, role="user", content="older turn")
+        id_a1 = db.append_message(sid, role="assistant", content="calling tool", tool_calls=[{"id": "call_big"}])
+        big_payload = "REFINED_EXECUTION_TRACER_PAYLOAD " + ("Z" * 1800)
+        id_t_big = db.append_message(
+            sid, role="tool", content=big_payload, tool_call_id="call_big", tool_name="terminal"
+        )
+        id_a2 = db.append_message(sid, role="assistant", content="calling small tool", tool_calls=[{"id": "call_small"}])
+        id_t_small = db.append_message(
+            sid, role="tool", content="short tool output ok", tool_call_id="call_small", tool_name="terminal"
+        )
+
+        compacted_messages = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "assistant", "content": "calling tool", "tool_calls": [{"id": "call_big"}]},
+            {
+                "role": "tool",
+                "content": f"[terminal output demoted at compaction — {len(big_payload):,} chars preserved in session history. Recover with session_search(query=..., session_id='{sid}')]",
+                "tool_call_id": "call_big",
+                "tool_name": "terminal",
+            },
+            {"role": "assistant", "content": "calling small tool", "tool_calls": [{"id": "call_small"}]},
+            {
+                "role": "tool",
+                "content": "short tool output ok",
+                "tool_call_id": "call_small",
+                "tool_name": "terminal",
+            },
+        ]
+        db.archive_and_compact(sid, compacted_messages, tail_count=4)
+
+        rows = {
+            int(r["id"]): (int(r["active"]), int(r["compacted"]))
+            for r in db._conn.execute(
+                "SELECT id, active, compacted FROM messages WHERE session_id = ?", (sid,)
+            ).fetchall()
+        }
+        # Summarised middle user row and demoted big tool original must be compacted=1
+        assert rows[id_u1] == (0, 1)
+        assert rows[id_t_big] == (0, 1)
+        # Verbatim carried assistant/small-tool originals must stay rewound (0, 0)
+        assert rows[id_a1] == (0, 0)
+        assert rows[id_a2] == (0, 0)
+        assert rows[id_t_small] == (0, 0)
+        # And search_messages must now find the demoted tool payload!
+        hits = db.search_messages("REFINED_EXECUTION_TRACER_PAYLOAD", role_filter=["tool"])
+        assert [int(h["id"]) for h in hits] == [id_t_big]

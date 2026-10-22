@@ -164,7 +164,8 @@ def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_
 def _search_filter_clauses(
     where: list[str], params: list, *, include_inactive: bool, source_filter: Optional[list[str]],
     exclude_sources: Optional[list[str]], role_filter: Optional[list[str]],
-    after_ts: Optional[int] = None, before_ts: Optional[int] = None) -> None:
+    after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+    session_ids: Optional[list[str]] = None) -> None:
     """Append the visibility/source/role/session-start predicates every search route shares. Live
     rows (active=1) AND compaction-archived rows (compacted=1) are discoverable; only
     rewind/undo rows (active=0, compacted=0) are hidden. ``after_ts``/``before_ts`` bound
@@ -174,6 +175,12 @@ def _search_filter_clauses(
         where.append("(m.active = 1 OR m.compacted = 1)")
     # display_kind="hidden" rows are model-facing scaffolding the person never saw; a hit would confuse.
     where.append("COALESCE(m.display_kind, '') <> 'hidden'")
+    if session_ids is not None:
+        if not session_ids:
+            where.append("0")
+        else:
+            where.append(f"m.session_id IN ({','.join('?' for _ in session_ids)})")
+            params.extend(session_ids)
     if source_filter is not None:
         where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
         params.extend(source_filter)
@@ -1072,6 +1079,7 @@ class SessionSearchMixin:
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        session_ids: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
         """:meth:`_search_messages_impl` plus one log line per slow search with the routing
         path taken. Threshold HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call)."""
@@ -1081,7 +1089,7 @@ class SessionSearchMixin:
             rows = self._search_messages_impl(
                 query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
                 limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
-                after_ts=after_ts, before_ts=before_ts)
+                after_ts=after_ts, before_ts=before_ts, session_ids=session_ids)
             return rows
         finally:
             elapsed_ms = (time.time() - started) * 1000.0
@@ -1095,6 +1103,7 @@ class SessionSearchMixin:
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        session_ids: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
         """FTS5 search across session messages (keywords, ``"phrases"``, AND/OR/NOT, ``prefix*``).
         Returns snippet + session metadata + 1-message context per hit; ``fields`` selects a
@@ -1111,11 +1120,16 @@ class SessionSearchMixin:
             return []
         filters = dict(include_inactive=include_inactive, source_filter=source_filter,
                        exclude_sources=exclude_sources, role_filter=role_filter,
-                       after_ts=after_ts, before_ts=before_ts)
+                       after_ts=after_ts, before_ts=before_ts, session_ids=session_ids)
         # New oversized tool results index only a bounded prefix; an explicit tool-role search is the
         # opt-in full-body path and scans canonical rows via LIKE.
         if role_filter and "tool" in role_filter:
             matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
+            if not matches:
+                relaxed = self._or_relaxed_query(query)
+                if relaxed is not None and relaxed != query:
+                    matches = self._search_messages_like_fallback(
+                        relaxed, limit=limit, offset=offset, sort=sort, **filters)
             return self._finalize_search_matches(matches, result_fields=result_fields)
         self._refresh_fts_stale_state()
         if self._fts_stale:
@@ -1219,7 +1233,7 @@ class SessionSearchMixin:
         like_params: list = [p for tok in non_op_tokens for p in _like_params(tok)]
         like_where = [f"({' OR '.join([_LIKE_ANY_COLUMN_SQL] * len(non_op_tokens))})"]
         filters = {k: route[k] for k in ("include_inactive", "source_filter", "exclude_sources", "role_filter",
-                                         "after_ts", "before_ts")}
+                                         "after_ts", "before_ts", "session_ids") if k in route}
         _search_filter_clauses(like_where, like_params, **filters)
         # instr() for the snippet uses the first search token.
         return self._like_rows(like_where, [non_op_tokens[0], *like_params, route["limit"], route["offset"]],

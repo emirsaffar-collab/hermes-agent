@@ -867,7 +867,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
         rewind_ids = list(carried_ids)
         if tail_count > 0:
-            rewind_ids += self._tail_originals(covered_active, tail_count, merged_away)
+            tail_orig_ids = self._tail_originals(covered_active, tail_count, merged_away)
+            rewind_ids += self._filter_verbatim_tail_originals(
+                conn, tail_orig_ids, compacted_messages[-int(tail_count):])
         rewind_ids += unseen
         rewind_ids = list(dict.fromkeys(rewind_ids))
         if rewind_ids:
@@ -986,11 +988,13 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             conn, session_id, carried_messages or [])
         if tail_count > 0:
             bound = watermark is not None
-            rewind_ids += [int(row["id"]) for row in conn.execute(
+            tail_slice = compacted_messages[-int(tail_count):]
+            tail_orig_ids = [int(row["id"]) for row in conn.execute(
                 f"SELECT id FROM messages WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, *((int(watermark),) if bound else ()),
-                 int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
+                 int(tail_count) + self._uncounted_merged_rows(tail_slice))).fetchall()]
+            rewind_ids += self._filter_verbatim_tail_originals(conn, tail_orig_ids, tail_slice)
         rewind_ids += tail_ids
         rewind_ids = list(dict.fromkeys(rewind_ids))
         if rewind_ids:
