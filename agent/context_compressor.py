@@ -3337,13 +3337,24 @@ class ContextCompressor(
         """Pass 4: demote tool-result bodies inside the protected tail when it alone exceeds the soft
         budget (#61932). Keeps a short recent floor and the ``spared`` pending tool round verbatim; overrides
         the skill guard (else the dead-end recurs). Tool-call arguments stay byte-exact. Returns the number of
-        tool results demoted."""
+        tool results demoted. Pressure counts only role=="tool" rows — the only rows demotion can shrink —
+        so a tail inflated by large user/assistant rows (a stacked skill bundle, a pasted report) does not
+        fire demotion that can never reach the ceiling."""
         soft_ceiling = self._tail_soft_ceiling(protect_tail_tokens)
         demote_end = len(result) - min(_PRESSURE_KEEP_RECENT_MESSAGES, len(result))
         start = max(0, prune_boundary)
 
         def _protected_region_tokens() -> int:
-            return sum(_estimate_msg_budget_tokens(result[i]) for i in range(start, len(result)))
+            # Demotable tokens only: this pass's sole lever is tool-result demotion, so measuring
+            # the whole region (all roles) makes an undemotable user/assistant row look like
+            # pressure — the loop then demotes every tool body, still never reaches the ceiling,
+            # and the last resort nukes the newest body too, destroying working memory for zero
+            # reclaimed budget (stacked-skill-bundle sessions, 2026-10-22).
+            return sum(
+                _estimate_msg_budget_tokens(result[i])
+                for i in range(start, len(result))
+                if result[i].get("role") == "tool"
+            )
 
         demoted = 0
 
