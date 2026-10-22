@@ -109,6 +109,16 @@ class TestSkillPrunedMarkerEmit:
         assert _extract_pruned_skill_names(summary) == ["pdf"]
         assert _skill_pruned_marker("pdf") in summary
 
+    def test_marker_extractor_ignores_template_placeholders(self):
+        """Doc/code snippets carrying '…', '...', or '{skill_name}' must not be extracted."""
+        doc_snippet = (
+            "[SKILL_PRUNED: content lost in compression; reload with skill_view(name='…')]\n"
+            "[SKILL_PRUNED: content lost in compression; reload with skill_view(name='...')]\n"
+            "[SKILL_PRUNED: content lost in compression; reload with skill_view(name='{skill_name}')]\n"
+            + _skill_pruned_marker("productivity/diligence-pipeline")
+        )
+        assert _extract_pruned_skill_names(doc_snippet) == ["productivity/diligence-pipeline"]
+
 class TestReinjectPrunedSkillMarkers:
 
     def test_reinjects_when_marker_paraphrased_away(self):
@@ -170,6 +180,42 @@ class TestProtectedSkillPrune:
         skill_row = result[3]
         assert pruned >= 1
         assert _skill_pruned_marker("fresh-skill") in skill_row["content"]
+
+    def test_active_user_turn_skill_survives_multi_round_tool_batches_until_next_turn(self):
+        """Both polarities: a skill loaded in the active user turn survives >10 tool rows,
+        then is demoted once a subsequent user turn + >10 tool rows push it out of scope."""
+        c = _make_compressor()
+        tool_rounds_active = []
+        for i in range(7):
+            tool_rounds_active.extend([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": f"c_{i}", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": f"c_{i}", "content": f"round {i} " + "t" * 400},
+            ])
+        msgs_active = (
+            self._filler(2)
+            + [{"role": "user", "content": "Execute the readiness audit"}]
+            + _skill_view_pair("call_active", "always-verify", size=5000)
+            + tool_rounds_active
+        )
+        # Positive polarity: 14 assistant/tool rows (> _SKILL_PRUNE_RECENT_WINDOW=10) after skill_view
+        # within the SAME active user turn -> skill body stays intact.
+        res_active, _ = c._prune_old_tool_results(msgs_active, protect_tail_count=4)
+        assert res_active[4]["content"].startswith("# always-verify instructions")
+        assert SKILL_PRUNED_MARKER_PREFIX not in res_active[4]["content"]
+
+        # Negative polarity: a new user turn arrives and runs >10 messages without naming the skill ->
+        # the old skill from the prior turn is now demoted to [SKILL_PRUNED].
+        msgs_next_turn = (
+            msgs_active
+            + [{"role": "user", "content": "Unrelated follow-up question"}]
+            + tool_rounds_active
+        )
+        res_next, _ = c._prune_old_tool_results(msgs_next_turn, protect_tail_count=4)
+        assert _skill_pruned_marker("always-verify") in res_next[4]["content"]
 
 class TestMarkerSurvivesRealCompress:
     """P2 layer: markers survive a real compress() with a mocked aux LLM."""

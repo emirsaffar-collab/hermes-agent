@@ -965,9 +965,9 @@ def _skill_pruned_marker(skill_name: str) -> str:
     )
 
 
-# Anchored on the shared prefix so marker wording changes stay in sync.
+# Anchored on the shared prefix; excludes doc/template placeholders ('…', '...', '{skill_name}').
 _SKILL_PRUNED_MARKER_RE = re.compile(
-    re.escape(SKILL_PRUNED_MARKER_PREFIX) + r"[^\]]*?reload with skill_view\(name='([^']+)'\)",
+    re.escape(SKILL_PRUNED_MARKER_PREFIX) + r"[^\]]*?reload with skill_view\(name='(?!(?:\.\.\.|\u2026))([^'{}\u2026]+)'\)",
 )
 
 
@@ -1206,21 +1206,20 @@ def _skill_view_call_sites(messages: list[dict[str, Any]]) -> list[tuple[int, st
 
 
 def _collect_protected_skill_names(messages: list[dict[str, Any]], prune_boundary: int) -> set[str]:
-    """Skill names (lower-cased) whose skill_view bodies must survive Phase-1 demotion.
-    Recently loaded, loaded inside the protected tail, or named by a tail user message. Applies to
-    Phase-1/2 only; the Pass-4 pressure demotion ignores it."""
+    """Skill names (lower-cased) whose skill_view bodies must survive Phase-1/2 demotion: loaded in
+    the recent window, active user turn, or protected tail, or named by active/tail user messages."""
     total = len(messages)
     if not total:
         return set()
-    recent_start = max(0, total - _SKILL_PRUNE_RECENT_WINDOW)
-    tail_start = max(0, prune_boundary)
+    last_user = next((i for i in range(total - 1, -1, -1) if messages[i].get("role") == "user"), total)
+    protect_from = min(max(0, total - _SKILL_PRUNE_RECENT_WINDOW), max(0, prune_boundary), last_user)
     tail_user_texts = [
-        m["content"].lower() for m in messages[tail_start:]
+        m["content"].lower() for m in messages[min(max(0, prune_boundary), last_user):]
         if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"]
     ]
     return {
         skill.lower() for idx, skill in _skill_view_call_sites(messages)
-        if idx >= min(recent_start, tail_start) or any(skill.lower() in text for text in tail_user_texts)
+        if idx >= protect_from or any(skill.lower() in text for text in tail_user_texts)
     }
 
 
