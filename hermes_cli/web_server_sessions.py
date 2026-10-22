@@ -219,6 +219,8 @@ async def _mutate_via_gateway_owner(profile, actor, params):
     discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=1.5)
     endpoint = getattr(discovery, 'endpoint', None)
     if endpoint is None:
+        if getattr(discovery, 'state', 'absent') not in ('absent', None):
+            raise HTTPException(status_code=503, detail='owner_unreachable')
         return None
     if not getattr(endpoint, 'control_home', True):
         # The selected home answered on its own socket (a multiplexer-served profile already

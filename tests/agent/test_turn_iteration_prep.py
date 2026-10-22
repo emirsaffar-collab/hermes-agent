@@ -182,3 +182,56 @@ def test_interleaved_redirect_and_rebuilt_restarts_do_not_starve_each_other():
     assert (v0.action, v0._turn_exit_reason) == ("break", "rebuilt_restart_limit_exceeded")
 
 
+def test_prepare_iteration_suppresses_noop_reanchor_log_and_logs_real_index_shift(caplog):
+    """When _anchors_current_turn is False (e.g. idx=-1 or post-hook content mutation at idx=0)
+    but _reanchor returns the identical index, prepare_iteration must not emit 'Re-anchored stale
+    current_turn_user_idx X -> X'; when the index genuinely shifts, it must log and update."""
+    import logging
+    from agent.turn_iteration_prep import prepare_iteration
+
+    req_logger = logging.getLogger("agent.conversation_loop.test_reanchor")
+    agent = SimpleNamespace(
+        _nous_wire_pending=None,
+        step_callback=None,
+        _skill_nudge_interval=0,
+        valid_tool_names=set(),
+        _adopt_nous_key_before_expiry=lambda: None,
+        _drain_pending_steer=lambda: None,
+        run_budget_seconds=None,
+        iteration_budget=SimpleNamespace(remaining=10, max_iterations=20),
+        logger=req_logger,
+        _sanitize_args_cursor={},
+        _sanitize_tool_call_arguments=lambda *a, **kw: 0,
+        session_id="sess-reanchor",
+        _reanchor_current_turn_user_idx=lambda msgs, um: (
+            0 if any(m.get("role") == "user" for m in msgs) else -1
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger=req_logger.name):
+        # Case 1: idx=-1 -> -1 (no user message in messages) -> no-op, must NOT log
+        prep_neg = prepare_iteration(
+            agent, messages=[{"role": "assistant", "content": "working"}],
+            api_call_count=2, user_message="go", current_turn_user_idx=-1,
+        )
+        assert prep_neg.current_turn_user_idx == -1
+
+        # Case 2: idx=0 -> 0 (mutated user content at index 0, fallback returns 0) -> no-op, must NOT log
+        prep_same = prepare_iteration(
+            agent, messages=[{"role": "user", "content": "[mutated] go"}],
+            api_call_count=2, user_message="go", current_turn_user_idx=0,
+        )
+        assert prep_same.current_turn_user_idx == 0
+        assert [r.getMessage() for r in caplog.records if "Re-anchored stale" in r.getMessage()] == []
+
+        # Case 3: idx=2 -> 0 (post-compaction index shift) -> genuine shift, MUST log and update
+        prep_shifted = prepare_iteration(
+            agent, messages=[{"role": "user", "content": "[mutated] go"}],
+            api_call_count=2, user_message="go", current_turn_user_idx=2,
+        )
+        assert prep_shifted.current_turn_user_idx == 0
+        stale_logs = [r.getMessage() for r in caplog.records if "Re-anchored stale" in r.getMessage()]
+        assert stale_logs == ["Re-anchored stale current_turn_user_idx 2 -> 0 (session=sess-reanchor)"]
+
+
+

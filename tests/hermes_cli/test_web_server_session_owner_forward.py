@@ -313,3 +313,34 @@ async def test_owner_restarted_between_discovery_and_mint_is_a_retryable_503(tmp
     for peer in peers:
         peer.close()
     assert (exc.value.status_code, exc.value.detail) == (503, 'owner_unreachable')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('owner_state', ['starting', 'draining', 'conflict', 'inaccessible'])
+async def test_standalone_mutation_during_gateway_startup_returns_retryable_503_not_409(
+    tmp_path, monkeypatch, owner_state,
+):
+    """During gateway cold-start (state='starting', before publish_gateway_runtime_ready),
+    discover_gateway_endpoint returns endpoint=None with state!='absent'. Standalone serve
+    must surface retryable 503 owner_unreachable instead of falling back to _mutate_offline_store
+    and colliding with gateway.lock (409 Exclusive maintenance refused)."""
+    from hermes_cli import web_server_sessions
+
+    request = _standalone_request(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        'hermes_cli.gateway_runtime.discover_gateway_endpoint',
+        lambda home, timeout=1.5: SimpleNamespace(state=owner_state, endpoint=None),
+    )
+    offline = []
+    monkeypatch.setattr(
+        web_server_sessions, '_mutate_offline_store',
+        lambda profile, actor, params: offline.append(params),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await web_server_sessions._mutate_session_request(
+            request, None, 'session-pin', request_id='req-pin', expected_revision=0,
+            operation='pin', payload={'pinned': True},
+        )
+    assert (exc.value.status_code, exc.value.detail) == (503, 'owner_unreachable')
+    assert offline == []
+

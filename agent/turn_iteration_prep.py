@@ -247,11 +247,12 @@ def prepare_iteration(
     # state.db still holds. A valid index always lands on this turn's user row; re-anchor otherwise.
     if user_message is not None and not _anchors_current_turn(messages, current_turn_user_idx, user_message):
         _reanchored_idx = _reanchor(agent, messages, user_message)
-        request_logger.info(
-            "Re-anchored stale current_turn_user_idx %s -> %s (session=%s)",
-            current_turn_user_idx, _reanchored_idx, agent.session_id or "-",
-        )
-        current_turn_user_idx = _reanchored_idx
+        if _reanchored_idx != current_turn_user_idx:
+            request_logger.info(
+                "Re-anchored stale current_turn_user_idx %s -> %s (session=%s)",
+                current_turn_user_idx, _reanchored_idx, agent.session_id or "-",
+            )
+            current_turn_user_idx = _reanchored_idx
     return IterationPrep(
         action="fallthrough", messages=messages, request_logger=request_logger,
         current_turn_user_idx=current_turn_user_idx,
