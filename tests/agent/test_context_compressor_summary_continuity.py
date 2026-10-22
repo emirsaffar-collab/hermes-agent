@@ -492,3 +492,41 @@ def test_fallback_handoff_anchors_reach_the_next_summarizer():
 
     prompt = mock_call.call_args.kwargs["messages"][0]["content"]
     assert "FALLBACK-ANCHOR-ASK" in prompt
+
+
+def test_post_handoff_tail_cut_advances_past_leading_standalone_summary():
+    """When post-handoff turns fit inside soft_ceiling but exceed raw tail_token_budget, a
+    leading standalone handoff summary pushing head+tail over soft_ceiling must not stop the
+    #40803 raw-budget re-walk or leave cut_idx at the post-handoff boundary (which strips the
+    standalone handoff to None and aborts with empty_post_handoff_window / structural_backoff).
+    """
+    compressor = _compressor()
+    compressor.tail_token_budget = 1_000  # soft_ceiling = 1,500
+    old_summary = "S" * 2_400  # ~610 tokens
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": f"{SUMMARY_PREFIX}\n{old_summary}", COMPRESSED_SUMMARY_METADATA_KEY: True},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c0", "content": "P" * 1_600},  # ~410 tokens (should be summarized)
+        {"role": "assistant", "content": "completed prior step"},  # role-alternation bridge before user
+        {"role": "user", "content": "latest request"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "T" * 3_200},  # ~810 tokens (stays in tail)
+    ]
+
+    with patch("agent.context_compressor.call_llm", return_value=_response("UPDATED summary")) as mock_call:
+        result = compressor.compress(messages, current_tokens=90_000)
+
+    mock_call.assert_called_once()
+    assert compressor.compression_count == 1
+    assert compressor._structural_no_op_backoff_until == 0.0
+    assert len(result) < len(messages)
+

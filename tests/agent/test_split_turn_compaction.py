@@ -538,3 +538,41 @@ def test_assistant_anchor_still_binds(
     )
     # The anchor pulls the cut back to the older turn's closer, aligned before any tool group.
     assert cut == compressor._align_boundary_backward(messages, older_closer_idx)
+
+
+@pytest.mark.parametrize("groups", [6, 10], ids=["post-user-tail-inside-soft-ceiling", "post-user-tail-over-soft-ceiling"])
+def test_stacked_skill_bundle_request_splits_and_restates_typed_invocation(groups: int) -> None:
+    """A stacked /skill bundle whose inlined skill bodies exceed soft_ceiling must still split.
+
+    Compaction replaces inlined skill bodies with [SKILL_PRUNED] markers and restates only the
+    typed /skill invocation, so the split gate must price the authored request rather than the
+    expanded skill scaffold (otherwise stacked-skill turns pin the entire run in the tail and
+    wedge in empty_post_handoff_window / structural_backoff). Covers both when post-user tool
+    groups exceed soft_ceiling and when they sit between raw tail_token_budget and soft_ceiling.
+    """
+    compressor = _make_compressor()
+    soft_ceiling = compressor._tail_soft_ceiling(compressor.tail_token_budget)
+    scaffold_body = "S" * ((soft_ceiling + 2_000) * 4)
+    stacked_request = (
+        '[IMPORTANT: The user has invoked the "/deep-research /research-and-plan" stacked skill '
+        "bundle, loading 2 skills together. Treat every skill below as active guidance for this turn.]\n\n"
+        "Skills loaded: deep-research, research-and-plan\n"
+        "User instruction: Investigate structural_backoff:263.\n\n"
+        '[Loaded as part of the stacked skill invocation "deep-research".]\n\n'
+        f"{scaffold_body}"
+    )
+    assert _authored_request_text(stacked_request) == "/deep-research /research-and-plan Investigate structural_backoff:263."
+
+    messages = _oversized_active_turn(request=stacked_request, groups=groups)
+    with patch.object(compressor, "_generate_summary", return_value=None):
+        compressed = compressor.compress(messages, current_tokens=90_000)
+
+    assert len(compressed) < len(messages)
+    assert compressor.compression_count == 1
+    summaries = [m for m in compressed if compressor._is_context_summary_message(m)]
+    assert len(summaries) == 1
+    summary_text = str(summaries[0].get("content") or "")
+    assert "/deep-research /research-and-plan Investigate structural_backoff:263." in summary_text
+    assert scaffold_body[:200] not in summary_text
+    _assert_tool_pairs_are_complete(compressed)
+

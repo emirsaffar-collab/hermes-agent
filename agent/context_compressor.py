@@ -1491,7 +1491,7 @@ def _restated_request_text(content: Any) -> str:
     text = _content_text_for_contains(content).strip()
     if _INFLIGHT_TASK_REPLAY_HEADER in text:
         text = text.rsplit(_INFLIGHT_TASK_REPLAY_HEADER, 1)[1].strip()
-    return text
+    return _typed_user_text(text).strip()
 
 
 def _authored_request_text(content: Any) -> str:
@@ -5123,6 +5123,18 @@ Write only the summary body. Do not include any preamble or prefix."""
         if token_budget is None:
             token_budget = self.tail_token_budget
         n = len(messages)
+        # Advance past leading standalone compaction handoffs: _scan_window_handoffs strips them
+        # from turns_to_summarize, so counting them in the tail walk or using them as the progress
+        # floor leaves an empty post-handoff window (#empty_post_handoff_window).
+        post_handoff_start = head_end
+        while (
+            post_handoff_start < n
+            and self._is_context_summary_message(messages[post_handoff_start])
+            and self._strip_context_summary_handoff_message(messages[post_handoff_start]) is None
+        ):
+            post_handoff_start += 1
+        if post_handoff_start < n - 1:
+            head_end = self._align_boundary_forward(messages, post_handoff_start)
         # Bounded recent-message floor: protect_last_n is a minimum up to a cap so bulky tool runs
         # aren't all kept.
         available_tail = max(0, n - head_end - 1)
@@ -5138,9 +5150,11 @@ Write only the summary body. Do not include any preamble or prefix."""
         # are applied below and may still necessarily exceed the ceiling.
         walk_floor = 0 if soft_ceiling >= min_tail * _estimate_msg_budget_tokens({}) else min_tail
         cut_idx, accumulated = self._walk_tail_budget(messages, head_end, soft_ceiling, walk_floor, cut_at_break=False)
-        # Whole transcript fits soft_ceiling: re-cut with the raw budget so a worthwhile middle
-        # exists (else #40803 loop).
-        if cut_idx <= head_end and 0 < accumulated <= soft_ceiling:
+        last_user_idx = self._find_last_user_message_idx(messages, head_end)
+        # Whole transcript (or the entire post-user tail behind an oversized skill-scaffolded user
+        # turn) fits soft_ceiling: re-cut with the raw budget so a worthwhile middle exists (else
+        # #40803 loop / #empty_post_handoff_window when raw user scaffold + tail > soft_ceiling).
+        if (cut_idx <= head_end or cut_idx == last_user_idx + 1) and 0 < accumulated <= soft_ceiling:
             cut_idx, _ = self._walk_tail_budget(messages, head_end, token_budget, min_tail, cut_at_break=True)
 
         fallback_cut = n - min_tail
@@ -5159,7 +5173,6 @@ Write only the summary body. Do not include any preamble or prefix."""
         # soft ceiling, anchoring its opening request retains the whole turn and blows the budget by
         # design — then the clean tool-group boundary above wins and that request rides the handoff
         # (#80449). The N-user promise (#70250) is never relaxed.
-        last_user_idx = self._find_last_user_message_idx(messages, head_end)
         user_anchored_cut = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
         split_oversized_turn = False
         # ``user_anchored_cut < cut_idx`` means the anchor found a real user turn strictly inside the
@@ -5173,7 +5186,11 @@ Write only the summary body. Do not include any preamble or prefix."""
             and _is_text_only_content(messages[last_user_idx].get("content"))
             # A single oversized user message is indivisible and must stay verbatim in the tail; this
             # exception is only for aggregate turn growth after a normally sized opening request.
-            and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
+            # Price the authored request (without /skill scaffolds or gateway reply pointers, which
+            # compaction prunes/strips on restatement) so stacked-skill turns are not pinned in tail.
+            and _estimate_msg_budget_tokens(
+                {"role": "user", "content": _authored_request_text(messages[last_user_idx].get("content"))}
+            ) <= soft_ceiling
             # The token ceiling is the only size guard: the request is restated verbatim after the
             # handoff, so a character cap only pinned long requests (e.g. /goal prompts) in place.
             # Only split when there is real turn body to summarize: if the oversized weight is the
