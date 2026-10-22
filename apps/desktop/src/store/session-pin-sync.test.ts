@@ -565,4 +565,25 @@ describe('watchSessionPins remote pull', () => {
     expect($pinnedSessionIds.get()).toEqual([])
     $activeGatewayProfile.set('default')
   })
+
+  it('does not re-PATCH pinned sessions on every slice refresh when the backend refuses with 409 offline maintenance', async () => {
+    const maintenanceErr = new Error(
+      '409: {"detail":"Exclusive maintenance refused: Gateway runtime already owns profile /x"}'
+    )
+    patch.mockImplementationOnce(() => Promise.reject(maintenanceErr))
+
+    $sessions.set([row('maint-pin')])
+    $pinnedSessionIds.set(['maint-pin'])
+    await flush()
+    await flush()
+    patch.mockClear()
+
+    // Subsequent slice refreshes must not re-fire PATCH in a retry storm while on the same gateway scope;
+    // the local pin stays intact.
+    $sessions.set([row('maint-pin', { pinned: false })])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toContain('maint-pin')
+    expect(patch).not.toHaveBeenCalled()
+  })
 })

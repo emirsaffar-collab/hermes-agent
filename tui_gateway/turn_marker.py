@@ -161,3 +161,29 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
                    if entry.get("notification_category") == "diagnostic" else {})}
     except Exception:
         return None
+
+
+def list_turn_markers(home: Path | str) -> dict[str, dict[str, Any]]:
+    """Return all normalized non-empty interrupted-turn markers for ``home``."""
+    try:
+        with _lock:
+            raw = _load(_marker_path(home))
+        out: dict[str, dict[str, Any]] = {}
+        for session_key, entry in raw.items():
+            if not session_key or not isinstance(entry, dict):
+                continue
+            prompt = str(entry.get("prompt") or "")
+            if not prompt.strip():
+                continue
+            out[str(session_key)] = {
+                "attempts": max(0, int(entry.get("attempts") or 0)),
+                "prompt": prompt,
+                "started_at": _started_at(entry),
+                "auto_continue": bool(entry.get("auto_continue", True)),
+                **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
+                **({"notification_category": "diagnostic"}
+                   if entry.get("notification_category") == "diagnostic" else {}),
+            }
+        return out
+    except Exception:
+        return {}

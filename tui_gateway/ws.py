@@ -377,6 +377,7 @@ def _start_backend_liveness() -> None:
     for start, what in (
         (server._start_backend_heartbeat_refresher, "backend heartbeat refresher start"),
         (server._schedule_startup_orphan_sweep, "startup orphan sweep scheduling"),
+        (server._schedule_startup_auto_continue_sweep, "startup auto-continue sweep scheduling"),
     ):
         try:
             start()

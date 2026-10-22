@@ -25,6 +25,7 @@ import { atom } from 'nanostores'
 
 import { setSessionPinnedRemote } from '@/hermes'
 import { onConnectionScopeChange } from '@/lib/connection-scoped'
+import { isMissingRestEndpoint, isOfflineMaintenance } from '@/lib/gateway-rpc'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
@@ -44,6 +45,9 @@ import type { SessionInfo } from '@/types/hermes'
 const mirrored = new Set<string>()
 // pin ids awaiting their row so we can resolve the owning profile before PATCH.
 const pending = new Set<string>()
+// pin ids whose PATCH was refused with terminal 409 offline maintenance or 404 missing endpoint on this scope;
+// kept fenced so neither the push pass retries on every slice refresh nor pullRemotePins drops the local pin.
+const maintenanceFenced = new Set<string>()
 // Writes we've issued, id -> the value we wrote and when. A list page already
 // in flight when we PATCH still carries the OLD value, and it can land after
 // our ack — so the ack is not proof the page we're reading is newer than the
@@ -268,8 +272,14 @@ function pullRemotePins(): void {
     }
 
     // Local intent still waiting on its PATCH (row unresolved when the push
-    // pass ran) is also newer than the page — never revert it.
-    if (pending.has(pinId) || pending.has(row.id)) {
+    // pass ran) or fenced by a terminal 409 maintenance refusal on this scope
+    // is also newer than the page — never revert it.
+    if (
+      pending.has(pinId) ||
+      pending.has(row.id) ||
+      maintenanceFenced.has(pinId) ||
+      maintenanceFenced.has(row.id)
+    ) {
       continue
     }
 
@@ -333,6 +343,7 @@ function reconcileInner(): void {
     if (!current.has(id)) {
       mirrored.delete(id)
       pending.delete(id)
+      maintenanceFenced.delete(id)
 
       // Removal owns the durable write; a separate unpin would race its
       // revision snapshot. Archive clears the pin in the same PATCH.
@@ -360,7 +371,13 @@ function reconcileInner(): void {
 
     pending.delete(id)
     mirrored.add(id)
-    void writePin(id, true, row.profile).catch(() => {
+    void writePin(id, true, row.profile).catch((err: unknown) => {
+      if (isMissingRestEndpoint(err) || isOfflineMaintenance(err)) {
+        maintenanceFenced.add(id)
+
+        return
+      }
+
       // Let a later reconcile retry the mirror.
       mirrored.delete(id)
       pending.add(id)
@@ -397,6 +414,7 @@ export function watchSessionPins(): void {
 export function resetSessionPinMirror(): void {
   mirrored.clear()
   pending.clear()
+  maintenanceFenced.clear()
   unconfirmed.clear()
   publishUnconfirmed()
 }
@@ -410,5 +428,6 @@ export function resetSessionPinMirror(): void {
 export function forgetPinSyncState(id: string): void {
   mirrored.delete(id)
   pending.delete(id)
+  maintenanceFenced.delete(id)
   unconfirmed.delete(id)
 }

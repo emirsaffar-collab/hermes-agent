@@ -605,6 +605,88 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
     return {"user": user} if user else None
 
 
+_STARTUP_AUTO_CONTINUE_DELAY_S = max(
+    0.0, float(os.environ.get("HERMES_STARTUP_AUTO_CONTINUE_DELAY_S") or 5.0)
+)
+_startup_auto_continue_sweep_ran = False
+_startup_auto_continue_sweep_lock = None
+
+
+def _sweep_interrupted_turn_markers(home: Path | str | None = None) -> list[str]:
+    """Boot-time sweep of ``desktop/interrupted_turns.json`` so background tabs
+    whose mid-turn process died auto-continue without waiting for a manual tab click
+    (ATLAS-121 / DQ #369)."""
+    enabled, freshness_secs, max_attempts = _auto_continue_config()
+    if not enabled:
+        return []
+    target_home = Path(home or _hermes_home)
+    markers = list_turn_markers(target_home)
+    if not markers:
+        return []
+    resumed: list[str] = []
+    now = time.time()
+    for session_key, marker in markers.items():
+        if not marker.get("auto_continue", True):
+            continue
+        writer_state = marker_writer_state(marker)
+        if writer_state == "alive" and marker.get("writer_pid") != os.getpid():
+            continue
+        age = now - marker["started_at"]
+        if age > freshness_secs or marker["attempts"] >= max_attempts:
+            clear_turn_marker(target_home, session_key)
+            continue
+        live = _find_live_session_by_key(session_key, None)
+        if live is not None:
+            live_sid, live_session = live
+            if _maybe_schedule_auto_continue(live_sid, live_session, session_key) is not None:
+                resumed.append(session_key)
+            continue
+        resume_fn = _methods.get("session.resume")
+        if not callable(resume_fn):
+            continue
+        token = bind_transport(_detached_ws_transport)
+        try:
+            resp = resume_fn(
+                f"auto-continue-boot-{session_key}",
+                {"session_id": session_key, "omit_messages": True},
+            )
+        except Exception:
+            logger.debug("boot auto-continue resume failed for %s", session_key, exc_info=True)
+            continue
+        finally:
+            reset_transport(token)
+        result = resp.get("result") if isinstance(resp, dict) else None
+        if isinstance(result, dict) and result.get("auto_continue"):
+            resumed.append(session_key)
+    if resumed:
+        logger.info(
+            "Boot auto-continue sweep scheduled %d interrupted session(s): %s",
+            len(resumed),
+            ", ".join(resumed),
+        )
+    return resumed
+
+
+def _schedule_startup_auto_continue_sweep() -> None:
+    """Schedule the once-per-process boot auto-continue sweep after a short grace window."""
+    global _startup_auto_continue_sweep_ran
+    if "PYTEST_CURRENT_TEST" in os.environ and "HERMES_STARTUP_AUTO_CONTINUE_DELAY_S" not in os.environ:
+        return
+    enabled, _, _ = _auto_continue_config()
+    if not enabled:
+        return
+    with _sessions_lock:
+        if _startup_auto_continue_sweep_ran:
+            return
+        _startup_auto_continue_sweep_ran = True
+    _reaper_daemon_timer(
+        _STARTUP_AUTO_CONTINUE_DELAY_S,
+        _sweep_interrupted_turn_markers,
+        "startup auto-continue sweep failed",
+        level="warning",
+    )
+
+
 def register(server) -> None:
     """Publish this module's helpers + handlers onto ``server``, rebound to its globals."""
     bind_module(globals(), server, skip=("_",))
