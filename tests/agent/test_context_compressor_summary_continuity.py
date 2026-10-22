@@ -530,3 +530,34 @@ def test_post_handoff_tail_cut_advances_past_leading_standalone_summary():
     assert compressor._structural_no_op_backoff_until == 0.0
     assert len(result) < len(messages)
 
+    # Also cover a single plain-assistant role-collision bridge (e.g. hidden interrupt placeholder)
+    # retained immediately between the standalone handoff and the sole active user turn.
+    compressor_bridge = _compressor()
+    compressor_bridge.tail_token_budget = 1_000  # soft_ceiling = 1,500
+    bridge_messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": f"{SUMMARY_PREFIX}\n{old_summary}", COMPRESSED_SUMMARY_METADATA_KEY: True},
+        {"role": "assistant", "content": "", "display_kind": "hidden", "api_content": "[interrupt: no assistant output for this turn]"},
+        {"role": "user", "content": "latest request"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c0", "content": "P" * 1_600},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "T" * 3_200},
+    ]
+    with patch("agent.context_compressor.call_llm", return_value=_response("BRIDGE summary")) as mock_bridge_call:
+        bridge_result = compressor_bridge.compress(bridge_messages, current_tokens=90_000)
+
+    mock_bridge_call.assert_called_once()
+    assert compressor_bridge.compression_count == 1
+    assert compressor_bridge._structural_no_op_backoff_until == 0.0
+    assert len(bridge_result) < len(bridge_messages)
+
+

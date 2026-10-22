@@ -5134,7 +5134,21 @@ Write only the summary body. Do not include any preamble or prefix."""
         ):
             post_handoff_start += 1
         if post_handoff_start < n - 1:
-            head_end = self._align_boundary_forward(messages, post_handoff_start)
+            aligned_post_handoff = self._align_boundary_forward(messages, post_handoff_start)
+            # When _compress_window retained a single assistant role-collision bridge immediately
+            # after the standalone handoff and before the active user turn, anchoring at
+            # last_user_idx would make _compress_window pull compress_end back to post_handoff_start
+            # (leaving only the handoff in the middle window). Advance past that bridge just like
+            # _align_boundary_forward does for an assistant(tool_calls)+tool bridge.
+            if (
+                post_handoff_start > head_end
+                and aligned_post_handoff == post_handoff_start
+                and aligned_post_handoff + 1 < n
+                and messages[aligned_post_handoff].get("role") == "assistant"
+                and aligned_post_handoff + 1 == self._find_last_user_message_idx(messages, aligned_post_handoff)
+            ):
+                aligned_post_handoff += 1
+            head_end = aligned_post_handoff
         # Bounded recent-message floor: protect_last_n is a minimum up to a cap so bulky tool runs
         # aren't all kept.
         available_tail = max(0, n - head_end - 1)
@@ -5367,7 +5381,14 @@ Write only the summary body. Do not include any preamble or prefix."""
                 bridge_idx = self._align_boundary_backward(messages, latest_actionable_idx)
             elif bridge_role != "assistant":
                 bridge_idx = -1
-            if bridge_idx > compress_start:
+            post_handoff_floor = compress_start
+            while (
+                post_handoff_floor < len(messages)
+                and self._is_context_summary_message(messages[post_handoff_floor])
+                and self._strip_context_summary_handoff_message(messages[post_handoff_floor]) is None
+            ):
+                post_handoff_floor += 1
+            if bridge_idx > post_handoff_floor:
                 compress_end = bridge_idx
         return compress_start, compress_end
 
