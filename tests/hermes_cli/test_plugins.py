@@ -2916,3 +2916,67 @@ class TestAsyncHookOnCallerLoop:
             results = asyncio.run(mgr.ainvoke_hook("pre_gateway_dispatch", event="e", gateway="g"))
         assert results == [{"seen": "e"}, {"seen_async": "e"}]
         assert "async plugin blew up" in caplog.text
+
+
+# --- hook-timeout skip: fail-closed decided by the hook's OWN declaration (RCA 2026-10-23) ---
+# Contract: a hook that declares fail_closed:false must not deny the tool call when it is
+# skipped; a hook that declares true must still deny; a hook that declares nothing inherits
+# the event default. Regression for plugins_dispatch computing fail-closed from the EVENT only.
+
+
+def _skip_registry(*callbacks):
+    from hermes_cli.plugins_dispatch import PluginDispatchMixin
+
+    class _Stub(PluginDispatchMixin):
+        def __init__(self, cbs):
+            self._hooks = {"pre_tool_call": list(cbs)}
+
+        def _report_hook_failure(self, hook_name, cb, kwargs, exc):
+            raise AssertionError(f"hook {hook_name} raised {exc!r}")
+
+    return _Stub(callbacks)
+
+
+def _force_skip(monkeypatch):
+    from hermes_cli import plugins_dispatch as pd
+
+    monkeypatch.setattr(pd, "_hook_uses_callback_timeout", lambda name, t: True)
+    monkeypatch.setattr(
+        pd.PluginDispatchMixin,
+        "_run_hook_callback_bounded",
+        lambda self, name, cb, kwargs, timeout: pd._HOOK_SKIPPED,
+    )
+
+
+def _cb(declared):
+    def cb(**kwargs):
+        return None
+
+    if declared is not ...:
+        cb._hermes_fail_closed = declared
+    return cb
+
+
+def test_skipped_hook_declared_fail_open_does_not_block(monkeypatch):
+    """fail_closed:false + skipped => the tool call is ALLOWED (no block directive)."""
+    _force_skip(monkeypatch)
+    out = _skip_registry(_cb(False)).invoke_hook("pre_tool_call", tool_name="terminal")
+    assert out == [], f"a hook declared fail_closed:false blocked the tool call: {out}"
+
+
+def test_skipped_hook_declared_fail_closed_still_blocks(monkeypatch):
+    """fail_closed:true + skipped => still a block directive (ledger/destructive class)."""
+    from hermes_cli.plugins_dispatch import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+
+    _force_skip(monkeypatch)
+    out = _skip_registry(_cb(True)).invoke_hook("pre_tool_call", tool_name="terminal")
+    assert out == [{"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]
+
+
+def test_skipped_hook_without_declaration_inherits_event_default(monkeypatch):
+    """No fail_closed field at all => the event default decides (pre_tool_call => closed)."""
+    from hermes_cli.plugins_dispatch import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+
+    _force_skip(monkeypatch)
+    out = _skip_registry(_cb(...)).invoke_hook("pre_tool_call", tool_name="terminal")
+    assert out == [{"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]

@@ -141,6 +141,10 @@ class ShellHookSpec(_ToolMatcherMixin):
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     fail_closed: bool = False
+    # True only when the entry actually carried fail_closed/failClosed. The dispatcher needs
+    # the difference: an entry that declares nothing inherits the event default, one that
+    # declares false must never be turned into a policy gate by a skipped run.
+    fail_closed_declared: bool = False
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
 
@@ -434,6 +438,7 @@ def _parse_single_entry(event: str, index: int, raw: Any) -> Optional[ShellHookS
         warn(".timeout=%ds exceeds max %ds; clamping", timeout, MAX_TIMEOUT_SECONDS)
         timeout = MAX_TIMEOUT_SECONDS
     # ``fail_closed`` (canonical) wins over ``failClosed`` (Cursor/Claude-Code compat).
+    fail_closed_declared = "fail_closed" in raw or "failClosed" in raw
     fail_closed = raw.get("fail_closed", raw.get("failClosed", False))
     if not isinstance(fail_closed, bool):
         warn(".fail_closed must be a boolean (got %r); using default false (fail open)", fail_closed)
@@ -442,7 +447,8 @@ def _parse_single_entry(event: str, index: int, raw: Any) -> Optional[ShellHookS
         warn(".fail_closed=true will be ignored at runtime — fail_closed only applies to blocking-capable "
              "events (%s).  The hook will fail open on %s like any other hook.", ", ".join(sorted(_BLOCKING_EVENTS)), event)
         fail_closed = False
-    return ShellHookSpec(event=event, command=command.strip(), matcher=matcher, timeout=timeout, fail_closed=fail_closed)
+    return ShellHookSpec(event=event, command=command.strip(), matcher=matcher, timeout=timeout,
+                         fail_closed=fail_closed, fail_closed_declared=fail_closed_declared)
 
 
 # --- Subprocess callback ---
@@ -548,6 +554,8 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[dict[str, Any]
     # BEFORE the single-flight window — an unmatched callback must never contend for (nor be
     # skipped because of) another session's in-flight run (upstream #105223).
     _callback._hermes_matches_tool = spec.matches_tool
+    # Dispatcher contract: None means "declared nothing" so the event default still applies.
+    _callback._hermes_fail_closed = spec.fail_closed if spec.fail_closed_declared else None
     return _callback
 
 
