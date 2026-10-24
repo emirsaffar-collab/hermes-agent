@@ -15,29 +15,43 @@ so the exception branch is a three-way decision, not a binary one:
 The cause string must never publish as an empty tail: ``str(TimeoutError())`` is ``''`` on
 CPython, so ``f"... unverified: {exc}"`` used to name no cause at all.
 """
+import threading
+import time
+
 import pytest
 
 GRACE = 0.05
 
 
 def _install_authority(monkeypatch, mailbox, *, write_receipt=True, status="queued",
-                       message=None, raises=None, category=None):
+                       message=None, raises=None, category=None, write_after=None):
     """Stand in for the profile authority: optionally admit the turn, then lose the answer."""
 
     def fake_deliver(home, owner, message_, *, delivery_id, notification_category="result"):
-        if write_receipt:
-            record = {
-                "delivery_id": delivery_id,
-                "id": delivery_id,
-                "status": status,
-                "message": message_ if message is None else message,
-                "created_at": 1,
-                "sequence": 1,
-            }
-            if category is not None:
-                record["notification_category"] = category
+        record = {
+            "delivery_id": delivery_id,
+            "id": delivery_id,
+            "status": status,
+            "message": message_ if message is None else message,
+            "created_at": 1,
+            "sequence": 1,
+        }
+        if category is not None:
+            record["notification_category"] = category
+
+        def commit():
+            if write_after:
+                time.sleep(write_after)
             with mailbox._locked(home) as root:
                 mailbox._write(root / f"{delivery_id}.json", record)
+
+        if write_receipt:
+            if write_after:
+                # A late admit: the raise happens now, the authority commits the receipt a moment
+                # later — the shape of the live incident (attempt 00:23:17, owner turn 00:24:50).
+                threading.Thread(target=commit, daemon=True).start()
+            else:
+                commit()
         raise raises if raises is not None else TimeoutError()  # str(TimeoutError()) == ""
 
     monkeypatch.setattr(mailbox, "find_canonical_live_owner",
@@ -157,6 +171,54 @@ def test_a_diagnostic_receipt_does_not_admit_a_result_payload(tmp_path, monkeypa
     assert "another payload owns this delivery id" in outcome, outcome
 
 
+def test_a_receipt_that_appears_late_is_still_recognised(tmp_path, monkeypatch):
+    """The owner admits after the raise, not before: the grace must still find that record.
+
+    This is the live shape — a 30 s rpc budget lapsing while the owner is mid-turn. An instant
+    re-read (design v1) sees an empty store here and calls a delivered payload a failure.
+    """
+    from tools import bot_live_delivery as mailbox
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _install_authority(monkeypatch, mailbox, write_after=0.2)
+    from cron import scheduler_delivery
+    monkeypatch.setattr(scheduler_delivery, "BOT_CHAT_ADMISSION_GRACE_SECONDS", 1.0)
+
+    job = {"id": "j-late", "name": "n", "execution_id": "r1"}
+    started = time.monotonic()
+    outcome = _deliver(job)
+    waited = time.monotonic() - started
+
+    assert _receipts(job)["bot-chat:(own)"]["status"] == "queued", "a late admit is not a failure"
+    assert outcome is not None
+    assert "completion unverified; do not resend" in outcome
+    assert waited >= 0.2, f"the grace returned before the receipt existed ({waited:.2f}s)"
+
+
+def test_the_grace_waits_instead_of_reading_once(tmp_path, monkeypatch):
+    """Nothing on disk yet is PENDING, not terminal: the branch must spend its grace waiting.
+
+    ``await_delivery`` returns None on the first read when no record exists (it serves callers that
+    already own a receipt), so using it here made the grace a no-op — measured at 0.00 s by
+    scripts/probe-late-admit.py. This case pins the wait itself, not just the verdict.
+    """
+    from tools import bot_live_delivery as mailbox
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _install_authority(monkeypatch, mailbox, write_receipt=False)
+    from cron import scheduler_delivery
+    monkeypatch.setattr(scheduler_delivery, "BOT_CHAT_ADMISSION_GRACE_SECONDS", 0.3)
+
+    job = {"id": "j-wait", "name": "n", "execution_id": "r1"}
+    started = time.monotonic()
+    outcome = _deliver(job)
+    waited = time.monotonic() - started
+
+    assert _receipts(job)["bot-chat:(own)"]["status"] == "unknown"
+    assert outcome is not None
+    assert waited >= 0.25, f"the grace was a no-op ({waited:.2f}s for a 0.3s budget)"
+
+
 def test_an_unreadable_receipt_is_unknown_not_a_failure(tmp_path, monkeypatch):
     """A receipt the grace could not read is a blind spot, not proof of non-delivery: the class
     of the read error is logged, and the job still reports ``unknown``."""
@@ -165,10 +227,17 @@ def test_an_unreadable_receipt_is_unknown_not_a_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _install_authority(monkeypatch, mailbox, write_receipt=False)
 
-    def unreadable(home, delivery_id, timeout):
+    calls = {"n": 0}
+
+    def unreadable(home, delivery_id):
+        # The branch reads this store once BEFORE dialing too; that read must succeed, or the case
+        # tests the pre-dial failure path instead of the blind grace it is about.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return
         raise OSError("receipt store unreadable")
 
-    monkeypatch.setattr(mailbox, "await_delivery", unreadable)
+    monkeypatch.setattr(mailbox, "read_delivery_result", unreadable)
 
     job = {"id": "j-blind", "name": "n", "execution_id": "r1"}
     outcome = _deliver(job)

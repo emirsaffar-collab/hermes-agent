@@ -15,6 +15,7 @@ import contextvars
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -714,6 +715,32 @@ def bot_chat_message(job: dict, content: str) -> str:
 # write will never happen". Only failure paths pay it.
 BOT_CHAT_ADMISSION_GRACE_SECONDS = 5.0
 
+# How often the grace re-reads the store while it waits for the receipt to appear at all.
+_ADMISSION_POLL_SECONDS = 0.25
+
+
+def _await_admission(home, delivery_id: str, timeout: float) -> Optional[dict]:
+    """Wait up to ``timeout`` for a receipt for this id to EXIST, then return it (None if it never does).
+
+    ``tools.bot_live_delivery.await_delivery`` is the wrong tool here and was the first version of
+    this branch: it is written for callers that already had a receipt created for them, so a missing
+    record is terminal for it and it returns ``None`` on the first read — measured at 0.00 s by
+    ``scripts/probe-late-admit.py``. The exception branch needs the opposite default, because the
+    state a late admit starts in is exactly "no file yet". Polling the store keeps that distinction:
+    absence is pending, a record's status is the disposition.
+    """
+    from tools.bot_live_delivery import read_delivery_result
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        record = read_delivery_result(home, delivery_id)
+        if record is not None:
+            return record
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(_ADMISSION_POLL_SECONDS, remaining))
+
 
 def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
                          for_failure: bool = False) -> Optional[str]:
@@ -732,8 +759,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
     from hermes_constants import get_hermes_home
     from hermes_cli.profiles import get_profile_dir
     from tools.bot_live_delivery import (
-        PreDialError, await_delivery, deliver_to_live_owner, find_canonical_live_owner,
-        read_delivery_result,
+        PreDialError, deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
     )
 
     job_id = job.get("id", "?")
@@ -819,7 +845,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
         recovery_error = None
         if key is not None and home is not None:
             try:
-                recovered = await_delivery(home, key, BOT_CHAT_ADMISSION_GRACE_SECONDS)
+                recovered = _await_admission(home, key, BOT_CHAT_ADMISSION_GRACE_SECONDS)
             except Exception as read_exc:  # an unreadable receipt is not a delivery verdict
                 recovery_error = f"{type(read_exc).__name__}: {read_exc}"
                 recovered = None
