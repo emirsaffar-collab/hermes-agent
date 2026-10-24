@@ -861,6 +861,36 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
     )
 
 
+def _redact_mutation_result_dict(result_dict: dict, *, secret_file: bool) -> None:
+    """Redact diff, error, lsp_diagnostics, warning, note, and lint in write/patch results.
+
+    ``read_file_tool`` and ``search_tool`` redact returned file lines with
+    ``file_read=True`` (``«redacted:…»``), whereas ``patch_replace`` / ``patch_v4a``
+    diff against the raw on-disk bytes and ``write_file`` / ``patch`` syntax
+    linters and fuzzy-match ``Did you mean?`` hints can quote raw source lines.
+    Without this pass, removing or editing a line near a hardcoded secret echoes
+    the raw secret into ``state.db`` via the tool result JSON.
+    """
+    for _key in ("diff", "error", "lsp_diagnostics", "warning", "note"):
+        _val = result_dict.get(_key)
+        if isinstance(_val, str) and _val:
+            result_dict[_key] = redact_sensitive_text(
+                _val, file_read=True, secret_file=secret_file)
+    _lint = result_dict.get("lint")
+    if isinstance(_lint, dict):
+        for _lk, _lv in list(_lint.items()):
+            if isinstance(_lv, str) and _lv and _lk in ("output", "message"):
+                _lint[_lk] = redact_sensitive_text(
+                    _lv, file_read=True, secret_file=secret_file)
+            elif isinstance(_lv, dict):
+                _sub_sec = secret_file or _is_secret_file_arg(str(_lk))
+                for _sk in ("output", "message"):
+                    _sv = _lv.get(_sk)
+                    if isinstance(_sv, str) and _sv:
+                        _lv[_sk] = redact_sensitive_text(
+                            _sv, file_read=True, secret_file=_sub_sec)
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -919,13 +949,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                     # same-task writes stay unblocked (patch_tool carries it).
                     _mark_full_write_baseline(_resolved, task_id, getattr(result, "_content_sha256", None))
                 _note_edited(task_id, [path], path_to_resolved, session_id)
+        _is_sec = any(_is_secret_file_arg(_p) for _p in (path, _resolved) if _p)
+        _redact_mutation_result_dict(result_dict, secret_file=_is_sec)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
         else:
             logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
-        return tool_error(str(e))
+        return tool_error(redact_sensitive_text(str(e), file_read=True))
 
 
 def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str], list[str]] | str:
@@ -1046,9 +1078,18 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
                 result_dict["_hint"] = (
                     "old_string not found. Use read_file to verify the current "
                     "content, or search_files to locate the text.")
+        # Redact diff, error, lint, and lsp_diagnostics with file_read=True so
+        # deleting or editing a hardcoded secret via patch does not echo the raw
+        # secret back into state.db via result_dict.
+        _is_sec = any(
+            _is_secret_file_arg(_p)
+            for _p in (*_paths_to_check, *_path_to_resolved.values(), *_path_to_entry.values())
+            if _p
+        )
+        _redact_mutation_result_dict(result_dict, secret_file=_is_sec)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
-        return tool_error(str(e))
+        return tool_error(redact_sensitive_text(str(e), file_read=True))
 
 
 def search_tool(pattern: str, target: str = "content", path: str = ".",

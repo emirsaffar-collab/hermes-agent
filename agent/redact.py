@@ -256,11 +256,11 @@ _ENV_ASSIGN_LOWER_RE = re.compile(
 # bare secret-word key only at line start (optionally after ``export``), so conversational ``I have
 # password=foo`` mid-sentence is left alone.
 _SECRET_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)"
-# Rendered line-number prefix: ``5|line`` (read_file), ``6:line`` (grep -n), ``7-line`` (grep -A/-B/-C
-# context lines) and ``     8\tline`` (cat -n / nl: right-aligned number + TAB). Callers put the ONLY
-# leading ``[ \t]*`` in front of it — stacking a second whitespace run around an optional gutter made
-# the anchored passes quadratic on long indented lines (2s per 5k spaces).
-_LINE_NUMBER_GUTTER = r"(?:[0-9]+(?:[|:\-]|\t)[ \t]*)?"
+# Rendered line-number / diff / YAML-list prefix: ``5|line`` (read_file), ``6:line`` (grep -n),
+# ``7-line`` (grep -A/-B/-C), ``     8\tline`` (cat -n / nl), unified-diff ``-``/``+`` prefixes, and
+# YAML sequence ``- `` items (up to two prefix tokens, e.g. ``5|  - api_key: …`` or ``+  - api_key: …``).
+# Every whitespace run is possessive (``[ \t]*+``) so long indented lines never backtrack.
+_LINE_NUMBER_GUTTER = r"(?:(?:[0-9]+(?:[|:\-]|\t)|[+-])[ \t]*+){0,2}"
 _CFG_VALUE = r"(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
 # Linear pre-gate for the _CFG_*_RE subs: no secret keyword => neither can match.
 _CFG_SECRET_WORD_RE = re.compile(_SECRET_CFG_NAMES, re.IGNORECASE)
@@ -286,7 +286,7 @@ _CFG_DOTTED_RE = re.compile(
 # and ``cat -n`` emits ``     7\tADS_API_TOKEN: …``. Anchored at ``^`` without it, none of those
 # matched, so the rendered read of a secret-bearing file leaked what the raw text masked.
 _CFG_ANCHORED_RE = re.compile(
-    rf"(^[ \t]*{_LINE_NUMBER_GUTTER}(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
+    rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
     re.IGNORECASE | re.MULTILINE,
 )
 

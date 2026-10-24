@@ -1408,7 +1408,12 @@ class TestSecretFileAssignmentRedaction:
         ("108-      ADS_API_TOKEN: {tok}", "«redacted-secret»"),  # grep -A/-B/-C context gutter
         ("   108\tADS_API_TOKEN: {tok}", "«redacted-secret»"),   # cat -n / nl gutter (number + TAB)
         ("   108\texport FOO_TOKEN={tok}", "«redacted-secret»"),
-        ("GITHUB_TOKEN: ghp_S1abcdefghijklmnopqrstuvwxyz0Pn2T", "«redacted:ghp_…»"),  # prefix label kept
+        ("-      ADS_API_TOKEN: {tok}", "«redacted-secret»"),    # unified diff removed YAML line
+        ("+      ADS_API_TOKEN: {tok}", "«redacted-secret»"),    # unified diff added YAML line
+        ("+  - api_key: {tok}", "«redacted-secret»"),            # unified diff YAML sequence item
+        ("5|  - api_key: {tok}", "«redacted-secret»"),           # read_file YAML sequence item
+        ("+password={tok}", "«redacted-secret»"),                # unified diff added bare config key
+        ("GITHUB_TOKEN: " + "ghp_" + "S1abcdefghijklmnopqrstuvwxyz0Pn2T", "«redacted:ghp_…»"),  # prefix label kept
     ])
     def test_secret_file_masks_assignment_with_non_reusable_sentinel(self, template, sentinel):
         text = template.format(tok=self.SYNTH)
