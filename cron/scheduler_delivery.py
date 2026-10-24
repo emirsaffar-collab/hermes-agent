@@ -708,6 +708,13 @@ def bot_chat_message(job: dict, content: str) -> str:
     )
 
 
+# How long the exception branch waits for a receipt that may still be being written. The receipt is
+# committed by the target's authority when it ADMITS the turn, so a 30 s rpc budget can lapse while the
+# owner is still mid-turn; this grace is what separates "the write has not happened yet" from "the
+# write will never happen". Only failure paths pay it.
+BOT_CHAT_ADMISSION_GRACE_SECONDS = 5.0
+
+
 def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
                          for_failure: bool = False) -> Optional[str]:
     """Admit job output to the target profile's authority as a real inbound Bot Chat turn.
@@ -725,12 +732,20 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
     from hermes_constants import get_hermes_home
     from hermes_cli.profiles import get_profile_dir
     from tools.bot_live_delivery import (
-        deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
+        PreDialError, await_delivery, deliver_to_live_owner, find_canonical_live_owner,
+        read_delivery_result,
     )
 
     job_id = job.get("id", "?")
     profile_label = profile or "(own)"
     message = bot_chat_message(job, content)
+    target = f"bot-chat:{profile_label}"
+    key: Optional[str] = None  # set once the deterministic delivery id exists (the receipt oracle)
+    home = None  # set with the resolved target profile home; both must exist to re-read a receipt
+    # Only a raise from AFTER the RPC left the socket is ambiguous: before it, nothing reached the
+    # authority and the failure is definite. Set on the line above the dial, not by exception type,
+    # because the branch must not depend on which class a transport happens to raise.
+    dial_started = False
     try:
         source_home = get_hermes_home().resolve()
         home = (get_profile_dir(profile) if profile else source_home).resolve()
@@ -750,7 +765,6 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
         ).encode("utf-8")).hexdigest()
         # Read BEFORE discovery: the previous owner may have exited after accepting.
         receipt = read_delivery_result(home, key)
-        target = f"bot-chat:{profile_label}"
         if receipt is None and suppress_notification:
             # Suppression is a durable disposition, not a send: the failure notice is booked
             # against the job and never handed to the owner (the target profile hides
@@ -770,6 +784,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
             if owner is None:
                 return f"bot-chat delivery to profile '{profile_label}' unverified: no canonical Bot Chat"
             # A failure notice rides as ``diagnostic`` so the target's reply stays muted.
+            dial_started = True  # past here a raise may mean an admitted delivery
             receipt = deliver_to_live_owner(home, owner, message, delivery_id=key,
                 **({"notification_category": "diagnostic"} if for_failure else {}))
         if (receipt["message"] != message
@@ -786,7 +801,68 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
                   else receipt.get("error") or receipt.get("reason") or "not completed")
         return f"{target} {status} (receipt {key}): {detail}"
     except Exception as exc:
-        return f"bot-chat delivery to profile '{profile_label}' unverified: {exc}"
+        # A raise AFTER the RPC left the socket does not prove nothing was admitted: the target's
+        # authority commits the receipt when it ADMITS the turn, so a 30 s ``rpc`` budget can lapse
+        # while the owner is still mid-turn and the payload is queued in front of it. Re-read the
+        # deterministic receipt this function reads BEFORE dialing, waiting a bounded grace, and let
+        # the record decide:
+        #   * record for THIS payload → its status is the disposition (settled → delivered;
+        #     queued/claimed → completion unverified; ambiguous → the detail branch);
+        #   * record for ANOTHER payload → the id belongs to something else: a definite failure,
+        #     never laundered into this admission;
+        #   * no record → the outcome is UNKNOWN, not failed: the caller keeps it out of
+        #     ``delivery_errors`` and books it as unverified. Only a raise from BEFORE the dial
+        #     (``dial_started`` false) is a definite non-delivery.
+        # The cause never publishes as an empty tail (``str(TimeoutError())`` is '' on CPython).
+        recovered = None
+        collision = False
+        recovery_error = None
+        if key is not None and home is not None:
+            try:
+                recovered = await_delivery(home, key, BOT_CHAT_ADMISSION_GRACE_SECONDS)
+            except Exception as read_exc:  # an unreadable receipt is not a delivery verdict
+                recovery_error = f"{type(read_exc).__name__}: {read_exc}"
+                recovered = None
+            # The identity check mirrors the success path exactly (payload AND category): a
+            # diagnostic notice and a result that happen to share text are different admissions.
+            if recovered is not None and (
+                    recovered.get("message") != message
+                    or recovered.get("notification_category", "result")
+                    != ("diagnostic" if for_failure else "result")):
+                collision = True
+                recovered = None  # a record holding another payload is a different admission
+        if recovered is not None and recovered.get("status") in ("settled", "queued", "claimed", "ambiguous"):
+            status = recovered["status"]
+            job.setdefault("_bot_chat_delivery_receipts", {})[target] = {
+                "status": status, "delivery_id": key}
+            logger.warning("Job '%s': Bot Chat %s receipt=%s recovered after %s: status=%s",
+                           job_id, profile_label, key, type(exc).__name__, status)
+            if status == "settled":
+                return None
+            detail = ("completion unverified; do not resend" if status in ("queued", "claimed")
+                      else recovered.get("error") or recovered.get("reason") or "not completed")
+            return f"{target} {status} (receipt {key}): {detail}"
+        detail = str(exc) or type(exc).__name__
+        # ``PreDialError`` is the delivery helper's own name for "nothing reached the authority":
+        # the helper raises it before opening the socket, so a raise out of the helper call can
+        # still be a definite non-delivery even though ``dial_started`` is already true here.
+        if collision or not dial_started or isinstance(exc, PreDialError):
+            why = ("a receipt for another payload owns this delivery id" if collision
+                   else "failed before the dial")
+            logger.warning("Job '%s': Bot Chat %s delivery failed — %s (%s): %s",
+                           job_id, profile_label, why, type(exc).__name__, detail)
+            return (f"bot-chat delivery to profile '{profile_label}' unverified: "
+                    f"{why}: {type(exc).__name__}: {detail}")
+        # Past the dial with no record: admission unknown. Not a delivery failure — the caller keeps
+        # an ``unknown`` receipt out of ``delivery_errors`` and books it as unverified instead.
+        job.setdefault("_bot_chat_delivery_receipts", {})[target] = {
+            "status": "unknown", "delivery_id": key}
+        logger.warning("Job '%s': Bot Chat %s admission UNCONFIRMED after %ss (%s): %s%s",
+                       job_id, profile_label, BOT_CHAT_ADMISSION_GRACE_SECONDS,
+                       type(exc).__name__, detail,
+                       f" [receipt unreadable: {recovery_error}]" if recovery_error else "")
+        return (f"{target} unknown (receipt {key}): admission unconfirmed: "
+                f"{type(exc).__name__}: {detail}")
 
 
 def _normalize_deliver_value(deliver) -> str:
@@ -1924,9 +2000,12 @@ def _deliver_result(
             if bot_chat_error:
                 receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
                 receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
-                if not receipt or receipt["status"] not in ("queued", "claimed"):
+                # ``unknown`` is an admission the producer could not confirm inside its grace:
+                # booked as unverified below, never as a delivery failure, because the payload may
+                # be queued in front of the owner while the receipt is still being written.
+                if not receipt or receipt["status"] not in ("queued", "claimed", "unknown"):
                     delivery_errors.append(bot_chat_error)
-                if receipt and receipt["status"] == "ambiguous":
+                if receipt and receipt["status"] in ("ambiguous", "unknown"):
                     unverified_targets.append(bot_chat_error)
             continue
 
