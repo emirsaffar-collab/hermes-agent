@@ -1200,6 +1200,35 @@ def get_timezone_migration_catchup_stats() -> dict[str, Any]:
     }
 
 
+def _rearm_next_run(job: dict[str, Any], now_iso: str) -> Optional[str]:
+    """Next run for a recurring job, anchored on the instant that was SCHEDULED, not on the
+    moment the tick actually claimed it.
+
+    Kvitto 2026-10-23 (disk-full chain): anchoring on the claim time folded every tick's lateness
+    into the following due time, so a job configured ``every 5m`` ran every 5.99-6.00 min —
+    measured across the estate, 33/33 interval jobs late, median +0.95 min, range +0.20..+2.39.
+    A watchdog whose configured cadence is a lie is an alarm that can arrive a full interval after
+    the cliff it watches. Anchoring on the due instant keeps the grid; if the anchored next is
+    already in the past (a run longer than its interval), fall back to now so a slow job cannot
+    accumulate catch-up bursts.
+    """
+    due = job.get("next_run_at")
+    base = now_iso
+    if due:
+        try:
+            if _parse_aware(due) is not None and _parse_aware(due) <= _parse_aware(now_iso):
+                base = due
+        except Exception:
+            base = now_iso
+    nxt = compute_next_run(job.get("schedule") or {}, base)
+    try:
+        if nxt and _parse_aware(nxt) is not None and _parse_aware(nxt) <= _parse_aware(now_iso):
+            nxt = compute_next_run(job.get("schedule") or {}, now_iso)
+    except Exception:
+        pass
+    return nxt
+
+
 def compute_next_run(schedule: dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
     """Compute the next run time for a schedule as an ISO string, or None if no more runs."""
     now = _hermes_now()
@@ -2712,7 +2741,7 @@ def advance_next_runs(job_ids) -> int:
                 or job.get("schedule", {}).get("kind") not in {"cron", "interval"}
             ):
                 continue
-            new_next = compute_next_run(job["schedule"], now)
+            new_next = _rearm_next_run(job, now)
             if new_next and new_next != job.get("next_run_at"):
                 job["next_run_at"] = new_next
                 advanced += 1
