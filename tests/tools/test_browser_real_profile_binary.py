@@ -82,9 +82,12 @@ class TestRealProfileBinaryOverride:
         """Drift guard: the real-profile launch path must consult the override (and only fall
         back to chromium_executable). Catches a refactor silently reverting to the real binary."""
         import inspect
-        import tools.browser_tool_real_profile as tool
+        import tools.browser_session_real_profile as tool
 
-        src = inspect.getsource(tool._real_profile_cdp)
-        assert "real_profile_binary_override()" in src, "override call missing from _real_profile_cdp"
+        # Re-pointed 24/10 by the v52 browser refactor: the launch path moved from
+        # tools/browser_tool_real_profile._real_profile_cdp (deleted upstream) to
+        # tools/browser_session_real_profile._launch. The invariant is unchanged.
+        src = inspect.getsource(tool._launch)
+        assert "real_profile_binary_override()" in src, "override call missing from _launch"
         assert "real_profile_binary_override() or chromium_executable(" in src, (
             "override must take precedence over the detected real binary")
