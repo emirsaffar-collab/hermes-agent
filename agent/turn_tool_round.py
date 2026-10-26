@@ -227,6 +227,7 @@ def run_tool_round(
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
     truncated_tool_call_retries = 0
+    agent._truncated_tool_call_retries = 0
     # Defer the paragraph break: _fire_stream_delta() prepends one "\n\n" when real
     # text arrives, so tool iterations don't stack blank lines.
     agent._stream_needs_break = True

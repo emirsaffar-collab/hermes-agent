@@ -410,6 +410,7 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
     agent = st.agent
     if st.truncated_tool_call_retries < 4:
         st.truncated_tool_call_retries += 1
+        agent._truncated_tool_call_retries = st.truncated_tool_call_retries
         n = st.truncated_tool_call_retries
         if st.is_stub:
             agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/4)...")
@@ -418,7 +419,10 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
         agent._ephemeral_max_output_tokens = boosted_output_cap(
             agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n
         )
+        agent._ephemeral_reasoning_off = True
         return st.done("continue")  # don't append the broken response
+    agent._truncated_tool_call_retries = 0
+    agent._ephemeral_reasoning_off = False
     agent._flush_status_buffer()
     _failure = FailoverReason.timeout.value if st.is_stub else "truncated"
     if st.is_stub and getattr(st.response, "_clean_eof", False):

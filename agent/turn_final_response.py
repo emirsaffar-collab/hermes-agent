@@ -162,6 +162,7 @@ def finish_text_response(
         return _verdict("continue")
 
     agent._empty_content_retries = 0
+    agent._truncated_tool_call_retries = 0
     agent._thinking_prefill_retries = 0
     # Surface the one-shot fallback switch notice before dropping the retry buffer so a
     # provider/model switch stays visible on success.
