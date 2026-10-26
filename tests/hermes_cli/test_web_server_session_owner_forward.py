@@ -31,7 +31,8 @@ def _discover(monkeypatch, endpoint, seen=None):
     def fake_discover(home, timeout=2.0):
         if seen is not None:
             seen['home'] = home
-        return SimpleNamespace(endpoint=endpoint)
+        return SimpleNamespace(state='absent' if endpoint is None else 'ready', endpoint=endpoint,
+                               reason_code=None, detail=None)
     monkeypatch.setattr('hermes_cli.gateway_runtime.discover_gateway_endpoint', fake_discover)
 
 
@@ -99,6 +100,56 @@ async def test_standalone_mutation_falls_back_to_offline_without_an_owner(tmp_pa
     assert result == {'ok': True, 'session_id': 'session-2', 'operation': 'rename', 'revision': 2}
     assert len(offline) == 1
     assert offline[0]['operation'] == 'rename'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('state, reason_code', [('inaccessible', 'control_timeout'),
+                                               ('inaccessible', 'profile_mismatch'), ('starting', None)])
+async def test_an_owner_discovery_cannot_identify_is_not_owner_less(tmp_path, monkeypatch, state, reason_code):
+    """#144141: over SSH ``serve --isolated`` discovery of a running gateway came back without an
+    endpoint, and the offline reservation that owner wins answered a bare 409: pins and renames
+    looked applied, then vanished. A lost reservation behind any verdict but ``absent`` answers a
+    retryable 503 that names discovery's reason and keeps the reservation's remedy."""
+    from contextlib import contextmanager
+    from gateway.runtime_ownership import OwnershipConflict
+    from hermes_cli import web_server_sessions
+    from hermes_cli.gateway_runtime import GatewayDiscovery
+
+    request = _standalone_request(monkeypatch, tmp_path)
+    monkeypatch.setattr('hermes_cli.gateway_runtime.discover_gateway_endpoint',
+                        lambda home, timeout=2.0: GatewayDiscovery(state, reason_code=reason_code))
+
+    @contextmanager
+    def owner_holds_the_lock(homes):
+        raise OwnershipConflict('Exclusive maintenance refused: held. Drain and stop the gateway, then retry.')
+        yield
+
+    monkeypatch.setattr('gateway.runtime_ownership.exclusive_maintenance', owner_holds_the_lock)
+    with pytest.raises(HTTPException) as exc:
+        await web_server_sessions._mutate_session_request(
+            request, None, 'session-7', request_id='req-7', expected_revision=0,
+            operation='sidebar', payload={'pinned': True})
+    assert exc.value.status_code == 503
+    assert exc.value.detail.startswith(f'owner_unavailable: {reason_code or state}: ')
+    assert 'Drain and stop the gateway' in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_without_a_live_owner_still_edits_offline(tmp_path, monkeypatch):
+    """Path checks read ``inaccessible`` before ``gateway.lock`` (a stale bad-mode socket, a parked
+    secondary), so no endpoint does not prove an owner: the offline reservation decides, as on main."""
+    from hermes_cli import web_server_sessions
+    from hermes_cli.gateway_runtime import GatewayDiscovery
+
+    request = _standalone_request(monkeypatch, tmp_path)
+    monkeypatch.setattr('hermes_cli.gateway_runtime.discover_gateway_endpoint', lambda home, timeout=2.0:
+                        GatewayDiscovery('inaccessible', reason_code='unsafe_control_permissions'))
+    monkeypatch.setattr(web_server_sessions, '_mutate_offline_store', lambda profile, actor, params:
+                        {'session_id': params['session_id'], 'operation': 'sidebar', 'revision': 1})
+    result = await web_server_sessions._mutate_session_request(
+        request, None, 'session-8', request_id='req-8', expected_revision=0,
+        operation='sidebar', payload={'pinned': True})
+    assert result == {'ok': True, 'session_id': 'session-8', 'operation': 'sidebar', 'revision': 1}
 
 
 @pytest.mark.asyncio
@@ -322,25 +373,32 @@ async def test_standalone_mutation_during_gateway_startup_returns_retryable_503_
 ):
     """During gateway cold-start (state='starting', before publish_gateway_runtime_ready),
     discover_gateway_endpoint returns endpoint=None with state!='absent'. Standalone serve
-    must surface retryable 503 owner_unreachable instead of falling back to _mutate_offline_store
-    and colliding with gateway.lock (409 Exclusive maintenance refused)."""
+    must surface a retryable 503 (owner_unavailable) when the offline reservation loses to
+    the (starting) owner — never the bare 409 Exclusive-maintenance refusal that pinned
+    sessions in maintenanceFenced (CF-36, graduated to upstream #144141)."""
+    from contextlib import contextmanager
+    from gateway.runtime_ownership import OwnershipConflict
     from hermes_cli import web_server_sessions
+    from hermes_cli.gateway_runtime import GatewayDiscovery
 
     request = _standalone_request(monkeypatch, tmp_path)
     monkeypatch.setattr(
         'hermes_cli.gateway_runtime.discover_gateway_endpoint',
-        lambda home, timeout=1.5: SimpleNamespace(state=owner_state, endpoint=None),
+        lambda home, timeout=1.5: GatewayDiscovery(owner_state, reason_code=None),
     )
-    offline = []
-    monkeypatch.setattr(
-        web_server_sessions, '_mutate_offline_store',
-        lambda profile, actor, params: offline.append(params),
-    )
+
+    @contextmanager
+    def owner_holds_the_lock(homes):
+        raise OwnershipConflict('Exclusive maintenance refused: held. Drain and stop the gateway, then retry.')
+        yield
+
+    monkeypatch.setattr('gateway.runtime_ownership.exclusive_maintenance', owner_holds_the_lock)
     with pytest.raises(HTTPException) as exc:
         await web_server_sessions._mutate_session_request(
             request, None, 'session-pin', request_id='req-pin', expected_revision=0,
             operation='pin', payload={'pinned': True},
         )
-    assert (exc.value.status_code, exc.value.detail) == (503, 'owner_unreachable')
-    assert offline == []
+    assert exc.value.status_code == 503
+    assert exc.value.detail.startswith(f'owner_unavailable: {owner_state}: ')
+    assert 'Drain and stop the gateway' in exc.value.detail
 
