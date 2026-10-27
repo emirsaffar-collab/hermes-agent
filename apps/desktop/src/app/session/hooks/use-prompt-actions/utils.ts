@@ -428,6 +428,11 @@ export function isSessionRecentlyInterrupted(sessionId: string, now = Date.now()
   return true
 }
 
+/** Milliseconds left on the session's Stop cooldown (0 when none). */
+export function recentInterruptRemainingMs(sessionId: string, now = Date.now()): number {
+  return isSessionRecentlyInterrupted(sessionId, now) ? (_recentlyInterruptedUntil.get(sessionId) ?? now) - now : 0
+}
+
 export function clearSessionRecentlyInterrupted(sessionId?: string): void {
   if (sessionId) {
     _recentlyInterruptedUntil.delete(sessionId)
