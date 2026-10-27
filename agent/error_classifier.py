@@ -111,6 +111,12 @@ _BILLING_PATTERNS = (
     # OpenRouter org-level monthly cap arrives as 403 "Budget limit exceeded (monthly limit)" (#107166):
     # account exhaustion, not a credential problem.
     "budget limit exceeded",
+    # The WORKSPACE-level cap words the same refusal differently — "Workspace monthly budget of
+    # $20000.00 exceeded … resets <ts>" — with no contiguous "budget limit exceeded", so it fell
+    # through to the auth branch and read as a credential fault (2026-10-27: 16 turns reported
+    # ``failure_reason=auth`` while the key was healthy and the cap was the whole story). Kept
+    # narrow on purpose: a bare "budget" would swallow unrelated 403 prose.
+    "workspace monthly budget",
     *_FREE_TIER_REFUSAL_PATTERNS,
     # LiteLLM proxies word a hard cap as "hard billing limit" (structured twin:
     # ``terminal_quota_exhausted`` in _BILLING_ERROR_CODES). "terminal billing
