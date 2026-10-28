@@ -88,8 +88,8 @@ import {
   setIntroSeed,
   setMessages,
   setNewChatWorkspaceTarget,
-  setResumeExhaustedSessionId,
   setResumeFailedSessionId,
+  setResumeReattachSessionId,
   setSelectedStoredSessionId,
   setSessionOwnerHint,
   setSessionStartedAt,
@@ -167,6 +167,13 @@ import {
   withoutEarlyClarifyProjection
 } from './restore-pending-clarify'
 import { projectPendingConnection, restorePendingConnectionFromSnapshot } from './restore-pending-connection'
+import {
+  type GraftedTranscriptPage,
+  graftTranscriptPage,
+  prefetchServesResume,
+  rereadPageAfterResumeBarrier
+} from './resume-barrier-reread'
+import { clearResumeLatches, clearResumeToasts, notifyResumeFailed, type ResumeAttemptOptions } from './resume-latches'
 import {
   ambientResumeConnectionId,
   openResumeGateway,
@@ -1154,7 +1161,7 @@ export function useSessionActions({
       storedSessionId: string,
       replaceRoute = false,
       capturedOwner?: SessionProfileRoute,
-      options?: { authoritativeSnapshot?: boolean }
+      options?: ResumeAttemptOptions
     ) => {
       // Delete/archive tombstones the durable id before the route flips, and
       // requestSessionResume already refuses to queue for a doomed id. This is
@@ -1205,7 +1212,7 @@ export function useSessionActions({
       // ref here is also what use-route-resume's self-heal assumes ("set
       // synchronously at resume entry").
       setFreshDraftReady(false)
-      clearNotifications()
+      clearResumeToasts(options)
       resetViewSync()
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
@@ -1223,15 +1230,7 @@ export function useSessionActions({
         closeSessionTile(storedSessionId)
       }
 
-      // Optimistically clear any prior resume-failure latch for this session:
-      // we're attempting a fresh resume, so the self-heal in use-route-resume
-      // must not keep treating it as stranded. It's re-armed below only if THIS
-      // attempt fails terminally (RPC reject + REST fallback failure).
-      setResumeFailedSessionId(current => (current === storedSessionId ? null : current))
-      // Also clear the exhausted-latch: a fresh attempt (manual Retry, reconnect,
-      // reselect) gives the bounded auto-retry counter a clean cycle, so the
-      // chat view drops the error state and shows the loader again.
-      setResumeExhaustedSessionId(current => (current === storedSessionId ? null : current))
+      clearResumeLatches(storedSessionId)
 
       // A warm cache entry is only trustworthy when it still BELONGS to the
       // session being resumed. A pooled profile backend that gets idle-reaped
@@ -1453,7 +1452,7 @@ export function useSessionActions({
           }
 
           setFreshDraftReady(false)
-          clearNotifications()
+          clearResumeToasts(options)
           setSelectedStoredSessionId(storedSessionId)
           selectedStoredSessionIdRef.current = storedSessionId
           setActiveSessionId(cachedRuntimeId)
@@ -1941,7 +1940,7 @@ export function useSessionActions({
       busyRef.current = false
       setBusy(false)
       setAwaitingResponse(false)
-      clearNotifications()
+      clearResumeToasts(options)
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
       const runtimeStartedAt = Date.now()
@@ -1981,6 +1980,7 @@ export function useSessionActions({
         let prefetchApplied = false
         let prefetchedStoredSessionId: string | null = null
         let prefetchedTranscriptMessages: ChatMessage[] | null = null
+        let prefetchedPage: GraftedTranscriptPage | null = null
 
         // REST transcript prefetch and the gateway resume RPC are independent
         // — run them concurrently so a big session's wall time is
@@ -2058,18 +2058,9 @@ export function useSessionActions({
             : viewMessagesForReconcile()
 
           // Tail page + previously backfilled prefix (same-session re-resume).
-          // A long turn can push every rendered row off the newest page; read
-          // older pages until they overlap so the graft keeps earlier history.
-          const prefetchedTail = await extendRefreshPageToOverlap(
-            toChatMessages(prefetchedResult.messages),
-            previousMessages,
-            olderPageReader(storedSessionId, sessionRestScope, prefetchedResult)
-          )
-
-          const graftedPrefetch = graftRefreshedTailOntoBackfill(prefetchedTail, previousMessages)
-
-          prefetchedTranscriptMessages = graftedPrefetch
-          localSnapshot = reconcileAuthoritativeChatMessages(graftedPrefetch, previousMessages)
+          prefetchedPage = await graftTranscriptPage(prefetchedResult, previousMessages, storedSessionId, sessionRestScope)
+          prefetchedTranscriptMessages = prefetchedPage.transcript
+          localSnapshot = prefetchedPage.snapshot
           prefetchApplied = true
           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
 
@@ -2081,21 +2072,22 @@ export function useSessionActions({
 
         const resumed = await resumePromise
 
+        const reread = await rereadPageAfterResumeBarrier(resumed, prefetchedPage, storedSessionId, sessionRestScope)
+
+        if (reread) {
+          ;({ page: prefetchedResult, snapshot: localSnapshot, transcript: prefetchedTranscriptMessages } = reread)
+        }
+
         if (!isCurrentResume()) {
           return
         }
 
         const currentMessages = viewMessagesForReconcile()
 
-        // Keep the local snapshot when resume would only reshuffle runtime
-        // projection. When the REST prefetch already hydrated the transcript,
-        // skip converting/reconciling the resume payload entirely — on a
-        // 1000+-message session that second conversion plus the deep
-        // equivalence compare costs over a second of main-thread time.
-        const resumedStoredSessionId = resumed.session_key || resumed.resumed
-
-        const prefetchMatchesResumedSession =
-          !prefetchedStoredSessionId || !resumedStoredSessionId || prefetchedStoredSessionId === resumedStoredSessionId
+        // A current prefetch skips converting the resume payload (over a second
+        // on a 1000+-message session); a page older than the resume snapshot
+        // (it lacks a durable row the resume carries) yields to that snapshot.
+        const prefetchMatchesResumedSession = prefetchServesResume(prefetchedStoredSessionId, resumed, prefetchedResult)
 
         const hasLiveProjection = Boolean(resumed.inflight || resumed.queued)
 
@@ -2531,9 +2523,13 @@ export function useSessionActions({
           // once retries exhaust, blank that visible transcript behind the
           // exhausted-state error overlay (a regression vs. plain fallback success).
           setResumeFailedSessionId(storedSessionId)
+        } else {
+          // Readable, but detached: a turn still running there never streams
+          // in. Re-attach quietly (use-resume-reattach), no error overlay.
+          setResumeReattachSessionId(storedSessionId)
         }
 
-        notifyError(err, copy.resumeFailed)
+        notifyResumeFailed(err, copy.resumeFailed, storedSessionId, options)
       } finally {
         displayRead.release()
 

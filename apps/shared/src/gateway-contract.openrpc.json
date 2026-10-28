@@ -10323,6 +10323,18 @@
             "title": "Messages",
             "type": "array"
           },
+          "messages_omitted": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Messages Omitted"
+          },
           "display_messages": {
             "anyOf": [
               {
@@ -27087,6 +27099,13 @@
               "type": "string"
             },
             "title": "Top Tier Model Ids",
+            "type": "array"
+          },
+          "subscription_model_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Subscription Model Ids",
             "type": "array"
           },
           "featured_model_ids": {

@@ -367,6 +367,39 @@ async def test_owner_restarted_between_discovery_and_mint_is_a_retryable_503(tmp
 
 
 @pytest.mark.asyncio
+async def test_a_signed_in_owner_forwards_through_the_real_ticket_verifier(tmp_path, monkeypatch):
+    """A dashboard sign-in is the machine owner, so a standalone dashboard forwarding its edit must
+    get a ticket from the running gateway's real control verifier, and the ticket names the owner.
+    The verifier only lets a peer name a structured login subject; the owner's own OS subject is
+    the peer's, so naming it explicitly would be refused and every edit would 503."""
+    from gateway.control_socket import GatewayControlServer
+    from gateway.owner_identity import host_owner_subject
+    from gateway.runtime_bootstrap import TicketStore
+    from hermes_cli import web_server_sessions
+
+    request = _standalone_request(monkeypatch, tmp_path)
+    request.state.session = SimpleNamespace(user_id='admin', provider='basic', issuer='')
+    _discover(monkeypatch, _real_endpoint(_closed_port()))
+    server = GatewayControlServer(tmp_path)
+    server.ticket_store = TicketStore('i-main', frozenset({'p-main'}))
+    monkeypatch.setattr('hermes_cli.gateway_client.private_control_query',
+                        lambda home, line, timeout=5: server.handle_request_line(
+                            line.strip(), peer_subject=host_owner_subject()))
+    grants = []
+
+    def admitted(endpoint, ticket):
+        grants.append(server.ticket_store.redeem(ticket, profile_id=None, purpose='interactive'))
+        raise _StopAfterMint
+
+    monkeypatch.setattr('hermes_cli.gateway_client.gateway_ws_target', admitted)
+    with pytest.raises(_StopAfterMint):
+        await web_server_sessions._mutate_session_request(
+            request, None, 'session-8', request_id='req-8', expected_revision=0,
+            operation='archive', payload={})
+    assert [grant['subject'] for grant in grants] == [host_owner_subject()]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('owner_state', ['starting', 'draining', 'conflict', 'inaccessible'])
 async def test_standalone_mutation_during_gateway_startup_returns_retryable_503_not_409(
     tmp_path, monkeypatch, owner_state,
@@ -401,4 +434,3 @@ async def test_standalone_mutation_during_gateway_startup_returns_retryable_503_
     assert exc.value.status_code == 503
     assert exc.value.detail.startswith(f'owner_unavailable: {owner_state}: ')
     assert 'Drain and stop the gateway' in exc.value.detail
-
