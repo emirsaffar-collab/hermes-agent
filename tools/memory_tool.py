@@ -119,6 +119,8 @@ _STORE_ACTIONS = {
 
 
 def _batch_op_line(op: dict[str, Any]) -> str:
+    if not isinstance(op, dict):
+        return f"  - ?: {str(op)[:120]}"
     op = op or {}
     act, content, old = op.get("action", "?"), op.get("content") or op.get("new_text") or "", op.get("old_text", "")
     if act == "remove":
@@ -256,6 +258,8 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
     if target_error is not None:
         return "rejected", json.dumps(target_error)
     if operations:
+        if isinstance(operations, list) and len(operations) == 1 and isinstance(operations[0], str) and operations[0].strip().startswith("["):
+            operations = operations[0]
         if isinstance(operations, str):
             # Local hardening (state.db, 48h): callers send a JSON-encoded list
             # in the string slot. Unwrap instead of rejecting -- the model can't
@@ -275,7 +279,7 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
                     pass
             # night 13/10 reconciliation: regex widened to cover upstream's new 'patch'
             # action (carried fix pre-dated it; both fix the same malformed-string hazard).
-        if not isinstance(operations, list):
+        if not isinstance(operations, list) or not all(isinstance(op, dict) for op in operations):
             return _invalid("operations must be a list of {action, content?, old_text?} objects.")
         if any(isinstance(op, dict) and op.get("action") == "replace" for op in operations):
             return _invalid(_REPLACE_REMOVED)

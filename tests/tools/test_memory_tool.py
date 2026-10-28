@@ -1189,3 +1189,14 @@ class TestOperationsStringUnwrap:
         assert result["success"] is True
         assert "new fact" in store._entries_for("memory")
         assert "old fact to replace" not in store._entries_for("memory")
+
+    def test_non_dict_operations_element_returns_structured_error_before_write_gate(self, store):
+        res = json.loads(
+            memory_tool(
+                target="memory",
+                operations=["patch", "old_text", "foo"],
+                store=store,
+            )
+        )
+        assert res["success"] is False
+        assert "operations must be a list of {action, content?, old_text?} objects." in res["error"]
