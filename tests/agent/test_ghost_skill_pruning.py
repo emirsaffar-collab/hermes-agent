@@ -217,6 +217,74 @@ class TestProtectedSkillPrune:
         res_next, _ = c._prune_old_tool_results(msgs_next_turn, protect_tail_count=4)
         assert _skill_pruned_marker("always-verify") in res_next[4]["content"]
 
+    def test_synthetic_mid_turn_user_row_does_not_evict_active_turn_skill(self):
+        """Mid-turn runtime injections ([Your active task list...], [IMPORTANT: Context...]) have role=='user'
+        but must not advance last_user past the real human turn that loaded the skill."""
+        c = _make_compressor()
+        tool_rounds = []
+        for i in range(7):
+            tool_rounds.extend([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": f"m_{i}", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": f"m_{i}", "content": f"round {i} " + "t" * 400},
+            ])
+        msgs = (
+            self._filler(2)
+            + [{"role": "user", "content": "Fix everything after sceptic pass"}]
+            + _skill_view_pair("call_ahl", "adversarial-hardening-loop", size=5000)
+            + [{"role": "user", "content": "[Your active task list was preserved across context compression]\n- [>] t6"}]
+            + tool_rounds
+        )
+        res, _ = c._prune_old_tool_results(msgs, protect_tail_count=4)
+        assert res[4]["content"].startswith("# adversarial-hardening-loop instructions")
+        assert SKILL_PRUNED_MARKER_PREFIX not in res[4]["content"]
+
+    def test_pressure_demotion_shrinks_non_protected_tools_before_protected_skill(self):
+        """Pass-4 sub-pass 4a shrinks ordinary read/search tool outputs first so active skills survive
+        when non-protected tool outputs account for the tail pressure."""
+        c = _make_compressor()
+        msgs = (
+            [{"role": "user", "content": "Audit and fix the guards"}]
+            + _skill_view_pair("call_skill", "always-verify", size=4000)
+            + [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call_read", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"big.py"}'}}],
+                },
+                {"role": "tool", "tool_call_id": "call_read", "content": "r" * 40000},
+                {"role": "assistant", "content": "done reading"},
+                {"role": "user", "content": "[IMPORTANT: Context is at 68%]"},
+                {"role": "assistant", "content": "continuing"},
+                {"role": "user", "content": "[Your active task list was preserved across context compression]"},
+                {"role": "assistant", "content": "wrapping up"},
+            ]
+        )
+        result, pruned = c._prune_old_tool_results(
+            msgs, protect_tail_count=10, protect_tail_tokens=3000
+        )
+        assert pruned >= 1
+        assert result[2]["content"].startswith("# always-verify instructions")
+        assert SKILL_PRUNED_MARKER_PREFIX not in result[2]["content"]
+        assert result[4]["content"].startswith("[read_file]")
+
+    def test_pinned_outbound_skill_survives_ordinary_prune_across_turns(self):
+        """Pinned outbound skills (outbound-comms, humanizer, google-chat-comms, svensk-avtalsgranskning)
+        stay protected across ordinary prune passes so outbound gates never lose their instructions."""
+        c = _make_compressor()
+        msgs = (
+            [{"role": "user", "content": "Draft reply to vendor"}]
+            + _skill_view_pair("call_out", "productivity/outbound-comms", size=5000)
+            + [{"role": "user", "content": "Now check the database rows first"}]
+            + self._filler(14, start=2)
+        )
+        res, _ = c._prune_old_tool_results(msgs, protect_tail_count=4)
+        assert res[2]["content"].startswith("# productivity/outbound-comms instructions")
+        assert SKILL_PRUNED_MARKER_PREFIX not in res[2]["content"]
+
 class TestMarkerSurvivesRealCompress:
     """P2 layer: markers survive a real compress() with a mocked aux LLM."""
 

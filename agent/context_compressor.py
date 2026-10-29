@@ -941,7 +941,8 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
 def _is_summary_stub(content: str) -> bool:
     """True for a ``[tool] ... (N chars)`` summary (a prune-only one may carry the rule) or a lean-tail demotion stub."""
-    return (s := without_skill_safety_rule(content)).startswith("[") and " chars)" in s and len(s) < 400 or is_demoted_stub(s)
+    s = without_skill_safety_rule(content)
+    return (s.startswith("[") and (" chars)" in s or " lines output)" in s) and len(s) < 400) or is_demoted_stub(s)
 
 
 # Shared floor; the clarify summary cap must stay strictly BELOW it so a preserved
@@ -1202,13 +1203,58 @@ def _skill_view_call_sites(messages: list[dict[str, Any]]) -> list[tuple[int, st
     return sites
 
 
+_SYNTHETIC_MID_TURN_USER_PREFIXES: tuple[str, ...] = (
+    "[context compaction",
+    "[prior context",
+    "[your active task list",
+    "[skills pruned during compression",
+    "[still in progress",
+    "[important: context",
+    "[important: background",
+    "[async delegation",
+    "[planning state preserved",
+    "[system:",
+    "cronjob response:",
+)
+
+_PINNED_OUTBOUND_SKILL_NAMES: frozenset[str] = frozenset({
+    "outbound-comms",
+    "humanizer",
+    "google-chat-comms",
+    "svensk-avtalsgranskning",
+    "outbound-quality-guard",
+    "outbound-guard-wordlist",
+})
+
+
+def _is_synthetic_mid_turn_user_row(msg: dict[str, Any]) -> bool:
+    """Return True if a role=='user' message is a runtime-injected mid-turn wrapper
+    (compaction handoff, preserved task list, context pressure nudge, async delegation
+    or cron wrapper) rather than a fresh human turn."""
+    if msg.get("role") != "user":
+        return False
+    if msg.get("_synthetic_origin"):
+        return True
+    content = msg.get("content")
+    if not isinstance(content, str):
+        return False
+    return content.lstrip().lower().startswith(_SYNTHETIC_MID_TURN_USER_PREFIXES)
+
+
 def _collect_protected_skill_names(messages: list[dict[str, Any]], prune_boundary: int) -> set[str]:
     """Skill names (lower-cased) whose skill_view bodies must survive Phase-1/2 demotion: loaded in
-    the recent window, active user turn, or protected tail, or named by active/tail user messages."""
+    the recent window, active user turn, or protected tail, named by active/tail user messages,
+    or pinned outbound/safety skills."""
     total = len(messages)
     if not total:
         return set()
-    last_user = next((i for i in range(total - 1, -1, -1) if messages[i].get("role") == "user"), total)
+    last_user = next(
+        (
+            i for i in range(total - 1, -1, -1)
+            if messages[i].get("role") == "user" and not _is_synthetic_mid_turn_user_row(messages[i])
+        ),
+        next((i for i in range(total - 1, -1, -1) if messages[i].get("role") == "user"), total),
+    )
     protect_from = min(max(0, total - _SKILL_PRUNE_RECENT_WINDOW), max(0, prune_boundary), last_user)
     tail_user_texts = [
         m["content"].lower() for m in messages[min(max(0, prune_boundary), last_user):]
@@ -1216,7 +1262,9 @@ def _collect_protected_skill_names(messages: list[dict[str, Any]], prune_boundar
     ]
     return {
         skill.lower() for idx, skill in _skill_view_call_sites(messages)
-        if idx >= protect_from or any(skill.lower() in text for text in tail_user_texts)
+        if idx >= protect_from
+        or skill.lower().rsplit("/", 1)[-1] in _PINNED_OUTBOUND_SKILL_NAMES
+        or any(skill.lower() in text or skill.lower().rsplit("/", 1)[-1] in text for text in tail_user_texts)
     }
 
 
@@ -1814,6 +1862,12 @@ def _sum_delegate_task(name, args, content, content_len, line_count):
 def _sum_execute_code(name, args, content, content_len, line_count):
     code_str = _str_arg(args, "code")
     code_preview = code_str[:60].replace("\n", " ") + ("..." if len(code_str) > 60 else "")
+    payload = _json_dict(content)
+    out_str = payload.get("output") if isinstance(payload, dict) else None
+    if isinstance(out_str, str) and out_str.strip():
+        out_flat = " ⏎ ".join(line.strip() for line in out_str.strip().splitlines() if line.strip())
+        out_snippet = out_flat if len(out_flat) <= 200 else out_flat[:197] + "..."
+        return f"[execute_code] `{code_preview}` -> {out_snippet} ({line_count} lines output)"
     return f"[execute_code] `{code_preview}` ({line_count} lines output)"
 
 
@@ -3333,10 +3387,12 @@ class ContextCompressor(
     def _pressure_demote_tail(
         self, result: list[dict[str, Any]], prune_boundary: int, protect_tail_tokens: int,
         call_id_to_tool: dict[str, tuple[str, str]], min_prune_chars: int, spared: range,
+        protected_skills: set[str] | None = None,
     ) -> int:
         """Pass 4: demote tool-result bodies inside the protected tail when it alone exceeds the soft
-        budget (#61932). Keeps a short recent floor and the ``spared`` pending tool round verbatim; overrides
-        the skill guard (else the dead-end recurs). Tool-call arguments stay byte-exact. Returns the number of
+        budget (#61932). Keeps a short recent floor and the ``spared`` pending tool round verbatim; shrinks
+        non-protected tool outputs first and only overrides the skill guard when protected skills alone still
+        exceed the soft ceiling. Tool-call arguments stay byte-exact. Returns the number of
         tool results demoted. Pressure counts only role=="tool" rows — the only rows demotion can shrink —
         so a tail inflated by large user/assistant rows (a stacked skill bundle, a pasted report) does not
         fire demotion that can never reach the ceiling."""
@@ -3358,24 +3414,42 @@ class ContextCompressor(
 
         demoted = 0
 
-        def _shrink_at(i: int) -> None:
+        def _shrink_at(i: int, skills_guard: set[str] | None = None) -> None:
             nonlocal demoted
             if i in spared:
                 return
-            if self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars):
+            if self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, skills_guard):
                 demoted += 1
 
         if demote_end <= prune_boundary or _protected_region_tokens() <= soft_ceiling:
             return 0
-        for i in range(start, demote_end):
-            _shrink_at(i)
-            if _protected_region_tokens() <= soft_ceiling:
-                break
+        # Sub-pass 4a: shrink non-protected tool bodies first so ordinary read/search/exec
+        # outputs absorb tail pressure before active/pinned skill_view instructions are touched.
+        if protected_skills:
+            for i in range(start, demote_end):
+                _shrink_at(i, protected_skills)
+                if _protected_region_tokens() <= soft_ceiling:
+                    break
+        # Sub-pass 4b: if protected skills alone still push the region over the soft ceiling
+        # (#61932 guard), fall back to unguarded demotion.
+        if _protected_region_tokens() > soft_ceiling:
+            for i in range(start, demote_end):
+                _shrink_at(i, None)
+                if _protected_region_tokens() <= soft_ceiling:
+                    break
         # If the recent floor is still dominated by huge tool bodies, demote all but the newest.
         if _protected_region_tokens() > soft_ceiling:
             last_tool_idx = next((i for i in range(len(result) - 1, -1, -1) if result[i].get("role") == "tool"), None)
-            for i in (i for i in range(start, len(result)) if i != last_tool_idx):
-                _shrink_at(i)
+            if protected_skills:
+                for i in (i for i in range(start, len(result)) if i != last_tool_idx):
+                    _shrink_at(i, protected_skills)
+                    if _protected_region_tokens() <= soft_ceiling:
+                        break
+            if _protected_region_tokens() > soft_ceiling:
+                for i in (i for i in range(start, len(result)) if i != last_tool_idx):
+                    _shrink_at(i, None)
+                    if _protected_region_tokens() <= soft_ceiling:
+                        break
             # Last resort, unless it is the spared pending round: the newest body may exceed the soft budget
             # alone (one 200KB read); summarize it.
             if (
@@ -3439,6 +3513,7 @@ class ContextCompressor(
         if protect_tail_tokens is not None and protect_tail_tokens > 0 and result:
             pruned += self._pressure_demote_tail(
                 result, prune_boundary, protect_tail_tokens, call_id_to_tool, min_prune_chars, spared,
+                protected_skills,
             )
         return result, pruned
 

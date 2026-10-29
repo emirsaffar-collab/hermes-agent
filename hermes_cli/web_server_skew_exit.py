@@ -23,6 +23,9 @@ from typing import Callable, Optional
 _log = logging.getLogger(__name__)
 
 DEFAULT_SKEW_POLL_S = 30.0
+# Once skew is confirmed across _CONFIRMATIONS polls, probe the retirement fence every second
+# instead of every 30s so inter-turn idle gaps on busy Desktop backends are caught immediately.
+DEFAULT_DRAIN_POLL_S = 1.0
 # Two consecutive observations: a checkout mid-rewrite (ref file replaced, packed-refs repacked) can
 # briefly read differently; a real update reads the new revision on every poll after it finishes.
 _CONFIRMATIONS = 2
@@ -67,6 +70,8 @@ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fe
                     _log.warning("%s", reason)
                     server.should_exit = True
                     return
+                time.sleep(min(poll_s, DEFAULT_DRAIN_POLL_S))
+                continue
             time.sleep(poll_s)
 
     thread = threading.Thread(target=_loop, daemon=True, name=thread_name)

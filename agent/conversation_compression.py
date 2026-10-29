@@ -2408,7 +2408,14 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
         if steer_text:
             return _insert_real_user_anchor(compressed, {"role": "user", "content": steer_text})
     from agent.message_metadata import append_message
-    append_message(compressed, {"role": "user", "content": COMPRESSION_CONTINUATION_USER_CONTENT})
+    append_message(
+        compressed,
+        {
+            "role": "user",
+            "content": COMPRESSION_CONTINUATION_USER_CONTENT,
+            "_synthetic_origin": "compression_continuation",
+        },
+    )
     return "placeholder_appended"
 
 
@@ -3074,9 +3081,15 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
                 # refresh it in place instead of stacking a duplicate.
                 _replace_message_content(_tail, todo_snapshot)
                 _tail["_todo_snapshot_synthetic"] = True
+                _tail["_synthetic_origin"] = "todo_snapshot"
                 merged = True
         if not merged:
-            compressed.append({"role": "user", "content": todo_snapshot, "_todo_snapshot_synthetic": True})
+            compressed.append({
+                "role": "user",
+                "content": todo_snapshot,
+                "_todo_snapshot_synthetic": True,
+                "_synthetic_origin": "todo_snapshot",
+            })
 
 
 def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:

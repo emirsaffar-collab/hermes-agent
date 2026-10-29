@@ -143,7 +143,7 @@ def apply_stop_gates(
 
     def _continue(nudge: str, flag: str) -> StopGateVerdict:
         """Append the synthetic nudge row and hand the turn back to the loop."""
-        append_message(messages, {"role": "user", "content": nudge, flag: True})
+        append_message(messages, {"role": "user", "content": nudge, flag: True, "_synthetic_origin": "stop_gate"})
         agent._session_messages = messages
         # Keep the answer only as a budget-exhaustion fallback; clear ``final_response`` so
         # the finalizer can tell this gate from error exits. Mark previewed only if the
