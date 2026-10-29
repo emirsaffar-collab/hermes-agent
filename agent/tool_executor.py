@@ -1107,7 +1107,8 @@ def _commit_tool_result(
                 function_name, function_args, function_result, failed=is_error, tool_call_id=tool_call_id,
             )
         if is_error:
-            logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, error_preview(function_result))
+            _, _fail_suffix = _detect_tool_failure(function_name, function_result)
+            logger.warning("Tool %s returned error%s (%.2fs): %s", function_name, _fail_suffix or "", tool_duration, error_preview(function_result))
         elif success_log_chars is not None:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, success_log_chars)
         if not blocked:

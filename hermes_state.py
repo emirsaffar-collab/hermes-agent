@@ -558,7 +558,22 @@ class SessionDB(
         return prompt_hash
 
     @staticmethod
-    def _delete_unreferenced_system_prompts(conn) -> None:
+    def _delete_unreferenced_system_prompts(
+        conn: sqlite3.Connection,
+        candidate_hashes: Optional[Any] = None,
+    ) -> None:
+        if candidate_hashes is not None:
+            candidates = list(dict.fromkeys(h for h in candidate_hashes if isinstance(h, str) and h))
+            if not candidates:
+                return
+            placeholders = ", ".join("?" for _ in candidates)
+            conn.execute(
+                f"DELETE FROM system_prompts WHERE hash IN ({placeholders}) AND NOT EXISTS ("
+                "SELECT 1 FROM sessions WHERE sessions.system_prompt_hash = system_prompts.hash) AND NOT EXISTS ("
+                "SELECT 1 FROM sessions WHERE sessions.tool_names = system_prompts.hash)",
+                candidates,
+            )
+            return
         conn.execute(
             "DELETE FROM system_prompts WHERE NOT EXISTS ("
             "SELECT 1 FROM sessions WHERE sessions.system_prompt_hash = system_prompts.hash) AND NOT EXISTS ("

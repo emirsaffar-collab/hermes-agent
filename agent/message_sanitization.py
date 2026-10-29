@@ -647,7 +647,7 @@ def normalize_provider_tool_call_ids(tool_calls: list) -> list:
     # falls back to id), not on raw fields.
     if not all(coalesce_tool_call_id(tc).startswith(_PROVIDER_TOOL_ID_PREFIXES) for tc in tool_calls):
         return tool_calls
-    logger.warning("Normalized provider-minted parallel tool-call ids for replay compatibility")
+    logger.debug("Normalized provider-minted parallel tool-call ids for replay compatibility")
     for tc in tool_calls:
         # Rewrite each field's call half separately: ``id`` may carry the response-item
         # half while ``call_id`` is bare, and that half must survive.

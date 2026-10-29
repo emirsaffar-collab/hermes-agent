@@ -107,7 +107,7 @@ def _seed(tmp_path, tail_rows, fold, follower):
         ("user", "Go deeper, full report."),
     ]
     for i in range(6):
-        rows += [("user", f"bulk q {i} " + "q" * 80), ("assistant", f"bulk a {i} " + "a" * 80)]
+        rows += [("user", f"bulk q {i} " + "q" * 160), ("assistant", f"bulk a {i} " + "a" * 160)]
     for role, content in [*rows, *tail_rows, ("assistant", REPLY)]:
         db.append_message(session_id, role, content)
     # Production live dicts carry _row_id + timestamp (session flush stamps both).

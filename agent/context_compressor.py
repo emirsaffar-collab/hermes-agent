@@ -4604,6 +4604,8 @@ Write only the summary body. Do not include any preamble or prefix."""
                     prior = prior[len(_MERGED_PRIOR_CONTEXT_HEADER):].lstrip()
             elif _SUMMARY_END_MARKER in content:
                 prior = content.split(_SUMMARY_END_MARKER, 1)[1].lstrip()
+                if prior.startswith(_INFLIGHT_TASK_REPLAY_HEADER):
+                    prior = ""
             else:
                 prior = ""
             return _unwrapped(prior) if prior else None
@@ -4625,6 +4627,8 @@ Write only the summary body. Do not include any preamble or prefix."""
                     text = _part_text(item)
                     if isinstance(text, str) and _SUMMARY_END_MARKER in text:
                         remainder = text.split(_SUMMARY_END_MARKER, 1)[1].lstrip()
+                        if remainder.startswith(_INFLIGHT_TASK_REPLAY_HEADER):
+                            remainder = ""
                         legacy_blocks = [_with_part_text(item, remainder)] if remainder else []
                         legacy_blocks += [later.copy() if isinstance(later, dict) else later for later in content[index + 1:]]
                         return _unwrapped(legacy_blocks) if legacy_blocks else None
@@ -5196,7 +5200,16 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Small conversations: force a cut after the head so compression still removes something.
         if cut_idx <= head_end:
             cut_idx = max(fallback_cut, head_end + 1)
-        cut_idx = self._align_boundary_backward(messages, cut_idx)
+        aligned_back = self._align_boundary_backward(messages, cut_idx)
+        if (
+            0 <= last_user_idx < cut_idx
+            and aligned_back <= last_user_idx + 1
+            and sum(map(price, range(aligned_back, n))) > soft_ceiling
+        ):
+            aligned_fwd = self._align_boundary_forward(messages, cut_idx)
+            cut_idx = aligned_fwd if cut_idx < aligned_fwd < n else aligned_back
+        else:
+            cut_idx = aligned_back
         # Anchors below keep the most recent user turn (active task, #10896) and the latest visible
         # assistant reply (#29824) in the tail; each only walks the cut backward, so chaining them is
         # normally monotonic. One bounded exception: when a single in-progress turn alone exceeds the
@@ -5226,7 +5239,12 @@ Write only the summary body. Do not include any preamble or prefix."""
             # Only split when there is real turn body to summarize: if the oversized weight is the
             # active turn's own newest group, the pre-anchor cut retains it anyway, so taking the
             # active request out of the tail buys no reclaim and loses the #10896 anchor.
-            and any(messages[i].get("tool_calls") for i in range(last_user_idx, cut_idx))
+            and (
+                any(messages[i].get("tool_calls") for i in range(last_user_idx, cut_idx))
+                or price(last_user_idx) > _estimate_msg_budget_tokens(
+                    {"role": "user", "content": _authored_request_text(messages[last_user_idx].get("content"))}
+                )
+            )
             # ...and only when the anchored region really is over the ceiling: a short transcript
             # (whole session under the budget) anchors for free, so the exception must not fire.
             # Measured with the walk's own accounting (#84371), not a second thought-charge rule.
@@ -5258,7 +5276,14 @@ Write only the summary body. Do not include any preamble or prefix."""
                 and allow_split_turn
                 and any(messages[i].get("tool_calls") for i in range(asst_anchored_cut, cut_idx))
                 # Priced like the walk (#84371): stale thinking the wire never carries must not trip it.
-                and sum(map(self._tail_row_pricer(messages), range(asst_anchored_cut, cut_idx))) > soft_ceiling
+                and (
+                    sum(map(self._tail_row_pricer(messages), range(asst_anchored_cut, cut_idx))) > soft_ceiling
+                    or (
+                        cut_idx < n
+                        and self._align_boundary_backward(messages, asst_anchored_cut) <= head_end
+                        and sum(map(price, range(asst_anchored_cut, n))) > soft_ceiling
+                    )
+                )
             ):
                 if not self.quiet_mode:
                     logger.debug(

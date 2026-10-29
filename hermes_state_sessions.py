@@ -695,11 +695,17 @@ class SessionSessionsMixin:
     def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
         """Store the full assembled system prompt snapshot."""
         def _do(conn):
-            conn.execute(
+            old_row = conn.execute("SELECT system_prompt_hash FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            old_hash = old_row[0] if old_row else None
+            new_hash = self._store_system_prompt(conn, system_prompt)
+            cur = conn.execute(
                 "UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
-                (self._store_system_prompt(conn, system_prompt), session_id),
+                (new_hash, session_id),
             )
-            self._delete_unreferenced_system_prompts(conn)
+            self._delete_unreferenced_system_prompts(
+                conn,
+                (old_hash if old_hash != new_hash else None, new_hash if cur.rowcount == 0 else None),
+            )
         self._execute_write(_do)
 
     def update_session_tool_names(self, session_id: str, pin: Any) -> None:
@@ -709,9 +715,14 @@ class SessionSessionsMixin:
         (legacy rows: an inline JSON name list); ``get_session`` resolves either."""
         payload = json.dumps(pin) if pin is not None else None
         def _do(conn):
-            conn.execute("UPDATE sessions SET tool_names = ? WHERE id = ?",
-                         (self._store_system_prompt(conn, payload), session_id))
-            self._delete_unreferenced_system_prompts(conn)
+            old_row = conn.execute("SELECT tool_names FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            old_hash = old_row[0] if old_row else None
+            new_hash = self._store_system_prompt(conn, payload)
+            cur = conn.execute("UPDATE sessions SET tool_names = ? WHERE id = ?", (new_hash, session_id))
+            self._delete_unreferenced_system_prompts(
+                conn,
+                (old_hash if old_hash != new_hash else None, new_hash if cur.rowcount == 0 else None),
+            )
         self._execute_write(_do)
 
     def update_session_model(
