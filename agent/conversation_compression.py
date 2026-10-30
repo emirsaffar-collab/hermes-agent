@@ -745,7 +745,9 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
 # anything when they eventually return, and each recovery frees its admission slot via the future
 # done-callback, restoring normal service. If a worker NEVER returns, its slot is lost for the process
 # lifetime — bounded, observable degradation instead of an unbounded stale-job queue.
-_COMPRESS_EXECUTOR_MAX_WORKERS = 4
+_COMPRESS_EXECUTOR_MAX_WORKERS = 8
+_COMPRESS_POOL_ADMISSION_GRACE_SECONDS = 15.0
+_COMPRESS_POOL_ADMISSION_POLL_SECONDS = 0.25
 _compress_admission_lock = threading.Lock()
 _compress_admitted_count = 0
 
@@ -758,6 +760,26 @@ def _try_admit_compression_job() -> bool:
             return False
         _compress_admitted_count += 1
         return True
+
+
+def _admit_compression_job_with_grace(grace_seconds: float = 0.0) -> bool:
+    """Try ``_try_admit_compression_job()`` immediately; when ``grace_seconds > 0``,
+    poll briefly (bounded both by wall clock and iteration count so no-op sleep
+    doubles in tests never busy-spin) for a freeing slot before refusing."""
+    if _try_admit_compression_job():
+        return True
+    if grace_seconds <= 0:
+        return False
+    deadline = time.monotonic() + float(grace_seconds)
+    max_polls = max(1, int(float(grace_seconds) / _COMPRESS_POOL_ADMISSION_POLL_SECONDS) + 1)
+    for _ in range(max_polls):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_COMPRESS_POOL_ADMISSION_POLL_SECONDS, remaining))
+        if _try_admit_compression_job():
+            return True
+    return False
 
 
 def _release_compression_admission(_future=None) -> None:
@@ -1181,6 +1203,8 @@ def run_compress_context_with_progress_timeout(
     fallback_worker: Optional[Callable[[CompressionCommitFence], tuple[list, str]]] = None,
     request_exceeds_window: bool = False,
     precommit_deadline_monotonic: Optional[float] = None,
+    admission_grace_seconds: float = 0.0,
+    trigger_source: Optional[str] = None,
 ) -> tuple[list, str]:
     """Run ``worker(fence)`` under a sync progress-aware (idle + ceiling) timeout.
     Budgets bound the PRE-commit phase only: an admitted commit always completes (overrun logged, surfaced
@@ -1237,7 +1261,7 @@ def run_compress_context_with_progress_timeout(
     # A queued job would silently wait out its whole budget without starting and stay eligible to run as a
     # stale cancelled job when a worker recovers. Fail fast: continue without compression this cycle. See
     # #76354.
-    if not _try_admit_compression_job():
+    if not _admit_compression_job_with_grace(admission_grace_seconds):
         logger.warning(
             "Context compression pool saturated (%d workers busy) — refusing new compression this cycle and continuing without "
             "compression. Wedged workers are fence-cancelled and free their "
@@ -1247,9 +1271,23 @@ def run_compress_context_with_progress_timeout(
         # Saturation refusals must hit the same telemetry stream as other failures, or
         # a wedged pool looks like compression simply stopped being attempted.
         if telemetry_agent is not None:
+            _mark_compression_blocked_transient(
+                telemetry_agent,
+                getattr(telemetry_agent, "context_compressor", None),
+                "pool_saturated",
+            )
             _emit_compression_attempt_telemetry(
                 telemetry_agent, started_at=time.monotonic(), commit_status="aborted", split_status="aborted",
                 failure_class="pool_saturated", include_last_telemetry=False,
+                attempt_seed=(
+                    {
+                        "attempt_id": uuid.uuid4().hex,
+                        "session_id": getattr(telemetry_agent, "session_id", "") or "",
+                        "trigger_source": trigger_source,
+                    }
+                    if trigger_source
+                    else None
+                ),
             )
         return messages, _resolve_fallback_prompt()
 
@@ -1543,9 +1581,13 @@ def compression_blocked_transiently(agent: Any) -> bool:
 
 def _mark_compression_blocked_transient(agent: Any, compressor: Any, reason: str) -> None:
     """Publish the transient-block signal when the active guard is transient.
-    ``reason`` comes from ``_compression_block_reason``: ``cooldown:*`` and ``structural_backoff:*`` are
-    transient; ``ineffective`` stays unmarked."""
-    if reason.startswith("cooldown") or reason.startswith("structural_backoff"):
+    ``reason`` comes from ``_compression_block_reason`` or pool admission: ``pool_saturated``,
+    ``cooldown:*`` and ``structural_backoff:*`` are transient; ``ineffective`` stays unmarked."""
+    if (
+        reason == "pool_saturated"
+        or reason.startswith("cooldown")
+        or reason.startswith("structural_backoff")
+    ):
         logger.info(
             "Skipping automatic compression re-entry: transient guard "
             "active (%s, session=%s, last failure: %s) — will retry after "

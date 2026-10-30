@@ -18,6 +18,7 @@ from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE, _reset_read_dedup_caches, compression_blocked_transiently,
     compression_skipped_due_to_lock, context_compression_timed_out,
     conversation_history_after_compression, ensure_compression_feasibility_checked,
+    request_exceeds_model_window,
 )
 from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
@@ -157,15 +158,28 @@ def run_preflight_compression(
             v._compression_timeout_exhausted = True
             v._turn_exit_reason = "context_compression_timeout"
             return _done("break")
+        _lock_skipped = compression_skipped_due_to_lock(agent)
         if v.messages is _pre_api_input and (
-            compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
+            _lock_skipped or compression_blocked_transiently(agent)
         ):
-            # Temporary DEFER (lock held / cooldown), not evidence about compressibility:
-            # refund the attempt, leave the progress blocker unarmed and proceed.
+            # Temporary DEFER (lock held / cooldown / pool_saturated), not evidence about compressibility:
+            # refund the attempt, leave the progress blocker unarmed and proceed (unless already over window
+            # or recovering from a provider overflow, where sending as-is is guaranteed to fail).
             v.compression_attempts -= 1
             v._last_preflight_pressure = None
             if v.pending_moa_prepared_request is moa_prepared_request:
                 v.pending_moa_prepared_request = None
+            if provider_overflow_preflight or request_exceeds_model_window(agent, request_pressure_tokens) is True:
+                agent._persist_session(v.messages, v.conversation_history)
+                return _done(
+                    "return",
+                    _compression_deferred_result(
+                        agent,
+                        v.messages,
+                        v.api_call_count,
+                        reason="lock" if _lock_skipped else "transient_block",
+                    ),
+                )
         else:
             _reset_retry_state_after_compaction(agent)
             # Re-baseline the flush cursor: rotation returns None (child flushes
@@ -315,7 +329,9 @@ def compress_after_tool_results(
         messages, active_system_prompt = agent._compress_context(
             messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id, trigger="post_tool",
         )
-        if messages is _post_tool_input and compression_skipped_due_to_lock(agent):
+        if messages is _post_tool_input and (
+            compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
+        ):
             # Lock-skip no-op is a temporary defer, not evidence about compressibility:
             # refund so a lock-loser loop doesn't burn the budget toward exhausted.
             # #69870 lock-skip / #97488 transient-block: this pass no-oped for a TEMPORARY reason (another

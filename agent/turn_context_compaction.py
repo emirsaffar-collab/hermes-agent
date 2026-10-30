@@ -388,16 +388,22 @@ def _run_preflight_passes(
             _preflight_input, system_message, approx_tokens=_preflight_tokens,
             task_id=effective_task_id, trigger="turn_start_threshold",
         )
-        if out.messages is _preflight_input and compression_skipped_due_to_lock(agent):
-            # Lock-skip: another path holds the lock, so this is a DEFER, not proof of
-            # incompressibility — don't arm the blocker; stop passes this turn.
+        if out.messages is _preflight_input and (
+            compression_skipped_due_to_lock(agent)
+            or getattr(agent, "_compression_blocked_transient", None) == "pool_saturated"
+        ):
+            # Lock-skip or pool-saturated no-op: another path holds the lock or all pool workers
+            # are temporarily busy, so this is a DEFER, not proof of incompressibility — don't arm
+            # the blocker; stop passes this turn.
             logger.info(
                 # That is a temporary DEFER, not proof the transcript cannot compress — do NOT arm the
                 # insufficient-progress blocker (the loop's error handlers must keep their provider-proven
                 # retry budget) and stop preflight passes for this turn; the lock winner is shrinking the
                 # same session concurrently. See #69870.
-                "Preflight compression deferred: compression lock "
-                "held by another path (session %s)",
+                "Preflight compression deferred: %s (session %s)",
+                "compression lock held by another path"
+                if compression_skipped_due_to_lock(agent)
+                else "compression worker pool saturated",
                 agent.session_id or "none",
             )
             break
