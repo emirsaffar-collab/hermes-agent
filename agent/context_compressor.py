@@ -455,6 +455,7 @@ def _strip_persistence_markers(messages: list[dict[str, Any]]) -> None:
     for msg in messages:
         if isinstance(msg, dict):
             msg.pop(_DB_PERSISTED_MARKER, None)
+            msg.pop("_anchor_urls", None)
 
 
 class StaleHeldHistory(RuntimeError):
@@ -942,7 +943,7 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 def _is_summary_stub(content: str) -> bool:
     """True for a ``[tool] ... (N chars)`` summary (a prune-only one may carry the rule) or a lean-tail demotion stub."""
     s = without_skill_safety_rule(content)
-    return (s.startswith("[") and (" chars)" in s or " lines output)" in s) and len(s) < 400) or is_demoted_stub(s)
+    return (s.startswith("[") and (" chars)" in s or " chars result)" in s or " lines output)" in s) and len(s) < 400) or is_demoted_stub(s)
 
 
 # Shared floor; the clarify summary cap must stay strictly BELOW it so a preserved
@@ -1135,9 +1136,9 @@ _ANCHOR_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
     ("commits", re.compile(r"\b[0-9a-f]{9,40}\b"), 40),
     ("branches", re.compile(r"\b(?:fix|feat|docs|refactor|chore|salvage|ent)/[A-Za-z0-9._/-]{3,60}"), 40),
     ("files", re.compile(r"\b[\w./-]+/[\w.-]+\.(?:py|ts|tsx|js|rs|md|yaml|yml|json|toml|sh)\b"), 80),
+    ("urls", re.compile(r"https?://[^\s)\"'\\]{10,110}"), 40),
     ("errors", re.compile(r"\b(?:[A-Z][a-zA-Z]*Error|Exception|ENOSPC|EACCES|SIGKILL|Traceback)\b[^\n]{0,90}"), 40),
     ("handles", re.compile(r"@[A-Za-z0-9-]{3,30}\b"), 40),
-    ("urls", re.compile(r"https?://[^\s)\"']{10,110}"), 30),
 ]
 _ANCHOR_NOISE = frozenset({
     "@teknium", "@teknium1",  # session owner, in every transcript
@@ -1146,7 +1147,11 @@ _ANCHOR_NOISE = frozenset({
 
 def _build_anchor_index(turns: list[dict[str, Any]]) -> str:
     """Regex-harvest exact identifiers from the compacted region (LLM-free); per-category caps, most-frequent first."""
-    contents = (_typed_user_text(m["content"]) if m.get("role") == "user" and isinstance(m.get("content"), str) else m.get("content") for m in turns)
+    contents = (
+        (_typed_user_text(m["content"]) if m.get("role") == "user" and isinstance(m.get("content"), str) else m.get("content") or "")
+        + ("\n" + "\n".join(m["_anchor_urls"]) if m.get("_anchor_urls") else "")
+        for m in turns
+    )
     text = "\n".join(c for c in contents if isinstance(c, str) and c)
     if not text:
         return ""
@@ -1164,9 +1169,21 @@ def _build_anchor_index(turns: list[dict[str, Any]]) -> str:
         if not counts:
             continue
         ranked = sorted(counts, key=lambda v: (-counts[v], -last_seen[v]))[:cap]
-        line = f"{label}: " + ", ".join(f"{v}(x{counts[v]})" if counts[v] > 1 else v for v in ranked)
-        if used + len(line) > _LEAN_ANCHOR_BUDGET_CHARS:
+        rem = _LEAN_ANCHOR_BUDGET_CHARS - used - len(label) - 2
+        if rem <= 0:
             break
+        kept: list[str] = []
+        cur_len = 0
+        for v in ranked:
+            item = f"{v}(x{counts[v]})" if counts[v] > 1 else v
+            add_len = len(item) + (2 if kept else 0)
+            if cur_len + add_len > rem:
+                break
+            kept.append(item)
+            cur_len += add_len
+        if not kept:
+            continue
+        line = f"{label}: " + ", ".join(kept)
         sections.append(line)
         used += len(line)
     if not sections:
@@ -1224,6 +1241,16 @@ _PINNED_OUTBOUND_SKILL_NAMES: frozenset[str] = frozenset({
     "svensk-avtalsgranskning",
     "outbound-quality-guard",
     "outbound-guard-wordlist",
+    "always-verify",
+    "dab",
+    "rca",
+    "deep-research",
+    "research-and-plan",
+    "verification-gate-construction",
+    "grounding-preflight",
+    "grounded-citations",
+    "plane-tickets",
+    "emir-work-conventions",
 })
 
 
@@ -1853,6 +1880,30 @@ def _sum_web_extract(name, args, content, content_len, line_count):
     return f"[web_extract] {first} ({content_len:,} chars)" + _result_failure_suffix(content)
 
 
+def _sum_web_search(name, args, content, content_len, line_count):
+    query = str(args.get("query", "?"))
+    q_disp = query if len(query) <= 60 else query[:57] + "..."
+    payload = _json_dict(content)
+    rows = []
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get("web"), list):
+            rows = data["web"]
+        elif isinstance(payload.get("results"), list):
+            rows = payload["results"]
+    urls = [r.get("url") for r in rows if isinstance(r, dict) and isinstance(r.get("url"), str) and r.get("url")]
+    url_part = ""
+    if urls:
+        shown = []
+        for u in urls[:5]:
+            if shown and sum(len(x) + 2 for x in shown) + len(u) > 265:
+                break
+            shown.append(u)
+        more = f" (+{len(urls) - len(shown)} more)" if len(urls) > len(shown) else ""
+        url_part = f" -> {', '.join(shown)}{more}"
+    return f"[web_search] query='{q_disp}'{url_part} ({content_len:,} chars result)" + _result_failure_suffix(content)
+
+
 def _sum_delegate_task(name, args, content, content_len, line_count):
     goal = _str_arg(args, "goal")
     goal = goal if len(goal) <= 60 else goal[:57] + "..."
@@ -2108,7 +2159,7 @@ _TOOL_RESULT_SUMMARIZERS = {
         ("browser_navigate", "browser_click", "browser_snapshot", "browser_type", "browser_scroll", "browser_vision"),
         _sum_browser,
     ),
-    "web_search": _sum_template("[web_search] query='{query}' ({content_len:,} chars result)", query="?"),
+    "web_search": _sum_web_search,
     "web_extract": _sum_web_extract,
     "delegate_task": _sum_delegate_task,
     "execute_code": _sum_execute_code,
@@ -2130,6 +2181,10 @@ _TOOL_RESULT_SUMMARIZERS = {
 
 def _json_dict(text: Any) -> dict:
     """Parse ``text`` as a JSON object; ``{}`` for empty, invalid, or non-object input."""
+    if isinstance(text, str) and text.startswith("<untrusted_tool_result"):
+        _, sep, body = text.partition("\n\n")
+        if sep:
+            text = body.removesuffix("</untrusted_tool_result>").strip()
     try:
         parsed = json.loads(text) if text else {}
     # Just-loaded / actively-referenced skills survive verbatim (#32106). Pass-4 pressure demotion overrides
@@ -3371,7 +3426,22 @@ class ContextCompressor(
             _skill = _json_dict(tool_args).get("name", "")
             if isinstance(_skill, str) and _skill.lower() in protected_skills:
                 return False
-        result[idx] = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
+        payload_urls: list[str] = []
+        if tool_name == "web_search":
+            _pl = _json_dict(content)
+            _web = (_pl.get("data") or {}).get("web") if isinstance(_pl, dict) else None
+            if isinstance(_web, list):
+                payload_urls = [r["url"] for r in _web if isinstance(r, dict) and isinstance(r.get("url"), str)]
+        raw_urls = list(dict.fromkeys(
+            payload_urls + [
+                m.group(0).strip().rstrip(".,;:")
+                for m in re.finditer(r"https?://[^\s)\"'\\]{10,110}", content[:65536])
+            ]
+        ))[:10]
+        updated = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
+        if raw_urls:
+            updated["_anchor_urls"] = raw_urls
+        result[idx] = updated
         return True
 
     def _tail_soft_ceiling(self, token_budget: int) -> int:

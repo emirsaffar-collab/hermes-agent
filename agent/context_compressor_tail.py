@@ -88,6 +88,8 @@ def demote_stale_tail_tools(
         if rounds_seen > _LEAN_TAIL_KEEP_TOOL_ROUNDS:
             break
         protected.add(i)
+    from agent.context_compressor import _collect_protected_skill_names
+    protected_skills = _collect_protected_skill_names(messages, tail_start)
     result = list(messages)
     demoted = 0
     skills: dict[str, str] | None = None
@@ -98,9 +100,12 @@ def demote_stale_tail_tools(
             continue
         if len(content) < _LEAN_TAIL_DEMOTE_MIN_CHARS or SKILL_PRUNED_MARKER_PREFIX in content or _is_summary_stub(content):
             continue
-        stub = _lean_recovery_stub(msg.get("tool_name") or "", len(content), session_id)
         skills = skill_view_names_by_call_id(messages) if skills is None else skills
-        if (skill := skills.get(str(msg.get("tool_call_id") or ""))) and not _result_failure_suffix(content):
+        skill = skills.get(str(msg.get("tool_call_id") or ""))
+        if skill and (skill.strip().lower() in protected_skills or skill.strip().lower().rsplit("/", 1)[-1] in protected_skills) and not _result_failure_suffix(content):
+            continue
+        stub = _lean_recovery_stub(msg.get("tool_name") or "", len(content), session_id)
+        if skill and not _result_failure_suffix(content):
             stub += " " + _skill_pruned_marker(skill)
         result[i] = _rewritten(msg, stub)
         demoted += 1
@@ -114,7 +119,11 @@ SKILL_SAFETY_RULE = (
     f"{SKILL_SAFETY_HEADING}\n"
     "A skill placeholder containing `[SKILL_PRUNED]` lost its content in context compression and is inaccessible — "
     "reload it with skill_view(name='...') before acting on anything that depends on it. After reloading, ignore any "
-    "remaining `[SKILL_PRUNED]` markers for that same skill; they are historical artifacts of earlier compactions."
+    "remaining `[SKILL_PRUNED]` markers for that same skill; they are historical artifacts of earlier compactions.\n"
+    "Pinned Invariant Floor (always active even while a skill reload is pending):\n"
+    "- Outbound (outbound-comms / google-chat-comms / humanizer): stage drafts only (never auto-send); Gmail create/update_draft = FULL REPLACE (pass BOTH body and html_body + thread_id/reply_to_message_id on replies); Celina/Ola/Hanna max 1 sentence DM / 1-2 room sentences, zero bullet lists; devs=English, business/store=Swedish.\n"
+    "- Plane (plane-tickets): engineering projects (NEWWEBSHOP/ONE/ECOM/ATLAS/2IZII) = English only, raw HTML, explicit priority + label, 2IZII requires 'internal' label, never assign/flip developer colleague tickets without a 24h Google Chat heads-up.\n"
+    "- Verification (always-verify / dab / rca / deep-research / research-and-plan): re-run receipts LIVE at claim time, quote verbatim output lines, run polarity + disconfirming checks before claiming done, and queue non-urgent GO asks via decision-queue.py."
 )
 
 
