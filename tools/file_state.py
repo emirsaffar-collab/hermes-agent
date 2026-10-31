@@ -9,7 +9,9 @@ a per-path lock; every method is a no-op under ``HERMES_DISABLE_FILE_STATE_GUARD
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import stat
 import threading
 import time
 from collections import defaultdict
@@ -17,10 +19,22 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-# (mtime, read_ts, partial). partial=True when read_file returned a windowed
+# (mtime, read_ts, partial, sha256_hex). partial=True when read_file returned a windowed
 # view (offset > 1 or limit < total_lines) — a later write should still warn
 # so the model re-reads in full.
-ReadStamp = tuple[float, float, bool]
+ReadStamp = tuple[float, float, bool, Optional[str]]
+_MAX_HASH_BYTES = 10_000_000
+
+
+def _sha256_or_none(resolved: str) -> Optional[str]:
+    try:
+        st = os.stat(resolved)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_HASH_BYTES:
+            return None
+        with open(resolved, "rb") as fh:
+            return hashlib.file_digest(fh, "sha256").hexdigest()
+    except OSError:
+        return None
 
 # Bounded so long sessions don't accumulate unbounded state.
 _MAX_PATHS_PER_AGENT = 4096
@@ -94,10 +108,11 @@ class FileStateRegistry:
                     self._path_lock_users.pop(resolved, None)
                     self._path_locks.pop(resolved, None)
 
-    def _stamp(self, task_id: str, resolved: str, mtime: float, now: float, partial: bool) -> None:
+    def _stamp(self, task_id: str, resolved: str, mtime: float, now: float, partial: bool,
+               content_sha256: Optional[str] = None) -> None:
         """Caller holds ``_state_lock``."""
         agent_reads = self._reads[task_id]
-        agent_reads[resolved] = (float(mtime), now, bool(partial))
+        agent_reads[resolved] = (float(mtime), now, bool(partial), content_sha256)
         _evict_oldest(agent_reads, _MAX_PATHS_PER_AGENT)
 
     def record_read(self, task_id: str, resolved: str, *, partial: bool = False,
@@ -107,8 +122,9 @@ class FileStateRegistry:
         mtime = _mtime_or_none(resolved) if mtime is None else mtime
         if mtime is None:
             return
+        digest = None if partial else _sha256_or_none(resolved)
         with self._state_lock:
-            self._stamp(task_id, resolved, mtime, time.time(), partial)
+            self._stamp(task_id, resolved, mtime, time.time(), partial, digest)
 
     def note_write(self, task_id: str, resolved: str, *, mtime: Optional[float] = None) -> None:
         """Record a successful write: global last-writer AND this agent's own
@@ -118,11 +134,12 @@ class FileStateRegistry:
         mtime = _mtime_or_none(resolved) if mtime is None else mtime
         if mtime is None:
             return
+        digest = _sha256_or_none(resolved)
         now = time.time()
         with self._state_lock:
             self._last_writer[resolved] = (task_id, now)
             _evict_oldest(self._last_writer, _MAX_GLOBAL_WRITERS)
-            self._stamp(task_id, resolved, mtime, now, False)
+            self._stamp(task_id, resolved, mtime, now, False, digest)
 
     def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
         """Model-facing warning if this write would be stale, else ``None``. Severity
@@ -157,12 +174,14 @@ class FileStateRegistry:
                         "Re-read the file before writing.")
 
         if stamp is not None:
-            read_mtime, _read_ts, partial = stamp
+            read_mtime, _read_ts, partial, read_sha256 = stamp
             if current_mtime != read_mtime:
-                return (
-                    f"{resolved} was modified since you last read it "
-                    "on disk (external edit or unrecorded writer). "
-                    "Re-read the file before writing.")
+                current_sha256 = None if partial else _sha256_or_none(resolved)
+                if partial or read_sha256 is None or current_sha256 != read_sha256:
+                    return (
+                        f"{resolved} was modified since you last read it "
+                        "on disk (external edit or unrecorded writer). "
+                        "Re-read the file before writing.")
             if partial:
                 return (
                     f"{resolved} was last read with offset/limit pagination "

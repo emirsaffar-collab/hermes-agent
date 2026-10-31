@@ -47,6 +47,7 @@ from agent.message_metadata import stamp_data_use
 from agent.session_persistence import sync_rewritten_tool_rows
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
+    _extract_error_preview,
     _is_destructive_command,
     _is_multimodal_tool_result,
     _multimodal_text_summary,
@@ -1569,7 +1570,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
             agent, messages, ref, function_result,
             budget=budget, tool_duration=tool_duration, is_error=is_error, blocked=blocked,
             effect_disposition=effect_disposition, observed=r is not None, data_use=r.data_use if r else frozenset(),
-            error_preview=lambda res: _multimodal_text_summary(res)[:200],
+            error_preview=lambda res: _extract_error_preview(res, max_len=240),
         )
         if committed is None:
             return False
@@ -1844,7 +1845,7 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
         agent, messages, ref, function_result,
         budget=budget, tool_duration=tool_duration, is_error=_is_error_result, blocked=managed.blocked,
         effect_disposition="unknown" if _execution_timed_out else None, observed=True, data_use=managed.data_use,
-        error_preview=lambda res: res[:200] if isinstance(res, str) and not agent.verbose_logging else res,
+        error_preview=lambda res: _extract_error_preview(res, max_len=240) if isinstance(res, str) and not agent.verbose_logging else res,
         success_log_chars=_result_len,
         verbose_text=_multimodal_text_summary,
     )
