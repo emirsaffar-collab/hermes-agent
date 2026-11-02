@@ -717,7 +717,7 @@ export const frOverrides = {
       advancedOutput: 'Limites de sortie',
       advancedDelegation: 'Sous-agents',
       advancedDesktop: 'Desktop et démarrage',
-      gatewayConnection: 'Cette fenêtre',
+      gatewayConnection: 'Gateway principal',
       gatewayDevices: 'Connexions enregistrées',
       gatewayManagedUpdates: 'Mises à jour à distance',
       gatewayManagedUpdatesUnavailable:
@@ -4686,6 +4686,14 @@ export const frOverrides = {
     terminalNew: 'Nouveau terminal',
     terminalCloseOthers: 'Fermer les autres',
     terminalCloseAll: 'Tout fermer',
+    terminalNewOn: 'Nouveau terminal sur…',
+    terminalGatewayRemoved: 'Passerelle supprimée',
+    terminalGatewayRemovedBody:
+      'La passerelle sur laquelle ce terminal tournait a été supprimée ; il ne peut pas être rouvert. Fermez cet onglet.',
+    terminalGatewayNoShellBody:
+      'Cette passerelle n’offre pas d’accès shell ; ce terminal ne peut pas être rouvert. Fermez cet onglet.',
+    terminalDisconnectedBody:
+      'Terminal déconnecté. Appuyez sur Entrée pour démarrer un nouveau shell ; l’historique est conservé.',
     addToChat: 'Ajouter à la conversation'
   },
   preview: {

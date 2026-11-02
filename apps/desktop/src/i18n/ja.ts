@@ -341,7 +341,7 @@ export const jaOverrides = {
       advancedOutput: '出力の制限',
       advancedDelegation: 'サブエージェント',
       advancedDesktop: 'デスクトップと起動',
-      gatewayConnection: 'このウィンドウ',
+      gatewayConnection: 'プライマリゲートウェイ',
       gatewayDevices: '保存済みの接続',
       gatewayManagedUpdates: 'リモート更新',
       gatewayManagedUpdatesUnavailable: 'リモート更新には、管理対象 SSH の更新に対応したデスクトップ版が必要です。',
@@ -3085,6 +3085,14 @@ export const jaOverrides = {
     terminalNew: '新しいターミナル',
     terminalCloseOthers: '他を閉じる',
     terminalCloseAll: 'すべて閉じる',
+    terminalNewOn: '新しいターミナルを開く場所…',
+    terminalGatewayRemoved: '削除されたゲートウェイ',
+    terminalGatewayRemovedBody:
+      'このターミナルが動作していたゲートウェイは削除されたため、再度開けません。このタブを閉じてください。',
+    terminalGatewayNoShellBody:
+      'このゲートウェイにはシェルアクセスがないため、このターミナルは再度開けません。このタブを閉じてください。',
+    terminalDisconnectedBody:
+      'ターミナルが切断されました。Enter キーで新しいシェルを開始します。スクロールバックは保持されます。',
     addToChat: 'チャットに追加'
   },
 

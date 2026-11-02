@@ -398,7 +398,7 @@ export const ruOverrides = {
       advancedOutput: 'Ограничения вывода',
       advancedDelegation: 'Субагенты',
       advancedDesktop: 'Приложение и запуск',
-      gatewayConnection: 'Это окно',
+      gatewayConnection: 'Основной шлюз',
       gatewayDevices: 'Сохранённые подключения',
       gatewayManagedUpdates: 'Удалённые обновления',
       gatewayManagedUpdatesUnavailable: 'Нужна версия приложения с поддержкой управляемых обновлений SSH.',
@@ -3337,6 +3337,14 @@ export const ruOverrides = {
     terminalNew: 'Новый терминал',
     terminalCloseOthers: 'Закрыть другие',
     terminalCloseAll: 'Закрыть все',
+    terminalNewOn: 'Новый терминал на…',
+    terminalGatewayRemoved: 'Удалённый шлюз',
+    terminalGatewayRemovedBody:
+      'Шлюз, на котором работал этот терминал, удалён, поэтому его нельзя открыть снова. Закройте эту вкладку.',
+    terminalGatewayNoShellBody:
+      'У этого шлюза нет доступа к оболочке, поэтому терминал нельзя открыть снова. Закройте эту вкладку.',
+    terminalDisconnectedBody:
+      'Терминал отключён. Нажмите Enter, чтобы запустить новую оболочку; история прокрутки сохранена.',
     addToChat: 'Добавить в чат'
   },
   preview: {
