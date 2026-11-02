@@ -132,6 +132,9 @@ def _stop_turns_before_exit(budget_s: float | None = None) -> None:
         # interrupted by SIGTERM/SIGINT rather than treating them as user-cancelled.
         session["_stopped_for_process_exit"] = True
         with contextlib.suppress(Exception):
+            from tui_gateway.turn_marker import mark_turn_interrupted
+            mark_turn_interrupted(session.get("hermes_home") or Path.home() / ".hermes", sid)
+        with contextlib.suppress(Exception):
             _interrupt_session_turn(sid, session)
         if (t := session.get("_run_thread")) is not None and t is not threading.current_thread():
             threads.append(t)

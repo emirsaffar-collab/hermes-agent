@@ -81,7 +81,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                     marker.get("writer_pid"), os.getpid())
         return None
     enabled, freshness_secs, max_attempts = _auto_continue_config()
-    age = time.time() - marker["started_at"]
+    interrupted_ref = float(marker.get("interrupted_at") or marker["started_at"])
+    age = time.time() - interrupted_ref
     if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
         clear_turn_marker(home, session_key)  # stale/disabled/crash-looping: a manual message continues
         return None

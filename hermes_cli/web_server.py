@@ -241,7 +241,11 @@ def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
     _SSH_RUNTIME_MARKER = None
     if nonce:
         try:
-            purelib = sysconfig.get_paths()["purelib"]
+            env_purelibs = [
+                p for p in sys.path
+                if p and "site-packages" in p and (os.sep + "environments" + os.sep) in p and os.path.isdir(p)
+            ]
+            purelib = env_purelibs[0] if env_purelibs else sysconfig.get_paths()["purelib"]
         except (KeyError, OSError):
             return
         # Primary identity: a marker FILE in site-packages. A replaced venv

@@ -137,6 +137,19 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
     _update(home, session_key, lambda entries: {**_prune(entries, now), session_key: entry}, "record")
 
 
+def mark_turn_interrupted(home: Path | str, session_key: str) -> None:
+    """Stamp ``interrupted_at`` when a graceful SIGTERM/SIGINT teardown interrupts an active turn."""
+    if not session_key:
+        return
+    now = time.time()
+    _update(
+        home,
+        session_key,
+        lambda e: {**e, session_key: {**e[session_key], "interrupted_at": now}} if session_key in e else None,
+        "mark_interrupted",
+    )
+
+
 def clear_turn_marker(home: Path | str, session_key: str) -> None:
     """Remove the marker once its turn concluded (any outcome the client saw)."""
     if session_key:
