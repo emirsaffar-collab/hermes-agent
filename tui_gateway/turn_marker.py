@@ -168,8 +168,8 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
             return None
         return {"attempts": max(0, int(entry.get("attempts") or 0)), "prompt": prompt, "started_at": _started_at(entry),
                 "auto_continue": bool(entry.get("auto_continue", True)),
-                # Writer identity when present: extra keys only, so a marker written by an older build still reads.
-                **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
+                # Writer identity and graceful interrupt timestamp when present: extra keys only, so older markers still read.
+                **{k: entry[k] for k in ("writer_pid", "writer_start_time", "interrupted_at") if entry.get(k) is not None},
                 **({"notification_category": "diagnostic"}
                    if entry.get("notification_category") == "diagnostic" else {})}
     except Exception:
@@ -193,7 +193,7 @@ def list_turn_markers(home: Path | str) -> dict[str, dict[str, Any]]:
                 "prompt": prompt,
                 "started_at": _started_at(entry),
                 "auto_continue": bool(entry.get("auto_continue", True)),
-                **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
+                **{k: entry[k] for k in ("writer_pid", "writer_start_time", "interrupted_at") if entry.get(k) is not None},
                 **({"notification_category": "diagnostic"}
                    if entry.get("notification_category") == "diagnostic" else {}),
             }

@@ -635,7 +635,9 @@ def _sweep_interrupted_turn_markers(home: Path | str | None = None) -> list[str]
         writer_state = marker_writer_state(marker)
         if writer_state == "alive":
             continue
-        age = now - marker["started_at"]
+        interrupted_at = marker.get("interrupted_at")
+        turn_ref_ts = float(interrupted_at) if interrupted_at is not None else float(marker["started_at"])
+        age = now - turn_ref_ts
         if age > freshness_secs or marker["attempts"] >= max_attempts:
             clear_turn_marker(target_home, session_key)
             continue
