@@ -156,6 +156,8 @@ def stop_authority_work(authority):
         if holder and holder[0] is not None:
             request_hard_interrupt(holder[0], 'Profile runtime is stopping')
     for cancel in getattr(authority, '_cron_cancellations', {}).values():
+        if getattr(cancel, 'reason', None) is None:
+            cancel.reason = 'gateway draining for restart'
         cancel.set()
 
 
