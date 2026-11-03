@@ -117,6 +117,38 @@ class _BotState:
 # plan), so per-stream transcription doubles as speaker separation.
 _RTC_HOOK_JS = r"""
 (() => {
+  if (navigator.mediaDevices && !window.__hermesSynthMedia) {
+    window.__hermesSynthMedia = true;
+    const makeAudioTrack = () => {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      gain.gain.value = 0.0;
+      const dst = ctx.createMediaStreamDestination();
+      osc.connect(gain);
+      gain.connect(dst);
+      osc.start();
+      return dst.stream.getAudioTracks()[0];
+    };
+    const makeVideoTrack = () => {
+      const c = document.createElement("canvas");
+      c.width = 640; c.height = 360;
+      const g = c.getContext("2d");
+      g.fillStyle = "#111"; g.fillRect(0, 0, 640, 360);
+      return c.captureStream(1).getVideoTracks()[0];
+    };
+    navigator.mediaDevices.enumerateDevices = async () => [
+      { deviceId: "default", kind: "audioinput", label: "Virtual Mic", groupId: "g1", toJSON() { return this; } },
+      { deviceId: "default", kind: "videoinput", label: "Virtual Cam", groupId: "g2", toJSON() { return this; } },
+      { deviceId: "default", kind: "audiooutput", label: "Virtual Speaker", groupId: "g3", toJSON() { return this; } }
+    ];
+    navigator.mediaDevices.getUserMedia = async (constraints) => {
+      const tracks = [];
+      if (constraints && constraints.audio) tracks.push(makeAudioTrack());
+      if (constraints && constraints.video) tracks.push(makeVideoTrack());
+      return new MediaStream(tracks);
+    };
+  }
   window.__hermesRtcStreams = new Map();
   const CHUNK_MS = 10000;
   function hook(stream) {
@@ -125,6 +157,17 @@ _RTC_HOOK_JS = r"""
       const tracks = stream.getAudioTracks();
       if (tracks.some(t => t.__hermesRtc)) return;
       tracks.forEach(t => t.__hermesRtc = true);
+      try {
+        if (!window.__hermesPullCtx) {
+          window.__hermesPullCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        window.__hermesPullCtx.resume();
+        const src = window.__hermesPullCtx.createMediaStreamSource(stream);
+        const silentGain = window.__hermesPullCtx.createGain();
+        silentGain.gain.value = 0.0001;
+        src.connect(silentGain);
+        silentGain.connect(window.__hermesPullCtx.destination);
+      } catch (e) {}
       const id = window.__hermesRtcStreams.size + 1;
       const mr = new MediaRecorder(stream, {mimeType: 'audio/webm;codecs=opus'});
       mr.ondataavailable = e => {
@@ -185,7 +228,7 @@ class _RtcTranscriber:
     _EBML_MAGIC = b"\x1a\x45\xdf\xa3"
     _CLUSTER_ID = b"\x1f\x43\xb6\x75"
 
-    def __init__(self, cfg: "_BotConfig", state: "_BotState", stop_flag: dict):
+    def __init__(self, cfg: _BotConfig, state: _BotState, stop_flag: dict):
         self.cfg, self.state, self.stop = cfg, state, stop_flag
         self._queue = deque()          # (stream_id, Path)
         self._lock = threading.Lock()
@@ -305,8 +348,17 @@ class _RtcTranscriber:
                 self.state.set(error=f"whisper unavailable ({e}) — merged audio kept on disk")
             return
         try:
-            segs, _info = model.transcribe(tail, language=None, vad_filter=True,
-                                           initial_prompt=self._last_text.get(stream_id) or None)
+            lang_env = os.environ.get("HERMES_MEET_LANGUAGE", "").strip() or None
+            if lang_env == "auto":
+                lang_env = None
+            prompt_env = os.environ.get("HERMES_MEET_INITIAL_PROMPT", "").strip() or self._last_text.get(stream_id) or None
+            segs, _info = model.transcribe(
+                tail,
+                language=lang_env,
+                vad_filter=True,
+                condition_on_previous_text=False,
+                initial_prompt=prompt_env,
+            )
             for s in segs:
                 text = (s.text or "").strip()
                 if text:
@@ -381,25 +433,34 @@ _ENABLE_CAPTIONS_JS = (
     "{ key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true })); return true; })();")
 
 _LEAVE_CALL_JS = (
-    "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
+    "() => { const b = document.querySelector('button[aria-label*=\"eave call\" i], button[aria-label*=\"ämna samtal\" i], button[aria-label*=\"Avsluta samtal\" i]');"
     " if (b) b.click(); }")
 
 # True once past the lobby: leave button, caption region (once our observer is installed)
-# or participant list visible.
+# or participant list visible (supports both English and Swedish Meet UI).
 _ADMISSION_PROBE_JS = r"""
     (() => {
-      if (document.querySelector('button[aria-label*="eave call" i]')) return true;
+      if (document.querySelector('button[aria-label*="eave call" i], button[aria-label*="ämna samtal" i], button[aria-label*="Avsluta samtal" i]')) return true;
       if (window.__hermesMeetInstalled && document.querySelector(
-          '[role="region"][aria-label*="aption" i], div[jsname="YSxPC"], div[jsname="tgaKEf"]')) return true;
+          '[role="region"][aria-label*="aption" i], [role="region"][aria-label*="textning" i], div[jsname="YSxPC"], div[jsname="tgaKEf"]')) return true;
       return !!document.querySelector('[aria-label*="articipants" i]');
     })();
     """
 
-# English only — what Meet shows when the host denies or removes a guest.
+# Count of participant tiles / badge in call (returns 1 when bot is alone in call).
+_PARTICIPANT_COUNT_JS = r"""
+    (() => {
+      const tiles = document.querySelectorAll('[data-participant-id], [data-requested-participant-id]');
+      if (tiles && tiles.length > 0) return tiles.length;
+      const bodyTxt = document.body ? (document.body.innerText || '') : '';
+      if (/Det finns ingen annan här|You're the only one here|Ingen annan är här/i.test(bodyTxt)) return 1;
+      return 2;
+    })();
+    """
 _DENIED_PROBE_JS = r"""
     (() => {
       const text = document.body ? document.body.innerText || '' : '';
-      return /You can't join this video call|You were removed from the meeting|No one responded to your request to join/i.test(text);
+      return /You can't join this video call|You were removed from the meeting|No one responded to your request to join|Du kan inte gå med i det här videosamtalet|Du har tagits bort från mötet|Ingen svarade på din förfrågan/i.test(text);
     })();
     """
 
@@ -582,30 +643,40 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> Non
     """
     deadline = time.time() + timeout
     while True:
-        for dismiss_sel in ('button:has-text("Got it")', 'div[role="dialog"] button'):
+        for dismiss_sel in (
+            'div[role="dialog"][aria-label*="Byt samtal" i] button',
+            'div[role="dialog"][aria-label*="Switch" i] button',
+            'button:has-text("Got it")',
+            'button:has-text("Uppfattat")',
+            'button:has-text("Jag förstår")',
+        ):
             dlg = _visible(page.locator(dismiss_sel))
             if dlg is not None:
-                _quiet(lambda: (dlg.click(timeout=2_000), True))
+                _quiet(lambda: (dlg.click(timeout=2_000, no_wait_after=True), True))
                 _quiet(page.wait_for_timeout, 1_500)
-        # Camera off: the fake-cam tile is visually disruptive to participants.
-        cam_off = _visible(page.get_by_role("button", name="Turn off camera", exact=False))
-        if cam_off is not None:
-            _quiet(lambda: (cam_off.click(timeout=2_000), True))
-        name_box = _visible(page.locator('input[aria-label*="name" i]'))
+        # Camera off: the fake-cam tile is visually disruptive to participants (EN + SV).
+        for cam_label in ("Turn off camera", "Slå av kameran", "Stäng av kameran", "Slå av kamera"):
+            cam_off = _visible(page.get_by_role("button", name=cam_label, exact=False))
+            if cam_off is not None:
+                _quiet(lambda: (cam_off.click(timeout=2_000, no_wait_after=True), True))
+                break
+        name_box = _visible(page.locator('input[aria-label*="name" i], input[aria-label*="namn" i]'))
         if name_box is not None:
             _quiet(name_box.fill, cfg.guest_name, timeout=2_000)
-        for label in ("Join now", "Ask to join", "Join here too"):
+        for label in ("Join now", "Gå med nu", "Ask to join", "Be om att få gå med", "Join here too", "Gå med här också"):
             btn = _visible(page.get_by_role("button", name=label, exact=False))
-            if btn is None and label == "Join here too":
-                # "Join here too" hides inside the collapsed "Other ways to join" accordion —
-                # expand it, then fall back to a text selector (accessible name carries an icon prefix).
-                accordion = _visible(page.locator('text=Other ways to join'))
-                if accordion is not None:
-                    _quiet(lambda: (accordion.click(timeout=2_000), True))
-                    time.sleep(1.5)
-                    btn = _visible(page.locator(f'button:has-text("{label}")'))
-            if btn is not None and _quiet(lambda: (btn.click(timeout=3_000), True)):
-                if label == "Ask to join":
+            if btn is None:
+                btn = _visible(page.locator(f'button:has-text("{label}")'))
+            if btn is None and label in ("Join here too", "Gå med här också"):
+                for acc_txt in ("Other ways to join", "Andra sätt att gå med"):
+                    accordion = _visible(page.locator(f'text={acc_txt}'))
+                    if accordion is not None:
+                        _quiet(lambda: (accordion.click(timeout=2_000, no_wait_after=True), True))
+                        time.sleep(1.5)
+                        btn = _visible(page.locator(f'button:has-text("{label}")'))
+                        break
+            if btn is not None and _quiet(lambda: (btn.click(timeout=3_000, no_wait_after=True), True)):
+                if label in ("Ask to join", "Be om att få gå med"):
                     state.set(lobby_waiting=True)
                 return
         if time.time() >= deadline:
@@ -618,10 +689,10 @@ def _ensure_mic_on(page) -> str:
     realtime speech inaudible. The in-call toggle's aria-label is "Turn on microphone" while muted /
     "Turn off microphone" while live; returns ``unmuted_clicked`` / ``unmuted`` / ``unknown``
     (toggle not found: Meet variant changed or the label is localized)."""
-    muted = _visible(page.locator('button[aria-label*="Turn on microphone" i]'))
+    muted = _visible(page.locator('button[aria-label*="Turn on microphone" i], button[aria-label*="Slå på mikrofon" i], button[aria-label*="Aktivera mikrofon" i]'))
     if muted is not None and _quiet(lambda: (muted.click(timeout=3_000), True)):
         return "unmuted_clicked"
-    if _visible(page.locator('button[aria-label*="Turn off microphone" i]')) is not None:
+    if _visible(page.locator('button[aria-label*="Turn off microphone" i], button[aria-label*="Slå av mikrofon" i], button[aria-label*="Inaktivera mikrofon" i], button[aria-label*="Stäng av mikrofon" i]')) is not None:
         return "unmuted"
     return "unknown"
 
@@ -629,10 +700,10 @@ def _ensure_mic_on(page) -> str:
 def _ensure_mic_muted(page) -> str:
     """RTC-capture mirror of ``_ensure_mic_on``: a transcribing bot must NEVER broadcast
     room audio from a real mic — mute on admission. Returns ``muted_clicked``/``muted``/``unknown``."""
-    live = _visible(page.locator('button[aria-label*="Turn off microphone" i]'))
+    live = _visible(page.locator('button[aria-label*="Turn off microphone" i], button[aria-label*="Slå av mikrofon" i], button[aria-label*="Inaktivera mikrofon" i], button[aria-label*="Stäng av mikrofon" i]'))
     if live is not None and _quiet(lambda: (live.click(timeout=3_000), True)):
         return "muted_clicked"
-    if _visible(page.locator('button[aria-label*="Turn on microphone" i]')) is not None:
+    if _visible(page.locator('button[aria-label*="Turn on microphone" i], button[aria-label*="Slå på mikrofon" i], button[aria-label*="Aktivera mikrofon" i]')) is not None:
         return "muted"
     return "unknown"
 
@@ -643,6 +714,8 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
     deadline = (time.time() + cfg.duration_s) if cfg.duration_s else None
     lobby_deadline = time.time() + cfg.lobby_timeout
     last_admission_check = 0.0
+    had_other_participants = False
+    alone_since = None
     while not stop_flag["stop"]:
         now = time.time()
         if deadline and now > deadline:
@@ -662,6 +735,25 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             elif _probe(page, _DENIED_PROBE_JS):
                 state.set(error="host denied admission", leave_reason="denied")
                 return
+        elif state.in_call and (now - last_admission_check) > 5.0:
+            last_admission_check = now
+            pcount = _quiet(page.evaluate, _PARTICIPANT_COUNT_JS) or 2
+            if isinstance(pcount, int) and pcount >= 2:
+                had_other_participants = True
+                alone_since = None
+            elif (
+                had_other_participants
+                and isinstance(pcount, int)
+                and pcount <= 1
+                and state.joined_at
+                and (now - state.joined_at) >= 300.0
+            ):
+                if alone_since is None:
+                    alone_since = now
+                elif (now - alone_since) >= 120.0:
+                    print(f"[meet_bot] leave_reason=everyone_left alone_s={now - alone_since:.1f}", flush=True)
+                    state.set(leave_reason="everyone_left")
+                    return
         try:
             queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
             for entry in (e for e in (queued if isinstance(queued, list) else ()) if isinstance(e, dict)):
@@ -762,6 +854,8 @@ def run_bot() -> int:
     try:
         with sync_playwright() as pw:
             launch_kwargs = dict(headless=not cfg.headed, args=chrome_args)
+            if cfg.headed:
+                chrome_args.append("--window-position=-2000,-2000")
             if cfg.rtc_audio:
                 # headless Chromium ships --mute-audio by default — remote streams record
                 # as digital silence without dropping it.
