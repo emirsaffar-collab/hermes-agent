@@ -150,26 +150,28 @@ _RTC_HOOK_JS = r"""
     };
   }
   window.__hermesRtcStreams = new Map();
+  window.__hermesPeerConns = new Set();
   const CHUNK_MS = 10000;
-  function hook(stream) {
+  function hookTrack(track) {
     try {
-      if (!stream || !stream.getAudioTracks || stream.getAudioTracks().length === 0) return;
-      const tracks = stream.getAudioTracks();
-      if (tracks.some(t => t.__hermesRtc)) return;
-      tracks.forEach(t => t.__hermesRtc = true);
+      if (!track || track.kind !== 'audio' || track.__hermesRtc) return;
+      track.__hermesRtc = true;
+      const audioStream = new MediaStream([track]);
       try {
         if (!window.__hermesPullCtx) {
           window.__hermesPullCtx = new (window.AudioContext || window.webkitAudioContext)();
         }
-        window.__hermesPullCtx.resume();
-        const src = window.__hermesPullCtx.createMediaStreamSource(stream);
+        if (window.__hermesPullCtx.state === 'suspended') {
+          window.__hermesPullCtx.resume();
+        }
+        const src = window.__hermesPullCtx.createMediaStreamSource(audioStream);
         const silentGain = window.__hermesPullCtx.createGain();
         silentGain.gain.value = 0.0001;
         src.connect(silentGain);
         silentGain.connect(window.__hermesPullCtx.destination);
       } catch (e) {}
       const id = window.__hermesRtcStreams.size + 1;
-      const mr = new MediaRecorder(stream, {mimeType: 'audio/webm;codecs=opus'});
+      const mr = new MediaRecorder(audioStream, {mimeType: 'audio/webm;codecs=opus'});
       mr.ondataavailable = e => {
         if (!e.data || e.data.size === 0) return;
         const r = new FileReader();
@@ -182,8 +184,26 @@ _RTC_HOOK_JS = r"""
       window.__hermesRtcStreams.set(id, mr);
     } catch (e) { window.__hermesRtcErr = String(e); }
   }
+  function hookStream(stream) {
+    try {
+      if (!stream || !stream.getAudioTracks) return;
+      for (const t of stream.getAudioTracks()) hookTrack(t);
+    } catch (e) {}
+  }
   const OrigPC = window.RTCPeerConnection;
-  function PatchedPC(...args) { return new OrigPC(...args); }
+  function PatchedPC(...args) {
+    const pc = new OrigPC(...args);
+    try {
+      window.__hermesPeerConns.add(pc);
+      pc.addEventListener('track', ev => {
+        try {
+          if (ev.track) hookTrack(ev.track);
+          if (ev.streams) for (const s of ev.streams) hookStream(s);
+        } catch (e) {}
+      });
+    } catch (e) {}
+    return pc;
+  }
   PatchedPC.prototype = OrigPC.prototype;
   window.RTCPeerConnection = PatchedPC;
   window.webkitRTCPeerConnection = PatchedPC;
@@ -193,12 +213,35 @@ _RTC_HOOK_JS = r"""
       get: desc.get,
       set(fn) {
         desc.set.call(this, function(ev) {
-          try { if (ev.streams && ev.streams[0]) hook(ev.streams[0]); } catch (e) {}
+          try {
+            if (ev.track) hookTrack(ev.track);
+            if (ev.streams) for (const s of ev.streams) hookStream(s);
+          } catch (e) {}
           if (fn) return fn.call(this, ev);
         });
       }
     });
   }
+  setInterval(() => {
+    try {
+      if (window.__hermesPullCtx && window.__hermesPullCtx.state === 'suspended') {
+        window.__hermesPullCtx.resume();
+      }
+      for (const pc of window.__hermesPeerConns) {
+        if (pc.connectionState === 'closed') continue;
+        for (const r of (pc.getReceivers ? pc.getReceivers() : [])) {
+          if (r && r.track && r.track.kind === 'audio' && r.track.readyState === 'live') {
+            hookTrack(r.track);
+          }
+        }
+      }
+      for (const el of document.querySelectorAll('audio,video')) {
+        if (el.srcObject && el.srcObject.getAudioTracks) {
+          hookStream(el.srcObject);
+        }
+      }
+    } catch (e) {}
+  }, 2000);
   window.__hermesMeetRtcStop = () => {
     for (const mr of window.__hermesRtcStreams.values()) {
       try { if (mr.state !== 'inactive') mr.stop(); } catch (e) {}
