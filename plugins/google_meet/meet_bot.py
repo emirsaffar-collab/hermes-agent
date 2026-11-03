@@ -169,7 +169,16 @@ _RTC_HOOK_JS = r"""
         silentGain.gain.value = 0.0001;
         src.connect(silentGain);
         silentGain.connect(window.__hermesPullCtx.destination);
+        window.__hermesPullNodes = window.__hermesPullNodes || [];
+        window.__hermesPullNodes.push({src, silentGain, audioStream, track});
       } catch (e) {}
+      track.addEventListener('unmute', () => {
+        try {
+          if (window.__hermesPullCtx && window.__hermesPullCtx.state === 'suspended') {
+            window.__hermesPullCtx.resume();
+          }
+        } catch (e) {}
+      });
       const id = window.__hermesRtcStreams.size + 1;
       const mr = new MediaRecorder(audioStream, {mimeType: 'audio/webm;codecs=opus'});
       mr.ondataavailable = e => {
@@ -222,6 +231,25 @@ _RTC_HOOK_JS = r"""
       }
     });
   }
+  try {
+    const srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
+    if (srcDesc && srcDesc.set) {
+      Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
+        get: srcDesc.get,
+        set(val) {
+          try { if (val) hookStream(val); } catch (e) {}
+          return srcDesc.set.call(this, val);
+        }
+      });
+    }
+    const origPlay = HTMLMediaElement.prototype.play;
+    if (origPlay) {
+      HTMLMediaElement.prototype.play = function(...args) {
+        try { if (this.srcObject) hookStream(this.srcObject); } catch (e) {}
+        return origPlay.apply(this, args);
+      };
+    }
+  } catch (e) {}
   setInterval(() => {
     try {
       if (window.__hermesPullCtx && window.__hermesPullCtx.state === 'suspended') {
