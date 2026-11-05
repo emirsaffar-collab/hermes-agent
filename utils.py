@@ -677,7 +677,7 @@ def atomic_roundtrip_yaml_save(path: str | Path, new_state: dict, *,
 
 
 def safe_json_loads(text: str, default: Any = None) -> Any:
-    """Parse JSON, returning *default* on any parse error.
+    """Parse JSON, returning *default* on any parse error (a too-deeply nested body included).
 
     When runtime middleware (tool-loop warnings, identical-call notices, directory hints)
     or post-tool hooks append a trailing ``\\n\\n[...]`` or ``\\n\\n---`` note after a JSON
@@ -695,10 +695,10 @@ def safe_json_loads(text: str, default: Any = None) -> Any:
                     tail = stripped[end:].strip()
                     if isinstance(parsed, dict) and tail.startswith(("[", "---")):
                         return parsed
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, RecursionError):
                     pass
         return default
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return default
 
 
