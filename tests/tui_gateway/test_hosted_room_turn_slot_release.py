@@ -102,6 +102,21 @@ def test_mobile_turn_releases_slot_when_it_ends(monkeypatch, tmp_path):
     assert "active_session_lease" not in session
 
 
+def test_okhttp_transport_on_desktop_sourced_session_releases_slot_when_turn_ends(monkeypatch, tmp_path):
+    """A Desktop-created session (source='desktop') resumed from hermes-mobile (User-Agent: okhttp/...)
+    is recognized as a mobile turn and releases its active-session slot when the turn ends."""
+    _turn_env(monkeypatch, tmp_path)
+    lease = _Lease()
+    session = _session("desktop", lease)
+    session["transport"] = types.SimpleNamespace(_ws=types.SimpleNamespace(headers={"user-agent": "okhttp/4.12.0"}))
+
+    assert server._run_prompt_submit("rid", "ui-sid", session, "hello from phone on desktop session") is True
+
+    assert session["running"] is False
+    assert lease.released is True
+    assert "active_session_lease" not in session
+
+
 def test_detached_ws_turn_releases_slot_when_it_ends(monkeypatch, tmp_path):
     """If a client disconnected mid-turn, the finished turn releases its active-session slot immediately."""
     _turn_env(monkeypatch, tmp_path)

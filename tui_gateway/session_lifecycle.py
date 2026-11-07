@@ -60,13 +60,27 @@ _SESSION_OWNERSHIP_UNAVAILABLE = "Hermes could not safely reserve this session. 
 _AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "idle_timeout", "lru_evict", "tui_shutdown"})
 
 
-def _is_mobile_session(session: dict | None) -> bool:
-    if not isinstance(session, dict):
+def _transport_is_okhttp(transport: Any) -> bool:
+    if transport is None:
         return False
-    return (
-        str(session.get("client_surface") or "").strip().lower() == "mobile"
-        or _session_source(session).strip().lower() == "mobile"
-    )
+    ws = getattr(transport, "_ws", None) or getattr(transport, "ws", None)
+    headers = getattr(ws, "headers", None) or {}
+    ua = str(headers.get("user-agent") or "").strip().lower()
+    return ua.startswith("okhttp/")
+
+
+def _is_mobile_session(session: dict | None) -> bool:
+    if isinstance(session, dict):
+        if str(session.get("client_surface") or "").strip().lower() == "mobile":
+            return True
+        if _session_source(session).strip().lower() == "mobile":
+            return True
+        if _transport_is_okhttp(session.get("transport")):
+            return True
+    with contextlib.suppress(Exception):
+        if _transport_is_okhttp(current_transport()):
+            return True
+    return False
 
 
 def _lease_metadata(live_session_id: str, *, turn_active: bool | None = None) -> dict:
@@ -151,7 +165,7 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     surface = "mobile" if _is_mobile_session(session) else _session_source(session)
     lease, limit_message = _claim_active_session_slot(
         key, live_session_id=sid, surface=surface, profile_home=session.get("profile_home"),
-        turn_active=True if session.get("running") else None)
+        turn_active=True)
     if limit_message is None:
         _attach_lease(session, lease)
         return None
@@ -345,7 +359,7 @@ def _take_over_idle_cross_surface_lease(sid: str, session: dict, key: str, *, su
             if turn_active is not False and not (is_mobile_handoff and age_s >= 2.0):
                 return False
             lease_id = uuid.uuid4().hex
-            new_meta = _lease_metadata(sid, turn_active=True if session.get("running") else None)
+            new_meta = _lease_metadata(sid, turn_active=True)
             entries[idx] = _lease_entry(
                 lease_id=lease_id, session_id=key, surface=surface, metadata=new_meta,
                 track_liveness=track_liveness,

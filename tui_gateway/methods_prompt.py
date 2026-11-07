@@ -858,12 +858,15 @@ def _(rid, params: dict) -> dict:
         if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
     if err is not None:
         return err
+    prev_client_surface = session.get("client_surface", "")
+    # Rewritten every submit: a session alternates app window / HUD / live voice / mobile; set before
+    # _ensure_active_session_slot so cross-surface handoff sees the submitting surface (CF-65).
+    session["client_surface"] = params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
+        session["client_surface"] = prev_client_surface
         # Refused HERE — before the busy queue, db row and agent build — so a refusal
         # leaves the session untouched.  The reason travels as machine-readable data.
         return _slot_refusal(rid, sid, session, text, params, limit_message, internal_hosted_submit)
-    # Rewritten every submit: a session alternates app window / HUD / live voice; a stale value misinforms.
-    session["client_surface"] = params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""
     # Live-voice delegations carry the recent spoken transcript for the MODEL INPUT only (the persisted
     # user row stays the words the user said); anything else clears it.
     voice_context = params.get("voice_context")
