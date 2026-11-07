@@ -607,6 +607,8 @@ CREATE TABLE IF NOT EXISTS session_admissions (
 );
 CREATE INDEX IF NOT EXISTS session_admissions_pending
     ON session_admissions(target_session_id, status, seq);
+CREATE INDEX IF NOT EXISTS idx_session_admissions_target_request
+    ON session_admissions(target_session_id, request_id, admission_id);
 -- Cron run history finds a job's unified-runtime runs by the scheduler principal's request ids
 -- (``cron:<job>:<execution>``); without this a lookup walked
 -- every cron admission of every job. Partial: interactive turns, the bulk of admissions, pay

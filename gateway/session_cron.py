@@ -305,6 +305,14 @@ async def execute(authority, ref, row, policy):
             stop = _CombinedCancelEvent(CancelRequest(execution_id), cancel)
             result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
                                              extra_prompt=data['extra_prompt'], cancel_event=stop)
+        # Early exits inside run_job (wakeAgent=false, monitor skip, or preflight block) return before
+        # opening _session_db, leaving the session row committed by submit() with ended_at IS NULL.
+        if not (not result[0] and str(result[3] or '').startswith('Job timed out after ')):
+            await asyncio.to_thread(
+                authority.db.end_session,
+                ref.session_id,
+                'cron_complete' if result[0] else 'cron_incomplete_no_output',
+            )
         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
         # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
         flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}

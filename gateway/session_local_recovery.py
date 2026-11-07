@@ -405,7 +405,7 @@ def reset_local_session(store, old_entry, session_id, now, display_name):
 _BOOT_RECEIPTS_SQL = (
     "SELECT m.key FROM state_meta m LEFT JOIN sessions s "
     "ON s.id = CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.entry.session_id') END "
-    "WHERE m.key LIKE ? AND (s.ended_at IS NULL OR s.end_reason = 'compression' "
+    "WHERE m.key LIKE ? AND ((s.ended_at IS NULL AND COALESCE(s.source, '') != 'cron') OR s.end_reason = 'compression' "
     "OR EXISTS (SELECT 1 FROM session_admissions a WHERE a.target_session_id = substr(m.key, ?) "
     "AND a.status IN ('queued','started','unknown')) "
     "OR EXISTS (SELECT 1 FROM state_meta c WHERE c.key = ? || substr(m.key, ?)))")

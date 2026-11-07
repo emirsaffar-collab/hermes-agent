@@ -739,6 +739,13 @@ async def recover_bot_deliveries(authority):
         for path, record in records:
             if not record or record.get('profile_home') != str(home) or not record.get('admission_id'):
                 continue
+            status = record.get('status')
+            if status in {'settled', 'cancelled'} and (
+                status != 'settled' or record.get('reply') or not (record.get('author') or {}).get('is_bot')
+            ):
+                remember_receipt(authority, home, record)
+                continue
+            before = dict(record)
             try:
                 record.update(_result(authority, record))
                 if record['status'] in {'queued', 'claimed'}:
@@ -753,7 +760,8 @@ async def recover_bot_deliveries(authority):
                 logging.getLogger(__name__).error('Bot delivery %s not recovered: %s (%s)',
                                                   record.get('delivery_id'), exc.reason, path, exc_info=True)
                 continue
-            await write_receipt(home, record)
+            if record != before:
+                await write_receipt(home, record)
             remember_receipt(authority, home, record)
         row = authority.db.get_session_by_title('Bot Chat')
         if row is None:
