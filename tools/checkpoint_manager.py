@@ -901,9 +901,18 @@ def _too_broad(abs_dir: str) -> bool:
     hermes_p = get_hermes_home().resolve()
     broad_dirs = {
         home / "workspace", home / "workspace" / "research",
+        home / "Claude Code", home / ".ssh",
         hermes_p / "cache", hermes_p / "cache" / "scratch",
+        hermes_p / "state", hermes_p / "logs", hermes_p / "outbox",
+        hermes_p / "checkpoints", hermes_p / "cron", hermes_p / "runtime",
     }
-    return p in broad_dirs or str(p).startswith(str(hermes_p / "cache" / "scratch") + os.sep)
+    broad_prefixes = (
+        str(hermes_p / "cache" / "scratch") + os.sep,
+        str(hermes_p / "checkpoints") + os.sep,
+        str(hermes_p / "state") + os.sep,
+        str(hermes_p / "logs") + os.sep,
+    )
+    return p in broad_dirs or str(p).startswith(broad_prefixes)
 
 
 def _dir_size_bytes(path: Path) -> int:
