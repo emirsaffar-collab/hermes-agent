@@ -489,7 +489,10 @@ def _skill_readiness(frontmatter: dict[str, Any], skill_name: str) -> tuple[dict
         and (e["name"] in still_missing or not _is_env_var_persisted(e["name"], env_snapshot))]
     setup_needed = bool(remaining)
     # Only vars actually set pass through to sandboxed execution (execute_code, terminal).
-    if available_env_names := [e["name"] for e in required_env_vars if e["name"] not in remaining]:
+    if available_env_names := [
+        e["name"] for e in required_env_vars
+        if e["name"] not in remaining and _is_env_var_persisted(e["name"], env_snapshot)
+    ]:
         try:
             from tools.env_passthrough import register_env_passthrough
             register_env_passthrough(available_env_names)

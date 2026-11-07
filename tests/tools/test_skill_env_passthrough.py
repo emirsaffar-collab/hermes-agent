@@ -137,3 +137,6 @@ class TestAgentMailKeyPassthrough:
         assert result["setup_needed"] is False, (
             "an absent optional key must not force the skill into setup_needed"
         )
+        assert not is_env_passthrough("AGENTMAIL_API_KEY"), (
+            "an absent optional key must not be registered in env passthrough when unset"
+        )
