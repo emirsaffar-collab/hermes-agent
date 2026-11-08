@@ -538,17 +538,48 @@ def _adopt_out_of_band_turns(session: dict) -> None:
     # Keyset probe first: the common turn has nothing to adopt and must not pay a full transcript decode.
     # Address the live session, not session_key: a rotation moves the tip mid-session, so the parent
     # holds none of the foreign rows (Telegram reply, cron) this function exists to adopt and the model
-    # silently never sees them (#123545).
+    # silently never sees them (#123545). Also detect in-place SQLite secret scrubs (rowbak receipt or
+    # tool-row content length change on id <= seen) so poisoned in-memory history is re-hydrated (#CF67).
+    target_key = _submit_row_target_key(session)  # type: ignore[name-defined]
+    scrubbed = False
     with _session_db(session) as db:
         try:
-            newer = db.get_messages(_submit_row_target_key(session), after_id=seen) if db is not None else []
+            newer = db.get_messages(target_key, after_id=seen) if db is not None else []
+            if db is not None and target_key:
+                import glob as _glob
+                import os as _os
+                db_path = str(getattr(db, "db_path", "") or _os.path.expanduser("~/.hermes/state.db"))
+                last_scrub_mt = float(session.get("_scrub_reloaded_mtime") or 0.0)
+                rowbaks = _glob.glob(f"{db_path}.rowbak-secret-scrub-*-{target_key}-*.json")
+                max_mt = max((_os.path.getmtime(p) for p in rowbaks), default=0.0)
+                if max_mt > last_scrub_mt:
+                    session["_scrub_reloaded_mtime"] = max_mt
+                    scrubbed = True
+                elif callable(getattr(db, "_read_all", None)):
+                    mem_tool_lens = {
+                        rid: len(m.get("content") or "")
+                        for m in history
+                        if isinstance(m, dict)
+                        and m.get("role") == "tool"
+                        and isinstance(m.get("content"), str)
+                        and isinstance((rid := _message_row_id(m)), int)  # type: ignore[name-defined]
+                        and _below_ceiling(rid)
+                    }
+                    if mem_tool_lens:
+                        db_rows = db._read_all(
+                            "SELECT id, LENGTH(COALESCE(content, '')) FROM messages "
+                            "WHERE session_id = ? AND active = 1 AND role = 'tool' AND id <= ?",
+                            (target_key, seen),
+                        ) or ()
+                        if any(mem_tool_lens.get(int(r[0])) not in (None, int(r[1])) for r in db_rows):
+                            scrubbed = True
         except Exception:
             logger.debug("out-of-band history probe failed; turn runs on the in-memory history", exc_info=True)
             return
     newer = [row for row in newer if _foreign(row.get("id"))]
-    if not newer:
+    if not newer and not scrubbed:
         return
-    rewritten = any(row.get("_compressed_summary") for row in newer)
+    rewritten = scrubbed or any(row.get("_compressed_summary") for row in newer)
     rows = _load_durable_truncation_history(session, repair_alternation=rewritten) or []
     keep = _below_ceiling if rewritten else _foreign
     tail = canonicalize_replay_history([m for m in rows if keep(_message_row_id(m))])

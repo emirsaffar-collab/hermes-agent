@@ -302,3 +302,67 @@ def test_try_activate_fallback_sets_content_filter_fallback_sticky_on_http_403_c
     assert try_activate_fallback(ag_neg, reason=FailoverReason.rate_limit) is True
     assert ag_neg._content_filter_fallback_sticky is False
 
+
+def test_adopt_out_of_band_turns_reloads_history_on_in_place_secret_scrub(tmp_path, monkeypatch):
+    import threading
+    from contextlib import contextmanager
+    import tui_gateway.prompt_turn as pt
+
+    fake_db_file = tmp_path / "state.db"
+    fake_db_file.write_text("", encoding="utf-8")
+
+    class _FakeDB:
+        db_path = str(fake_db_file)
+
+        def __init__(self, tool_len: int):
+            self._tool_len = tool_len
+
+        def get_messages(self, key, after_id=None):
+            return []
+
+        def _read_all(self, sql, params):
+            return [(10, self._tool_len)]
+
+    scrubbed_rows = [
+        {"role": "user", "content": "hi", "_row_id": 9},
+        {"role": "tool", "content": "Container 0x3d19…bfbf started", "_row_id": 10},
+    ]
+    orig_history = [
+        {"role": "user", "content": "hi", "_row_id": 9},
+        {"role": "tool", "content": "Container 0x" + ("3d19a91b" * 8) + " started", "_row_id": 10},
+    ]
+
+    session = {
+        "history": list(orig_history),
+        "history_version": 1,
+        "history_lock": threading.Lock(),
+        "_submit_user_row": {"_row_id": 11},
+    }
+
+    # Bind required server globals on prompt_turn for isolated test execution
+    monkeypatch.setattr(pt, "_message_row_id", lambda m: m.get("_row_id") if isinstance(m, dict) else None, raising=False)
+    monkeypatch.setattr(pt, "_submit_row_target_key", lambda s: "sess_1", raising=False)
+    monkeypatch.setattr(pt, "_load_durable_truncation_history", lambda s, repair_alternation=False: list(scrubbed_rows), raising=False)
+    monkeypatch.setattr(pt, "canonicalize_replay_history", lambda rows: list(rows), raising=False)
+
+    # Negative control: matching tool length and no rowbak -> history not rewritten
+    @contextmanager
+    def _unchanged_db(_s):
+        yield _FakeDB(len(orig_history[1]["content"]))
+
+    monkeypatch.setattr(pt, "_session_db", _unchanged_db, raising=False)
+    pt._adopt_out_of_band_turns(session)
+    assert session["history_version"] == 1
+    assert session["history"][1]["content"] == orig_history[1]["content"]
+
+    # Positive control: shortened tool length in SQLite after --scrub -> history re-hydrated
+    @contextmanager
+    def _scrubbed_db(_s):
+        yield _FakeDB(len(scrubbed_rows[1]["content"]))
+
+    monkeypatch.setattr(pt, "_session_db", _scrubbed_db, raising=False)
+    pt._adopt_out_of_band_turns(session)
+    assert session["history_version"] == 2
+    assert session["history"][1]["content"] == "Container 0x3d19…bfbf started"
+
+
