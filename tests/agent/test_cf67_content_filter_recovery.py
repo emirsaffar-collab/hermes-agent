@@ -266,3 +266,39 @@ def test_prepare_iteration_respects_content_filter_fallback_sticky_and_turn_rese
     agent._content_filter_fallback_sticky = False
     prepare_iteration(agent, api_call_count=2, messages=[{"role": "user", "content": "hi"}], current_turn_user_idx=0, user_message="hi")
     assert restored == [True]
+
+
+def test_try_activate_fallback_sets_content_filter_fallback_sticky_on_http_403_content_policy_blocked(monkeypatch):
+    from agent.chat_completion_helpers import try_activate_fallback
+    import agent.route_binding as rb
+    import agent.chat_completion_helpers as cch
+
+    monkeypatch.setattr(rb, "bind_route_entry", lambda ag, fb, prov, mod: ("google/gemini-4-argon", "openrouter"))
+    monkeypatch.setattr(cch, "rewrite_prompt_model_identity", lambda *a, **k: None)
+    monkeypatch.setattr(cch, "_should_skip_fallback_candidate", lambda *a, **k: False)
+
+    def _make_fb_agent():
+        return SimpleNamespace(
+            model="google/gemini-4-argon",
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            _primary_runtime={"provider": "openrouter", "model": "google/gemini-4-argon"},
+            _fallback_chain=[{"provider": "vertex", "model": "google/gemini-4-argon"}],
+            _fallback_index=0,
+            _fallback_activated=False,
+            _content_filter_fallback_sticky=False,
+            _unavailable_fallback_keys=set(),
+            _buffer_diagnostic_status=lambda *a, **k: None,
+            _pending_fallback_notice=None,
+            _stale_stream_streak=0,
+            _stale_first_token_streak=0,
+        )
+
+    ag_pos = _make_fb_agent()
+    assert try_activate_fallback(ag_pos, reason=FailoverReason.content_policy_blocked) is True
+    assert ag_pos._content_filter_fallback_sticky is True
+
+    ag_neg = _make_fb_agent()
+    assert try_activate_fallback(ag_neg, reason=FailoverReason.rate_limit) is True
+    assert ag_neg._content_filter_fallback_sticky is False
+
