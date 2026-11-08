@@ -613,6 +613,8 @@ CREATE TABLE IF NOT EXISTS session_admissions (
 );
 CREATE INDEX IF NOT EXISTS session_admissions_pending
     ON session_admissions(target_session_id, status, seq);
+CREATE INDEX IF NOT EXISTS idx_session_admissions_status_outcome
+    ON session_admissions(status, outcome, owner_epoch);
 CREATE INDEX IF NOT EXISTS idx_session_admissions_target_request
     ON session_admissions(target_session_id, request_id, admission_id);
 -- Cron run history finds a job's unified-runtime runs by the scheduler principal's request ids
@@ -637,6 +639,10 @@ CREATE TABLE IF NOT EXISTS worker_executions (
 -- inside the write transaction; without this each probe scanned the whole (only-growing) table.
 CREATE INDEX IF NOT EXISTS idx_worker_executions_session_status
     ON worker_executions(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_worker_executions_kind_status
+    ON worker_executions(kind, status, owner_epoch);
+CREATE INDEX IF NOT EXISTS idx_worker_executions_status_epoch
+    ON worker_executions(status, owner_epoch);
 CREATE TABLE IF NOT EXISTS worker_receipts (
     execution_id TEXT NOT NULL REFERENCES worker_executions(execution_id) ON DELETE RESTRICT,
     sequence INTEGER NOT NULL CHECK (sequence > 0),
@@ -929,6 +935,12 @@ CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity
 CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started
     ON sessions(created_source, started_at DESC)
     WHERE source = 'local';
+CREATE INDEX IF NOT EXISTS idx_session_admissions_status_outcome
+    ON session_admissions(status, outcome, owner_epoch);
+CREATE INDEX IF NOT EXISTS idx_worker_executions_kind_status
+    ON worker_executions(kind, status, owner_epoch);
+CREATE INDEX IF NOT EXISTS idx_worker_executions_status_epoch
+    ON worker_executions(status, owner_epoch);
 """
 
 

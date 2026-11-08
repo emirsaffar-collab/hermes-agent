@@ -728,11 +728,13 @@ class RelayRuntime:
             if session_root is not None and _same_handle(top, session_root) and handle is not session_root:
                 break
             try:
-                orphan_output = self._take_deferred_scope_output(top) or {
+                deferred_output = self._take_deferred_scope_output(top)
+                orphan_output = deferred_output or {
                     "outcome": "cancelled", "hermes.orphan_drain": True,
                 }
                 pop_relay_scope(self.relay, top, output=orphan_output, metadata=metadata)
-                drained += 1
+                if deferred_output is None:
+                    drained += 1
             except Exception:
                 logger.warning("Hermes Relay orphaned scope drain failed", exc_info=True)
                 break

@@ -455,6 +455,10 @@ def release_handed_off_receipts(db, *, epoch):
     from hermes_state_local import hand_off_conversations, moved_receipts
     from hermes_state_runtime import _epoch
 
+    with db._read_ctx() as conn:
+        if not any(_messaging_platform(source) is not None for _, source in moved_receipts(conn).values()):
+            return
+
     def write(conn):
         _epoch(conn, epoch)
         moved = {owner: (target, source) for owner, (target, source) in moved_receipts(conn).items()

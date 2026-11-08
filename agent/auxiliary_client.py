@@ -5670,7 +5670,9 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
     with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and old_entry[0] is not client:
-            _close_cached_client(old_entry[0])
+            old_loop = old_entry[2]
+            if old_loop is None or old_loop.is_closed() or old_loop is bound_loop:
+                _close_cached_client(old_entry[0], close_async=old_loop is not None and old_loop.is_closed())
         _client_cache[cache_key] = (client, default_model, bound_loop)
 
 
@@ -5877,9 +5879,11 @@ def _get_cached_client(
             )
             if loop_ok:
                 return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+            # Stale async entry — evict. Only close when the owner loop is absent or closed;
+            # a live foreign loop in another worker thread may be mid-request on cached_client,
+            # and _force_close_async_httpx would flip its httpx.AsyncClient to CLOSED mid-flight.
+            if cached_loop is None or cached_loop.is_closed():
+                _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
             del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
@@ -5909,10 +5913,17 @@ def _get_cached_client(
                     del _client_cache[next(iter(_client_cache))]
                 _client_cache[cache_key] = (client, default_model, current_loop)
             else:
-                built_client = client
-                client, default_model, _ = _client_cache[cache_key]
-                # Race loser was never exposed to a caller — safe to close now.
-                _close_cached_client(built_client, close_async=async_mode)
+                winner_client, winner_default, winner_loop = _client_cache[cache_key]
+                winner_loop_ok = not async_mode or (
+                    winner_loop is not None and winner_loop is current_loop and not winner_loop.is_closed()
+                )
+                if winner_loop_ok:
+                    built_client = client
+                    client, default_model = winner_client, winner_default
+                    # Race loser was never exposed to a caller — safe to close now.
+                    _close_cached_client(built_client, close_async=async_mode)
+                else:
+                    _client_cache[cache_key] = (client, default_model, current_loop)
     return client, _compat_model(client, model, default_model)
 
 
