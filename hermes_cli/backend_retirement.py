@@ -21,6 +21,8 @@ class RetirementFence:
     def __init__(self):
         self._lock = threading.Lock()
         self._active = 0
+        self._thread_depth = {}
+        self._draining = False
         self._preparing = False
         self._token = None
         self._committed = False
@@ -32,16 +34,27 @@ class RetirementFence:
             self._token = None
 
     def acquire(self):
+        tid = threading.get_ident()
         with self._lock:
             self._expire()
-            if self._preparing or self._token is not None:
+            depth = self._thread_depth.get(tid, 0)
+            if self._preparing or self._token is not None or (self._draining and self._active > 0 and depth == 0):
                 return False
             self._active += 1
+            self._thread_depth[tid] = depth + 1
             return True
 
     def release(self):
+        tid = threading.get_ident()
         with self._lock:
             self._active -= 1
+            depth = self._thread_depth.get(tid, 1) - 1
+            if depth <= 0:
+                self._thread_depth.pop(tid, None)
+            else:
+                self._thread_depth[tid] = depth
+            if self._active <= 0:
+                self._draining = False
 
     def active_count(self):
         with self._lock:
@@ -63,7 +76,10 @@ class RetirementFence:
             self._expire()
             if self._committed:
                 return {"ok": True, "idle": True, "token": self._token}
-            if self._preparing or self._token is not None or self._active:
+            if self._preparing or self._token is not None:
+                return {"ok": False, "idle": False}
+            if self._active:
+                self._draining = True
                 return {"ok": False, "idle": False}
             self._preparing = True
         # No admissions can cross the freeze. Do not hold our lock while reading ledgers:
@@ -76,6 +92,7 @@ class RetirementFence:
         finally:
             with self._lock:
                 self._preparing = False
+                self._draining = False
                 if verdict is True:
                     self._token = token = secrets.token_urlsafe(32)
                     self._expires_at = self._now() + 30.0
@@ -97,6 +114,7 @@ class RetirementFence:
             if not token or token != self._token or self._committed:
                 return {"ok": False}
             self._token = None
+            self._draining = False
             return {"ok": True}
 
 

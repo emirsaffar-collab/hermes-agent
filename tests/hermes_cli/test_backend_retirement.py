@@ -75,3 +75,56 @@ def test_only_uncommitted_permits_expire_and_unreadable_work_never_grants(monkey
         assert not admitted
     monkeypatch.setattr(web_server_idle_proof, "idle_proof", lambda: {"idle": None})
     assert RetirementFence().prepare() == {"ok": False, "idle": None}
+
+
+def test_prepare_fences_overlapping_new_admissions_while_allowing_reentrant_work(monkeypatch):
+    import threading
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_cli import web_server_idle_proof
+
+    monkeypatch.setattr(web_server_idle_proof, "idle_proof", lambda: {"idle": True})
+    fence = RetirementFence()
+    entered_a = threading.Event()
+    release_a = threading.Event()
+    reentrant_results = []
+    other_thread_results = []
+
+    def worker_a():
+        with fence.work() as admitted:
+            assert admitted is True
+            entered_a.set()
+            assert release_a.wait(5.0)
+            with fence.work() as nested:
+                reentrant_results.append(nested)
+
+    t_a = threading.Thread(target=worker_a)
+    t_a.start()
+    assert entered_a.wait(5.0)
+
+    # First prepare while worker_a is active enters draining mode.
+    assert fence.prepare() == {"ok": False, "idle": False}
+    assert fence._draining is True
+
+    # A new top-level turn on another thread is rejected while draining.
+    def worker_b():
+        with fence.work() as admitted:
+            other_thread_results.append(admitted)
+
+    t_b = threading.Thread(target=worker_b)
+    t_b.start()
+    t_b.join(5.0)
+    assert other_thread_results == [False]
+
+    # Finish worker_a (which also completes a nested re-entrant work() handoff on the same thread).
+    release_a.set()
+    t_a.join(5.0)
+    assert reentrant_results == [True]
+    assert fence.active_count() == 0
+    assert fence._draining is False
+
+    # Next prepare succeeds and issues a valid retirement token.
+    permit = fence.prepare()
+    assert permit["ok"] is True and permit["idle"] is True
+    assert fence.cancel(permit["token"]) == {"ok": True}
+    with fence.work() as admitted_after_cancel:
+        assert admitted_after_cancel is True
