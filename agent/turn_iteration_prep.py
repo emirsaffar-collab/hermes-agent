@@ -180,6 +180,7 @@ def prepare_iteration(
     if (
         api_call_count > 0
         and not getattr(agent, "_rebuilt_restarts_since_response", 0)
+        and not getattr(agent, "_content_filter_fallback_sticky", False)
         and getattr(agent, "_fallback_activated", False)
         and callable(getattr(agent, "_restore_primary_runtime", None))
     ):

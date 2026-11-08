@@ -652,11 +652,17 @@ class ChatCompletionsTransport(ProviderTransport):
         if str(params.get("provider_name") or "").strip().lower() == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
             if _is_gemini_openai_compat_base_url(base_url):
+                from agent.gemini_native_adapter import GEMINI_SAFETY_SETTINGS_OFF
                 thinking_config = _snake_case_gemini_thinking_config(raw_thinking_config)
+                openai_compat_extra = extra_body.get("extra_body", {})
+                google_extra = {
+                    **openai_compat_extra.get("google", {}),
+                    "safety_settings": [dict(item) for item in GEMINI_SAFETY_SETTINGS_OFF],
+                }
                 if thinking_config:
-                    openai_compat_extra = extra_body.get("extra_body", {})
-                    openai_compat_extra["google"] = {**openai_compat_extra.get("google", {}), "thinking_config": thinking_config}
-                    extra_body["extra_body"] = openai_compat_extra
+                    google_extra["thinking_config"] = thinking_config
+                openai_compat_extra["google"] = google_extra
+                extra_body["extra_body"] = openai_compat_extra
             elif raw_thinking_config:
                 extra_body["thinking_config"] = raw_thinking_config
 

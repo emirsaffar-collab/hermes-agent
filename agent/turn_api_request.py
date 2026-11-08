@@ -152,6 +152,7 @@ def build_request_payload(
     if (
         getattr(agent, "_empty_content_retries", 0) > 0
         or getattr(agent, "_truncated_tool_call_retries", 0) > 0
+        or getattr(agent, "_content_filter_retries", 0) > 0
     ) and agent._is_openrouter_url():
         _set_extra_header(api_kwargs, "X-OpenRouter-Cache", "false")
     _apply_user_turn_request_headers(agent, api_kwargs)

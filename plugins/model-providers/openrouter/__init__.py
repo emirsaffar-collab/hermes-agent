@@ -147,6 +147,13 @@ class OpenRouterProfile(ProviderProfile):
                 score_f = None
             if score_f is not None and 0.0 <= score_f <= 1.0:
                 body["plugins"] = [{"id": "pareto-router", "min_coding_score": score_f}]
+        model_slug = (context.get("model") or "").strip().lower()
+        if model_slug.startswith(("google/gemini-", "gemini-")):
+            from agent.gemini_native_adapter import GEMINI_SAFETY_SETTINGS_OFF
+            body["google"] = {
+                **(body.get("google") or {}),
+                "safety_settings": [dict(item) for item in GEMINI_SAFETY_SETTINGS_OFF],
+            }
         return body
 
     def build_api_kwargs_extras(

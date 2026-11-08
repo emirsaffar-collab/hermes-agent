@@ -752,16 +752,45 @@ def continue_codex_incomplete(
     )
 
 
+_CONTENT_FILTER_STEER_NOTE = (
+    "\n\n[hermes note: Previous response generation was interrupted by an upstream output filter "
+    "(finish_reason=content_filter). Continue the task and summarize technical outcomes factually "
+    "without echoing raw security-hook internals, secret-scanner patterns, or exploit/bypass steps.]"
+)
+
+
 @dataclass
 class RefusalVerdict:
     """Outcome of ``handle_content_policy_refusal``: ``"break"`` (fallback activated —
-    restart armed on ``_retry``; caller resets retry/compression counters) or
-    ``"return"`` (the typed content-policy result in ``result``). ``active_system_prompt``
+    restart armed on ``_retry``; caller resets retry/compression counters), ``"continue"``
+    (mid-turn same-route retry with neutral steering and cache bypass), or ``"return"``
+    (the typed content-policy result in ``result``). ``active_system_prompt``
     is the possibly re-synced system prompt."""
 
     action: str
     result: Optional[dict[str, Any]]
     active_system_prompt: Any
+
+
+def _activate_refusal_fallback(agent: Any) -> bool:
+    """Activate the next fallback provider with ``FailoverReason.content_policy_blocked``."""
+    try:
+        return bool(agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked))
+    except TypeError:
+        return bool(agent._try_activate_fallback())
+
+
+def _inject_content_filter_steer_note(api_messages: Any) -> None:
+    """Append ``_CONTENT_FILTER_STEER_NOTE`` to the trailing tool/user message on ``api_messages``."""
+    if not isinstance(api_messages, list) or not api_messages:
+        return
+    for msg in reversed(api_messages):
+        if not isinstance(msg, dict) or msg.get("role") not in ("tool", "user"):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and _CONTENT_FILTER_STEER_NOTE not in content:
+            msg["content"] = content + _CONTENT_FILTER_STEER_NOTE
+        return
 
 
 def handle_content_policy_refusal(
@@ -772,8 +801,11 @@ def handle_content_policy_refusal(
     current_turn_user_idx: Any = None,
 ) -> RefusalVerdict:
     """HTTP-200 refusal (``finish_reason`` ``content_filter`` / ``guardrail_intervened``).
-    Deterministic for the unchanged prompt — never retried: one configured-fallback try,
-    else surface the refusal (explanation may live only in the reasoning channel)."""
+    Step-1 prompt refusals are deterministic for the unchanged prompt (one configured-fallback
+    try, else surface the refusal). Mid-turn refusals (``api_call_count > 1``) occur after the
+    user prompt was already accepted and tool rounds executed — usually triggered by the model's
+    own speculative reasoning about security hooks/secrets — so retry once on the current route
+    with neutral steering, lower thinking effort, and OpenRouter cache bypass before failing over."""
     from agent.conversation_loop import _arm_fallback_restart, _content_policy_blocked_result
 
     _refusal_result = normalize_response_for_agent(agent, response)
@@ -782,7 +814,10 @@ def handle_content_policy_refusal(
         _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
     # Anthropic stop_reason=refusal carries its reason on stop_details (category + optional explanation),
     # not in a content block — without it a classifier halt reads as "(no text)" (#113689).
-    _stop_details = (getattr(_refusal_result, "provider_data", None) or {}).get("stop_details")
+    _stop_details = (
+        (getattr(_refusal_result, "provider_data", None) or {}).get("stop_details")
+        or getattr(response, "stop_details", None)
+    )
     if not _refusal_text and isinstance(_stop_details, dict):
         _refusal_text = str(_stop_details.get("explanation") or "").strip() or (
             f"provider refusal category: {_stop_details['category']}" if _stop_details.get("category") else ""
@@ -798,14 +833,37 @@ def handle_content_policy_refusal(
     )
     stop_thinking_spinner(agent, thinking_spinner)
 
+    _refusal_log = _refusal_text[:500] + "..." if len(_refusal_text) > 500 else _refusal_text
+    _prior_cf_retries = int(getattr(agent, "_content_filter_retries", 0) or 0)
+    if api_call_count > 1 and (max_retries or 0) > 0 and _prior_cf_retries < 1:
+        agent._content_filter_retries = _prior_cf_retries + 1
+        agent._ephemeral_reasoning_off = True
+        _inject_content_filter_steer_note(api_messages)
+        logger.warning(
+            "%sModel declined to respond (finish_reason=content_filter) on mid-turn call #%d "
+            "(model=%s provider=%s) — retrying once with neutral steering and cache bypass. refusal=%s",
+            agent.log_prefix, api_call_count, agent.model, agent.provider, _refusal_log or "(no text)",
+        )
+        agent._buffer_diagnostic_status(
+            "⚠️ Upstream output filter interrupted mid-turn response — retrying with neutral steering..."
+        )
+        return RefusalVerdict("continue", None, active_system_prompt)
+
+    agent._content_filter_retries = 0
+    agent._ephemeral_reasoning_off = False
     if agent._has_pending_fallback():
         agent._buffer_diagnostic_status("⚠️ Model declined to respond (safety refusal) — trying fallback...")
-    if agent._try_activate_fallback():
+    if _activate_refusal_fallback(agent):
+        agent._content_filter_fallback_sticky = True
+        logger.warning(
+            "%sModel declined to respond (finish_reason=content_filter) on primary — activated fallback "
+            "to model=%s provider=%s. refusal=%s",
+            agent.log_prefix, agent.model, agent.provider, _refusal_log or "(no text)",
+        )
         active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
         return RefusalVerdict("break", None, active_system_prompt)
 
     agent._flush_status_buffer()
-    _refusal_log = _refusal_text[:500] + "..." if len(_refusal_text) > 500 else _refusal_text
     # native_stop_reason tells an Anthropic classifier refusal (``refusal``) from a Bedrock guardrail
     # block (``end_turn``); both arrive here as content_filter.
     logger.warning(

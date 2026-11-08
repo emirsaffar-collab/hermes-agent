@@ -15,12 +15,18 @@ class VertexProfile(ProviderProfile):
     """Vertex AI — reuse Gemini's thinking_config translation for extra_body."""
 
     def build_extra_body(self, *, session_id: str | None = None, **context: Any) -> dict[str, Any]:
-        """Emit ``extra_body.google.thinking_config`` like the ``gemini`` provider's OpenAI-compat subpath."""
+        """Emit ``extra_body.google.{thinking_config,safety_settings}`` like the ``gemini`` provider's OpenAI-compat subpath."""
+        from agent.gemini_native_adapter import GEMINI_SAFETY_SETTINGS_OFF
         from agent.transports.chat_completions import _build_gemini_thinking_config, _snake_case_gemini_thinking_config
 
         raw = _build_gemini_thinking_config(context.get("model") or "", context.get("reasoning_config"))
         thinking_config = _snake_case_gemini_thinking_config(raw) if raw else None
-        return {"extra_body": {"google": {"thinking_config": thinking_config}}} if thinking_config else {}
+        google_extra: dict[str, Any] = {
+            "safety_settings": [dict(item) for item in GEMINI_SAFETY_SETTINGS_OFF],
+        }
+        if thinking_config:
+            google_extra["thinking_config"] = thinking_config
+        return {"extra_body": {"google": google_extra}}
 
 
 vertex = VertexProfile(
