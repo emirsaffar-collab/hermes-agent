@@ -2033,9 +2033,13 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
     agent._buffer_diagnostic_status(notice)
     pending = getattr(agent, "_pending_fallback_notice", None)
     if isinstance(pending, list):
-        pending.append(notice)
+        if not pending or pending[-1] != notice:
+            pending.append(notice)
     else:
-        agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
+        if pending and str(pending) != notice:
+            agent._pending_fallback_notice = [str(pending), notice]
+        else:
+            agent._pending_fallback_notice = [notice]
 
 
 def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=None) -> bool:

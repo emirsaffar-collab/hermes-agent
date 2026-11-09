@@ -88,6 +88,14 @@ def run_tool_round(
     if _tvv.action == "continue":
         return _verdict("continue")
 
+    # Surface any pending fallback switch notice on a successful tool-calling round (mirroring
+    # finish_text_response) so multi-step tool turns do not accumulate notices across CF-61
+    # mid-turn primary restores and dump stale duplicates at turn end.
+    if callable(getattr(agent, "_emit_pending_fallback_notice", None)):
+        agent._emit_pending_fallback_notice()
+    if callable(getattr(agent, "_clear_status_buffer", None)):
+        agent._clear_status_buffer()
+
     # Normalize only this unpersisted turn. Each local bridge entry must pass
     # through the same scope, approvals, state and scheduling as a singleton.
     from agent.tool_call_batches import expand_local_tool_batches
