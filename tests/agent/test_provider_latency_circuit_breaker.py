@@ -106,3 +106,17 @@ def test_served_name_and_order_tag_share_breaker_key():
     record_provider_failure("google/gemini-4-argon", "Google")
     assert is_provider_demoted("google/gemini-4-argon", "google-vertex")
 
+
+def test_explicit_failure_demotion_is_not_cleared_early_by_inflight_latency_sample():
+    reset_circuit_breaker()
+    try:
+        record_provider_failure("google/gemini-4-argon", "Google AI Studio")
+        assert is_provider_demoted("google/gemini-4-argon", "google-ai-studio/flex")
+        # An already-in-flight call completing fast right after a 429 must NOT wipe the failure cooldown.
+        record_provider_latency("google/gemini-4-argon", "Google AI Studio", 12.0, context_tokens=150_000)
+        assert is_provider_demoted("google/gemini-4-argon", "google-ai-studio/flex")
+        assert is_provider_demoted("google/gemini-4-argon", "google-ai-studio")
+    finally:
+        reset_circuit_breaker()
+
+

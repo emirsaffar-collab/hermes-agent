@@ -30,6 +30,13 @@ class _Agent:
     _credential_pool = None
     _current_streamed_assistant_text = ""
     _interrupt_requested = False
+    providers_order: list[str] | None = None
+    providers_allowed = None
+    providers_ignored = None
+    provider_sort = None
+    provider_require_parameters = None
+    provider_data_collection = None
+    allow_provider_fallbacks = None
     sleep_outcome = None  # what the (patched) interruptible wait returns
 
     def __init__(self, *, fallback_left=False, cycles=5, platform="cli"):
@@ -47,6 +54,9 @@ class _Agent:
 
     def _try_recover_primary_transport(self, *a, **k):
         return False
+
+    def _recover_with_credential_pool(self, **kw):
+        return False, kw.get("has_retried_429", False)
 
     def _has_content_after_think_block(self, text):
         return bool(text.strip())
@@ -202,5 +212,119 @@ def test_openrouter_upstream_429_records_provider_failure_and_reorders_upstreams
         assert reordered == ["google-vertex/global", "google-ai-studio/flex", "google-ai-studio"]
     finally:
         reset_circuit_breaker()
+
+
+def test_openrouter_upstream_429_retries_reordered_upstream_before_cross_provider_fallback():
+    """When an unwrapped OpenRouter 429 demotes Google AI Studio and promotes google-vertex/global
+    in extra_body.provider.order, attempt 1/3 retries on OpenRouter with the reordered order before
+    activating cross-provider fallback; if the reordered order also 429s, fallback activates."""
+    from agent.provider_latency_circuit_breaker import is_provider_demoted, reset_circuit_breaker
+    from agent.turn_api_error import handle_api_error
+
+    reset_circuit_breaker()
+    try:
+        agent = _Agent(fallback_left=True)
+        agent.provider = "openrouter"
+        agent.model = "google/gemini-4-argon"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._fallback_index = 0
+        agent._fallback_chain = [{"provider": "vertex", "model": "google/gemini-4-argon"}]
+        agent.providers_order = ["google-ai-studio/flex", "google-vertex/global", "google-ai-studio"]
+        agent._extract_api_error_context = lambda err: {"status_code": 429}
+
+        err1 = _Err(429, "Error code: 429 - Provider returned error")
+        err1.body = {
+            "message": "Provider returned error",
+            "code": 429,
+            "metadata": {
+                "provider_name": "Google AI Studio",
+                "limit_source": "upstream_provider_shared_pool",
+            },
+        }
+        api_kwargs = {
+            "extra_body": {
+                "provider": {
+                    "order": ["google-ai-studio/flex", "google-vertex/global", "google-ai-studio"]
+                }
+            }
+        }
+        retry = TurnRetryState()
+        with patch("agent.turn_api_error.recover_before_classification", lambda *a, **k: (False, None)), \
+                patch("agent.turn_recovery.interruptible_backoff_sleep", lambda *a, **k: None):
+            v1 = handle_api_error(
+                agent,
+                api_error=err1,
+                _retry=retry,
+                messages=[],
+                api_messages=[],
+                api_kwargs=api_kwargs,
+                active_system_prompt=None,
+                conversation_history=None,
+                approx_tokens=50000,
+                retry_count=0,
+                max_retries=3,
+                compression_attempts=0,
+                max_compression_attempts=2,
+                api_call_count=1,
+                thinking_spinner=None,
+                system_message="",
+                api_request_id=None,
+                api_start_time=0.0,
+                effective_task_id=None,
+                turn_id="t1",
+            )
+
+        assert is_provider_demoted("google/gemini-4-argon", "google-ai-studio/flex")
+        assert api_kwargs["extra_body"]["provider"]["order"] == [
+            "google-vertex/global",
+            "google-ai-studio/flex",
+            "google-ai-studio",
+        ]
+        assert v1.action == "fallthrough"
+        assert v1.retry_count == 1
+        assert agent.activated == []
+
+        # If attempt 2/3 also 429s (either on Google or with no further reorder available),
+        # cross-provider fallback activates immediately.
+        err2 = _Err(429, "Error code: 429 - Provider returned error")
+        err2.body = {
+            "message": "Provider returned error",
+            "code": 429,
+            "metadata": {
+                "provider_name": "Google",
+                "limit_source": "upstream_provider_shared_pool",
+            },
+        }
+        with patch("agent.turn_api_error.recover_before_classification", lambda *a, **k: (False, None)), \
+                patch("agent.turn_recovery.interruptible_backoff_sleep", lambda *a, **k: None):
+            v2 = handle_api_error(
+                agent,
+                api_error=err2,
+                _retry=retry,
+                messages=[],
+                api_messages=[],
+                api_kwargs=api_kwargs,
+                active_system_prompt=None,
+                conversation_history=None,
+                approx_tokens=50000,
+                retry_count=v1.retry_count,
+                max_retries=3,
+                compression_attempts=0,
+                max_compression_attempts=2,
+                api_call_count=1,
+                thinking_spinner=None,
+                system_message="",
+                api_request_id=None,
+                api_start_time=0.0,
+                effective_task_id=None,
+                turn_id="t1",
+            )
+
+        assert is_provider_demoted("google/gemini-4-argon", "google-vertex/global")
+        assert v2.action == "break"
+        assert agent.activated == [True]
+    finally:
+        reset_circuit_breaker()
+
 
 

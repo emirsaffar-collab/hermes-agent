@@ -49,6 +49,8 @@ _lock = threading.Lock()
 _history: dict[tuple[str, str], collections.deque[float]] = {}
 # (model, provider) -> demoted_until_timestamp
 _demoted_until: dict[tuple[str, str], float] = {}
+# (model, provider) -> explicit_failure_demoted_until_timestamp (immune to early latency recovery from in-flight calls)
+_failure_demoted_until: dict[tuple[str, str], float] = {}
 # (model, provider) -> warning_suppressed_until_timestamp (prevents flapping across the threshold within 600s from re-warning)
 _warned_until: dict[tuple[str, str], float] = {}
 
@@ -110,9 +112,15 @@ def record_provider_latency(model: str, provider: str, duration_s: float,
                 "provider circuit-breaker: %s @ %s degraded (avg=%.1fs over %d calls, threshold=%.1fs); demoting for %.0fs",
                 model, provider, avg, len(_history[key]), threshold, _COOLDOWN_SECONDS,
             )
-        elif key in _demoted_until and duration_s < threshold:
-            # Recovered early on probe
+        elif (
+            key in _demoted_until
+            and duration_s < threshold
+            and now >= _failure_demoted_until.get(key, 0.0)
+        ):
+            # Recovered early on probe (only for latency demotions; explicit failure/429
+            # demotions hold until their cooldown expires so in-flight calls cannot wipe them)
             del _demoted_until[key]
+            _failure_demoted_until.pop(key, None)
             logger.info("provider circuit-breaker: %s @ %s recovered (latest=%.1fs)", model, provider, duration_s)
 
 
@@ -122,7 +130,9 @@ def record_provider_failure(model: str, provider: str) -> None:
     key = (model.lower(), _breaker_provider_key(provider))
     now = time.monotonic()
     with _lock:
-        _demoted_until[key] = now + _COOLDOWN_SECONDS
+        until = now + _COOLDOWN_SECONDS
+        _demoted_until[key] = until
+        _failure_demoted_until[key] = until
         logger.warning(
             "provider circuit-breaker: %s @ %s recorded failure/timeout; demoting for %.0fs",
             model, provider, _COOLDOWN_SECONDS,
@@ -140,6 +150,7 @@ def is_provider_demoted(model: str, provider: str) -> bool:
             return False
         if now >= until:
             del _demoted_until[key]
+            _failure_demoted_until.pop(key, None)
             return False
         return True
 
@@ -182,6 +193,7 @@ def all_providers_demoted(model: str, order: Sequence[str] | None = None) -> boo
         # Same lazy expiry as is_provider_demoted: drop lapsed cooldowns first.
         for key in [k for k, until in _demoted_until.items() if now >= until]:
             del _demoted_until[key]
+            _failure_demoted_until.pop(key, None)
         if order:
             providers = [_breaker_provider_key(str(p)) for p in order if str(p)]
             if not providers:
@@ -222,5 +234,6 @@ def reset_circuit_breaker() -> None:
     with _lock:
         _history.clear()
         _demoted_until.clear()
+        _failure_demoted_until.clear()
         _warned_until.clear()
         _last_escalation_attempt.clear()

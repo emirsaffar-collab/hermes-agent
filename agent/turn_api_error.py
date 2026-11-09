@@ -158,13 +158,27 @@ def handle_api_error(
         FailoverReason.timeout,
     ):
         try:
-            from agent.provider_latency_circuit_breaker import record_provider_failure
-            record_provider_failure(str(getattr(agent, "model", "") or ""), str(_upstream_prov))
+            from agent.provider_latency_circuit_breaker import all_providers_demoted, record_provider_failure
+            _model_str = str(getattr(agent, "model", "") or "")
+            _prev_order = (
+                list(((api_kwargs.get("extra_body") or {}).get("provider") or {}).get("order") or [])
+                if isinstance(api_kwargs, dict) and isinstance(api_kwargs.get("extra_body"), dict)
+                else []
+            )
+            record_provider_failure(_model_str, str(_upstream_prov))
             if isinstance(api_kwargs, dict) and isinstance(api_kwargs.get("extra_body"), dict):
                 from agent.chat_completion_helpers import _provider_preferences_for_agent
                 _prefs = _provider_preferences_for_agent(agent)
                 if _prefs:
                     api_kwargs["extra_body"]["provider"] = _prefs
+                    _new_order = list(_prefs.get("order") or [])
+                    if (
+                        len(_new_order) >= 2
+                        and _new_order != _prev_order
+                        and not all_providers_demoted(_model_str, _new_order)
+                        and isinstance(error_context, dict)
+                    ):
+                        error_context["openrouter_order_reordered"] = True
         except Exception:
             logger.debug("provider circuit-breaker failure record failed", exc_info=True)
 

@@ -1921,8 +1921,15 @@ def route_classified_error(
         # upstream-aggregator 429 — the pool can't help, always fall back.
         # Fixes #11314.
         _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
+        _or_order_reordered = bool(
+            isinstance(error_context, dict)
+            and error_context.get("openrouter_order_reordered")
+            and retry_count < max_retries
+        )
         pool_may_recover = (
-            False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
+            _or_order_reordered
+            if _is_upstream
+            else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))

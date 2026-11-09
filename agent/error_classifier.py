@@ -1564,9 +1564,13 @@ def _is_codex_masked_replay_rejection(c: _Ctx) -> bool:
 
 
 def _error_obj(body: Any) -> dict:
-    """``body["error"]`` when it is a dict, else ``{}``."""
-    err = body.get("error") if isinstance(body, dict) else None
-    return err if isinstance(err, dict) else {}
+    """``body["error"]`` when it is a dict, or ``body`` itself when the SDK already unwrapped ``error``."""
+    if not isinstance(body, dict):
+        return {}
+    err = body.get("error")
+    if isinstance(err, dict):
+        return err
+    return body if "error" not in body else {}
 
 
 def _json_dict(text: Any) -> Optional[dict]:
