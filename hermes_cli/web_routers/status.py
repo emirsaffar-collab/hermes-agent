@@ -528,7 +528,7 @@ async def _webapp_caller_signed_out(request: Request) -> bool:
     session the gate would accept. ``/api/status`` is public, so the gate never verified one."""
     from hermes_cli.web_server import _require_token
     from hermes_cli.web_server_surface import surface
-    if request is None or surface(request.app.state) != "webapp" \
+    if request is None or surface(request.app.state) not in {"webapp", "dashboard", "serve", "gateway"} \
             or not getattr(request.app.state, "auth_required", False):
         return False
     if getattr(request.state, "session", None) is None:
