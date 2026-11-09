@@ -65,6 +65,12 @@ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fe
             reason = observe()
             seen = seen + 1 if reason else 0
             if seen >= _CONFIRMATIONS:
+                active_fn = getattr(fence, "active_count", None)
+                if callable(active_fn):
+                    active_val = active_fn()
+                    if isinstance(active_val, int) and active_val > 0:
+                        time.sleep(min(poll_s, DEFAULT_DRAIN_POLL_S))
+                        continue
                 permit = fence.prepare()
                 if permit.get("ok") and fence.commit(permit.get("token")).get("ok"):
                     _log.warning("%s", reason)

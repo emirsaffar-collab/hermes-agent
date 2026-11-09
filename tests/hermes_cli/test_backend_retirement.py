@@ -128,3 +128,55 @@ def test_prepare_fences_overlapping_new_admissions_while_allowing_reentrant_work
     assert fence.cancel(permit["token"]) == {"ok": True}
     with fence.work() as admitted_after_cancel:
         assert admitted_after_cancel is True
+
+
+def test_cross_thread_acquire_release_never_poisons_parent_thread_depth(monkeypatch):
+    """Regression for #CF68 follow-up: _start_session_work and _pool.submit acquire on the caller
+    thread and release on the spawned worker thread. With bind_thread=False + worker_thread_scope(),
+    the parent thread never accumulates leaked _thread_depth, the worker thread gets re-entrant
+    depth 1 while running, and _start_session_work(session={'running': True}) honors already-admitted
+    turns even if prepare() set _draining in the millisecond gap between _lock_in_submit_turn and
+    _start_session_work."""
+    import threading
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_cli import web_server_idle_proof
+
+    monkeypatch.setattr(web_server_idle_proof, "idle_proof", lambda: {"idle": True})
+    fence = RetirementFence()
+    parent_tid = threading.get_ident()
+
+    assert fence.acquire(bind_thread=False) is True
+    assert fence._thread_depth.get(parent_tid, 0) == 0
+
+    worker_nested = []
+
+    def worker():
+        try:
+            with fence.worker_thread_scope():
+                assert fence.prepare() == {"ok": False, "idle": False}
+                assert fence._draining is True
+                with fence.work() as nested:
+                    worker_nested.append(nested)
+        finally:
+            fence.release(bind_thread=False)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(5.0)
+
+    assert worker_nested == [True]
+    assert fence.active_count() == 0
+    assert fence._thread_depth == {}
+    assert fence._draining is False
+
+    # Verify force=True allows an already-admitted session turn (session["running"] == True)
+    # to cross _start_session_work even while _draining is True from a concurrent turn.
+    assert fence.acquire(bind_thread=False) is True
+    assert fence.prepare() == {"ok": False, "idle": False}
+    assert fence._draining is True
+    assert fence.acquire(bind_thread=False, force=False) is False
+    assert fence.acquire(bind_thread=False, force=True) is True
+    fence.release(bind_thread=False)
+    fence.release(bind_thread=False)
+    assert fence.active_count() == 0
+    assert fence._draining is False

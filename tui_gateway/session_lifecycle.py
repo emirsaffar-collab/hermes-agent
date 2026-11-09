@@ -26,14 +26,16 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
     from agent.memory_provider import spawn_context_thread
     from hermes_cli.backend_retirement import retirement
 
-    if not retirement.acquire():
+    already_running = bool(isinstance(session, dict) and session.get("running"))
+    if not retirement.acquire(bind_thread=False, force=already_running):
         return None
 
     def run():
         try:
-            target()
+            with retirement.worker_thread_scope():
+                target()
         finally:
-            retirement.release()
+            retirement.release(bind_thread=False)
 
     try:
         thread = spawn_context_thread(run, name=name)
@@ -42,7 +44,7 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
         thread.start()
         return thread
     except BaseException:
-        retirement.release()
+        retirement.release(bind_thread=False)
         raise
 
 

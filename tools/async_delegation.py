@@ -975,7 +975,8 @@ def _dispatch_admitted(
                 # The stall clock starts when the runner starts; a unit queued behind a full pool is not stalled.
                 rec.update(_started=True, _progress_ts=time.time())
         try:
-            result = runner() or {}
+            with retirement.worker_thread_scope():
+                result = runner() or {}
             status = classify(result)
         except Exception as exc:
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
@@ -987,12 +988,12 @@ def _dispatch_admitted(
 
     # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
     # reservation too: the stall monitor may finalize its registry record before it really exits.
-    retirement.acquire()
+    retirement.acquire(bind_thread=False)
     try:
         future = executor.submit(propagate_context_to_thread(_worker))
-        future.add_done_callback(lambda _: retirement.release())
+        future.add_done_callback(lambda _: retirement.release(bind_thread=False))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        retirement.release()
+        retirement.release(bind_thread=False)
         with _records_lock:
             _records.pop(delegation_id, None)
         if remote := worker_ledger():

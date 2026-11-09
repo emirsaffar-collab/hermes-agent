@@ -1304,10 +1304,20 @@ def _run_prompt_submit(
                 _reopen_routed_session_row(routing_db, sid, session)
             can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
     if not can_start:
+        closing = False
         with session["history_lock"]:
+            closing = bool(session.get("_closing"))
             session["running"] = False
+            session.pop("_submit_user_row", None)
             if session.get(SESSION_KEY) is segments:
                 session.pop(SESSION_KEY)
+        if not closing and not muted:
+            _emit_terminal_turn_error(
+                sid, session, "backend is retiring; reconnect to continue",
+                error_surface={"layer": "runtime", "code": "backend_retiring", "retryable": True},
+                retire_marker=False)
+        else:
+            _clear_inflight_turn(session)
     return can_start
 
 
