@@ -197,6 +197,7 @@ def run_tool_round(
     maybe_prepare(agent, messages, origin="tool-batch")
 
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+    _rehydrate_scrubbed_assistant_msg(agent, assistant_msg, messages)
     from hermes_cli.observability.shared_metrics_harness import finish_tool_round
 
     finish_tool_round(agent)
@@ -346,3 +347,54 @@ def stage_tool_call_message(
         and agent._interim_assistant_visible_text(previous_msg) == current_interim_visible
     )
     return assistant_msg, duplicate_previous_interim
+
+
+def _rehydrate_scrubbed_assistant_msg(
+    agent: Any, assistant_msg: dict[str, Any], messages: list[dict[str, Any]]
+) -> None:
+    """When a pre_tool_call hook (secret-value-guard) blocks a tool call and scrubs the
+    pre-flushed assistant row in state.db on disk, sync the scrubbed fields back into the
+    in-memory assistant_msg so the next mid-turn API call does not send the raw secret to
+    OpenRouter and trigger HTTP 403 content_policy_blocked failover (#CF70)."""
+    if not isinstance(assistant_msg, dict) or not isinstance(messages, list):
+        return
+    try:
+        idx = next((i for i in range(len(messages) - 1, -1, -1) if messages[i] is assistant_msg), -1)
+        if idx < 0:
+            return
+        if not any(
+            isinstance(m, dict)
+            and m.get("role") == "tool"
+            and "secret-value-guard" in str(m.get("content") or "")
+            for m in messages[idx + 1 :]
+        ):
+            return
+        db = getattr(agent, "_session_db", None)
+        sid = getattr(agent, "session_id", None)
+        read_all = getattr(db, "_read_all", None) if db is not None else None
+        if not sid or not callable(read_all):
+            return
+        rows = read_all(
+            "SELECT content, tool_calls, reasoning, reasoning_content, reasoning_details "
+            "FROM messages WHERE session_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1",
+            (sid,),
+        )
+        if not rows:
+            return
+        c_val, tc_val, r_val, rc_val, rd_val = rows[0]
+        if isinstance(c_val, str) and "content" in assistant_msg:
+            assistant_msg["content"] = c_val
+        if isinstance(tc_val, str) and tc_val.strip():
+            parsed_tc = json.loads(tc_val)
+            if isinstance(parsed_tc, list):
+                assistant_msg["tool_calls"] = parsed_tc
+        for col_key, raw_val in (("reasoning", r_val), ("reasoning_content", rc_val)):
+            if isinstance(raw_val, str) and col_key in assistant_msg:
+                assistant_msg[col_key] = raw_val
+        if isinstance(rd_val, str) and rd_val.strip() and "reasoning_details" in assistant_msg:
+            parsed_rd = json.loads(rd_val)
+            if isinstance(parsed_rd, list):
+                assistant_msg["reasoning_details"] = parsed_rd
+    except Exception:
+        logger.debug("Mid-turn scrubbed assistant message rehydration failed open", exc_info=True)
+

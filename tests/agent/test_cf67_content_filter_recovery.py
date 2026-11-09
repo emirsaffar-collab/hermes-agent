@@ -366,3 +366,38 @@ def test_adopt_out_of_band_turns_reloads_history_on_in_place_secret_scrub(tmp_pa
     assert session["history"][1]["content"] == "Container 0x3d19…bfbf started"
 
 
+def test_mid_turn_secret_value_guard_block_rehydrates_scrubbed_assistant_msg_in_memory():
+    import json
+    from agent.turn_tool_round import _rehydrate_scrubbed_assistant_msg
+
+    raw_tc = [{"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": '{"content":"0x' + ("948fa1b2" * 8) + '"}'}}]
+    scrubbed_tc = [{"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": '{"content":"0x948f…a1b2"}'}}]
+
+    class _StubDB:
+        def _read_all(self, sql, params):
+            assert params == ("sess_midturn_1",)
+            return [("", json.dumps(scrubbed_tc), "scrubbed reasoning 0x948f…a1b2", "scrubbed reasoning 0x948f…a1b2", None)]
+
+    agent = SimpleNamespace(session_id="sess_midturn_1", _session_db=_StubDB())
+
+    # Negative control: normal tool result without secret-value-guard block does not query DB or mutate assistant_msg
+    assistant_neg = {"role": "assistant", "content": "", "tool_calls": list(raw_tc), "reasoning": "raw"}
+    msgs_neg = [{"role": "user", "content": "hi"}, assistant_neg, {"role": "tool", "tool_call_id": "c1", "content": "ok"}]
+    _rehydrate_scrubbed_assistant_msg(agent, assistant_neg, msgs_neg)
+    assert assistant_neg["tool_calls"] == raw_tc
+    assert assistant_neg["reasoning"] == "raw"
+
+    # Positive control: tool result blocked by secret-value-guard rehydrates scrubbed tool_calls & reasoning in-memory
+    assistant_pos = {"role": "assistant", "content": "", "tool_calls": list(raw_tc), "reasoning": "raw", "reasoning_content": "raw"}
+    msgs_pos = [
+        {"role": "user", "content": "hi"},
+        assistant_pos,
+        {"role": "tool", "tool_call_id": "c1", "content": '{"error": "BLOCKERAD (secret-value-guard): argumentet till write_file"}'},
+    ]
+    _rehydrate_scrubbed_assistant_msg(agent, assistant_pos, msgs_pos)
+    assert assistant_pos["tool_calls"] == scrubbed_tc
+    assert assistant_pos["reasoning"] == "scrubbed reasoning 0x948f…a1b2"
+    assert assistant_pos["reasoning_content"] == "scrubbed reasoning 0x948f…a1b2"
+
+
+
