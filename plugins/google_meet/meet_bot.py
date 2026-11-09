@@ -31,23 +31,28 @@ from typing import Optional
 from hermes_cli.browser_runtime import chromium_executable
 from utils import atomic_json_write
 
-# Short three-segment code, a lookup URL, or /new. Anything else is rejected.
+# Short three-segment code, a lookup URL, /new, or a Microsoft Teams meeting URL.
 MEET_URL_RE = re.compile(
-    r"^https://meet\.google\.com/([a-z0-9]{3,}-[a-z0-9]{3,}-[a-z0-9]{3,}|lookup/[^/?#]+|new)"
+    r"^https://(?:meet\.google\.com/([a-z0-9]{3,}-[a-z0-9]{3,}-[a-z0-9]{3,}|lookup/[^/?#]+|new)|teams\.(?:microsoft|live)\.com/(?:meet|l/meetup-join)/[^/?#\s]+)"
     r"(?:[/?#].*)?$")
 
 _FFMPEG_MISSING = "ffmpeg not found — install via `brew install ffmpeg` for realtime on macOS"
 
 
 def _is_safe_meet_url(url: str) -> bool:
-    """True if *url* is a Google Meet URL we're willing to navigate to."""
+    """True if *url* is a Google Meet or Microsoft Teams meeting URL we're willing to navigate to."""
     return isinstance(url, str) and bool(MEET_URL_RE.match(url.strip()))
 
 
 def _meeting_id_from_url(url: str) -> str:
-    """3-segment meeting code, or a timestamped id for ``/lookup/...`` and ``/new``."""
+    """3-segment meeting code, teams-<id>, or a timestamped id for ``/lookup/...`` and ``/new``."""
     m = re.search(r"meet\.google\.com/([a-z0-9]{3,}-[a-z0-9]{3,}-[a-z0-9]{3,})", url or "")
-    return m.group(1) if m else f"meet-{int(time.time())}"
+    if m:
+        return m.group(1)
+    mt = re.search(r"teams\.(?:microsoft|live)\.com/meet/([A-Za-z0-9_-]+)", url or "")
+    if mt:
+        return f"teams-{mt.group(1)[:16]}"
+    return f"meet-{int(time.time())}"
 
 
 def _quiet(fn, *args, **kwargs):
@@ -303,6 +308,7 @@ class _RtcTranscriber:
         self.cfg, self.state, self.stop = cfg, state, stop_flag
         self._queue = deque()          # (stream_id, Path)
         self._lock = threading.Lock()
+        self._whisper_lock = threading.Lock()
         self.threads = []
         self._last_text = {}
         self._transcribed = {}         # stream_id → samples already transcribed
@@ -334,9 +340,28 @@ class _RtcTranscriber:
         c.close()
         return np.frombuffer(bytes(pcm), dtype=np.int16).astype(np.float32) / 32768.0
 
+    def _merge_fragment_immediately(self, stream_id: int, path: Path) -> int:
+        merged = self.cfg.out_dir / "audio" / f"stream_{stream_id:02d}.webm"
+        merged.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            data = path.read_bytes()
+            if data.startswith(self._EBML_MAGIC):
+                cluster = data.find(self._CLUSTER_ID)
+                if merged.exists() and merged.stat().st_size > 0 and cluster > 0:
+                    data = data[cluster:]
+            with merged.open("ab") as f:
+                f.write(data)
+            self.state.set(audio_fragments=self.state.audio_fragments + 1)
+            _quiet(path.unlink)
+            return len(data)
+        except Exception as e:
+            sys.stderr.write(f"meet rtc: merge {path.name} failed: {e}\n")
+            return 0
+
     def submit(self, stream_id: int, path: Path) -> None:
         with self._lock:
-            self._queue.append((stream_id, path))
+            nbytes = self._merge_fragment_immediately(stream_id, path)
+            self._queue.append((stream_id, nbytes))
         alive = any(t.name == f"meet-rtc-{stream_id}" and t.is_alive() for t in self.threads)
         if not alive:
             t = threading.Thread(target=self._worker, args=(stream_id,),
@@ -369,21 +394,8 @@ class _RtcTranscriber:
                     fresh_bytes, last_flush = 0, time.time()
                 time.sleep(0.5)
                 continue
-            _, path = item
-            try:
-                data = path.read_bytes()
-                if data.startswith(self._EBML_MAGIC):
-                    cluster = data.find(self._CLUSTER_ID)
-                    # first fragment keeps its header; re-headers are stripped to Cluster
-                    if merged.exists() and merged.stat().st_size > 0 and cluster > 0:
-                        data = data[cluster:]
-                with merged.open("ab") as f:
-                    f.write(data)
-                fresh_bytes += len(data)
-                self.state.set(audio_fragments=self.state.audio_fragments + 1)
-                _quiet(path.unlink)  # only delete once safely merged
-            except Exception as e:
-                sys.stderr.write(f"meet rtc: merge {path.name} failed: {e}\n")
+            _, nbytes = item
+            fresh_bytes += int(nbytes or 0)
             if fresh_bytes > 400_000 or time.time() - last_flush > 15:
                 self._flush_stream(stream_id, merged, label)
                 fresh_bytes, last_flush = 0, time.time()
@@ -423,13 +435,16 @@ class _RtcTranscriber:
             if lang_env == "auto":
                 lang_env = None
             prompt_env = os.environ.get("HERMES_MEET_INITIAL_PROMPT", "").strip() or self._last_text.get(stream_id) or None
-            segs, _info = model.transcribe(
-                tail,
-                language=lang_env,
-                vad_filter=True,
-                condition_on_previous_text=False,
-                initial_prompt=prompt_env,
-            )
+            with self._whisper_lock:
+                segs_iter, _info = model.transcribe(
+                    tail,
+                    language=lang_env,
+                    vad_filter=True,
+                    beam_size=1,
+                    condition_on_previous_text=False,
+                    initial_prompt=prompt_env,
+                )
+                segs = list(segs_iter)
             for s in segs:
                 text = (s.text or "").strip()
                 if text:
@@ -504,34 +519,57 @@ _ENABLE_CAPTIONS_JS = (
     "{ key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true })); return true; })();")
 
 _LEAVE_CALL_JS = (
-    "() => { const b = document.querySelector('button[aria-label*=\"eave call\" i], button[aria-label*=\"ämna samtal\" i], button[aria-label*=\"Avsluta samtal\" i]');"
+    "() => { const b = document.querySelector('button[aria-label*=\"eave call\" i], button[aria-label*=\"ämna samtal\" i], button[aria-label*=\"Avsluta samtal\" i], button[id=\"hangup-button\"], button[data-tid=\"hangup-main-btn\"], button[data-tid*=\"hangup\" i]');"
     " if (b) b.click(); }")
 
 # True once past the lobby: leave button, caption region (once our observer is installed)
-# or participant list visible (supports both English and Swedish Meet UI).
+# or participant list visible (supports both English and Swedish Meet UI + Microsoft Teams web UI).
 _ADMISSION_PROBE_JS = r"""
     (() => {
-      if (document.querySelector('button[aria-label*="eave call" i], button[aria-label*="ämna samtal" i], button[aria-label*="Avsluta samtal" i]')) return true;
+      const bodyTxt = document.body ? (document.body.innerText || '') : '';
+      if (/Vi har meddelat personerna i mötet att du väntar|Someone in the meeting should let you in soon|Vi släpper in dig snart|Väntar i lobbyn|Waiting in lobby/i.test(bodyTxt)) return false;
+      if (document.querySelector('button[aria-label*="eave call" i], button[aria-label*="ämna samtal" i], button[aria-label*="Avsluta samtal" i], button[id="hangup-button"], button[data-tid="hangup-main-btn"], button[data-tid*="hangup" i]')) return true;
       if (window.__hermesMeetInstalled && document.querySelector(
           '[role="region"][aria-label*="aption" i], [role="region"][aria-label*="textning" i], div[jsname="YSxPC"], div[jsname="tgaKEf"]')) return true;
       return !!document.querySelector('[aria-label*="articipants" i]');
     })();
     """
 
-# Count of participant tiles / badge in call (returns 1 when bot is alone in call).
+# Count of HUMAN participant tiles in call (returns 1 when bot is alone or only with other notetaker bots like tl;dv).
 _PARTICIPANT_COUNT_JS = r"""
     (() => {
-      const tiles = document.querySelectorAll('[data-participant-id], [data-requested-participant-id]');
-      if (tiles && tiles.length > 0) return tiles.length;
       const bodyTxt = document.body ? (document.body.innerText || '') : '';
-      if (/Det finns ingen annan här|You're the only one here|Ingen annan är här/i.test(bodyTxt)) return 1;
+      if (/Det finns ingen annan här|You're the only one here|Ingen annan är här|Väntar på att andra ska ansluta|Waiting for others to join/i.test(bodyTxt)) return 1;
+      const botRe = /(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant|fireflies|otter\.ai|fathom|read\.ai|gemini\s+notes|meeting\s+bot|recording\s+bot)/i;
+      const selfRe = /^(\s*(du|you|mig|me)\s*)$/i;
+      const tiles = Array.from(document.querySelectorAll('[data-participant-id], [data-cid="calling-participant-stream"], [data-tid="roster-participant"]'));
+      if (tiles.length > 0) {
+        const seenIds = new Set();
+        let humanOtherCount = 0;
+        for (const t of tiles) {
+          const pid = t.getAttribute('data-participant-id') || t.getAttribute('data-tid') || t.id || '';
+          if (pid && seenIds.has(pid) && pid !== 'roster-participant') continue;
+          if (pid) seenIds.add(pid);
+          const selfName = (t.getAttribute('data-self-name') || '').trim();
+          const rawTxt = (t.innerText || t.textContent || '').trim();
+          const aria = (t.getAttribute('aria-label') || '').trim();
+          const combined = `${selfName} ${rawTxt} ${aria}`.trim();
+          if (!combined) continue;
+          if (botRe.test(combined)) continue;
+          const lines = rawTxt.split(/\n+/).map(s => s.trim()).filter(Boolean);
+          if (lines.length > 0 && lines.every(l => selfRe.test(l) || botRe.test(l))) continue;
+          if (selfRe.test(selfName) || selfRe.test(rawTxt)) continue;
+          humanOtherCount += 1;
+        }
+        return 1 + humanOtherCount;
+      }
       return 2;
     })();
     """
 _DENIED_PROBE_JS = r"""
     (() => {
       const text = document.body ? document.body.innerText || '' : '';
-      return /You can't join this video call|You were removed from the meeting|No one responded to your request to join|Du kan inte gå med i det här videosamtalet|Du har tagits bort från mötet|Ingen svarade på din förfrågan/i.test(text);
+      return /You can't join this video call|You were removed from the meeting|No one responded to your request to join|Du kan inte gå med i det här videosamtalet|Du har tagits bort från mötet|Ingen svarade på din förfrågan|Samtalet har avslutats|Call ended|Mötet har avslutats|The meeting has ended|Vi kunde inte släppa in dig|Sorry, we couldn't connect you|Ingen släppte in dig|No one let you in/i.test(text);
     })();
     """
 
@@ -725,12 +763,48 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> Non
             if dlg is not None:
                 _quiet(lambda: (dlg.click(timeout=2_000, no_wait_after=True), True))
                 _quiet(page.wait_for_timeout, 1_500)
-        # Camera off: the fake-cam tile is visually disruptive to participants (EN + SV).
+        # Microsoft Teams web launcher & pre-join screen handling
+        if "teams.microsoft.com" in page.url or "teams.live.com" in page.url or "teams." in cfg.url:
+            for web_sel in (
+                'button[data-tid="joinOnWeb"]',
+                'button:has-text("Continue on this browser")',
+                'button:has-text("Fortsätt i den här webbläsaren")',
+                'button:has-text("Join on the web instead")',
+                'button:has-text("Anslut på webben i stället")',
+            ):
+                wbtn = _visible(page.locator(web_sel))
+                if wbtn is not None:
+                    _quiet(lambda: (wbtn.click(timeout=2_000, no_wait_after=True), True))
+                    _quiet(page.wait_for_timeout, 2_000)
+                    break
+            t_name = _visible(page.locator('input[data-tid="prejoin-display-name-input"]'))
+            if t_name is not None:
+                teams_guest = re.sub(r"&", " och ", cfg.guest_name or "Ur och Penn Mötesanteckningar")
+                teams_guest = re.sub(r"[^\w\s\-'._@]", "", teams_guest, flags=re.UNICODE)
+                teams_guest = re.sub(r"\s+", " ", teams_guest).strip() or "Ur och Penn Motesanteckningar"
+                _quiet(t_name.click, timeout=2_000)
+                _quiet(t_name.fill, teams_guest, timeout=2_000)
+            for t_toggle in ('input[data-tid="toggle-video"]', 'input[data-tid="toggle-mute"]'):
+                tog = _visible(page.locator(t_toggle))
+                if tog is not None and _quiet(tog.is_checked):
+                    _quiet(lambda: (tog.click(timeout=2_000, no_wait_after=True), True))
+            t_join = _visible(page.locator('button[data-tid="prejoin-join-button"]'))
+            if t_join is not None and _quiet(t_join.is_enabled) and _quiet(lambda: (t_join.click(timeout=3_000, no_wait_after=True), True)):
+                state.set(lobby_waiting=True)
+                return
+
+        # Camera and microphone off on pre-join screen (EN + SV).
         for cam_label in ("Turn off camera", "Slå av kameran", "Stäng av kameran", "Slå av kamera"):
             cam_off = _visible(page.get_by_role("button", name=cam_label, exact=False))
             if cam_off is not None:
                 _quiet(lambda: (cam_off.click(timeout=2_000, no_wait_after=True), True))
                 break
+        if cfg.rtc_audio and not cfg.realtime:
+            for mic_label in ("Turn off microphone", "Slå av mikrofonen", "Stäng av mikrofonen", "Slå av mikrofon", "Stäng av mikrofon"):
+                mic_off = _visible(page.get_by_role("button", name=mic_label, exact=False))
+                if mic_off is not None:
+                    _quiet(lambda: (mic_off.click(timeout=2_000, no_wait_after=True), True))
+                    break
         name_box = _visible(page.locator('input[aria-label*="name" i], input[aria-label*="namn" i]'))
         if name_box is not None:
             _quiet(name_box.fill, cfg.guest_name, timeout=2_000)
@@ -772,7 +846,7 @@ def _ensure_mic_muted(page) -> str:
     """RTC-capture mirror of ``_ensure_mic_on``: a transcribing bot must NEVER broadcast
     room audio from a real mic — mute on admission. Returns ``muted_clicked``/``muted``/``unknown``."""
     live = _visible(page.locator('button[aria-label*="Turn off microphone" i], button[aria-label*="Slå av mikrofon" i], button[aria-label*="Inaktivera mikrofon" i], button[aria-label*="Stäng av mikrofon" i]'))
-    if live is not None and _quiet(lambda: (live.click(timeout=3_000), True)):
+    if live is not None and _quiet(lambda: (live.click(timeout=3_000, no_wait_after=True), True)):
         return "muted_clicked"
     if _visible(page.locator('button[aria-label*="Turn on microphone" i], button[aria-label*="Slå på mikrofon" i], button[aria-label*="Aktivera mikrofon" i]')) is not None:
         return "muted"
@@ -808,21 +882,27 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                 return
         elif state.in_call and (now - last_admission_check) > 5.0:
             last_admission_check = now
+            if state.mic_state == "unknown" and cfg.rtc_audio and not rt["enabled"]:
+                m_st = _ensure_mic_muted(page)
+                if m_st != "unknown":
+                    state.set(mic_state=m_st)
+            if _probe(page, _DENIED_PROBE_JS):
+                state.set(leave_reason="kicked_or_ended")
+                return
             pcount = _quiet(page.evaluate, _PARTICIPANT_COUNT_JS) or 2
             if isinstance(pcount, int) and pcount >= 2:
                 had_other_participants = True
                 alone_since = None
-            elif (
-                had_other_participants
-                and isinstance(pcount, int)
-                and pcount <= 1
-                and state.joined_at
-                and (now - state.joined_at) >= 300.0
-            ):
-                if alone_since is None:
-                    alone_since = now
-                elif (now - alone_since) >= 120.0:
-                    print(f"[meet_bot] leave_reason=everyone_left alone_s={now - alone_since:.1f}", flush=True)
+            elif isinstance(pcount, int) and pcount <= 1:
+                if had_other_participants:
+                    if alone_since is None:
+                        alone_since = now
+                    elif (now - alone_since) >= 12.0:
+                        print(f"[meet_bot] leave_reason=everyone_left alone_s={now - alone_since:.1f}", flush=True)
+                        state.set(leave_reason="everyone_left")
+                        return
+                elif state.joined_at and (now - state.joined_at) >= 300.0:
+                    print(f"[meet_bot] leave_reason=everyone_left empty_from_start_s={now - state.joined_at:.1f}", flush=True)
                     state.set(leave_reason="everyone_left")
                     return
         try:
@@ -958,17 +1038,18 @@ def run_bot() -> int:
             if rt["enabled"]:
                 _start_realtime_speaker(rt, cfg, stop_flag, state)
             _drain_loop(page, cfg, state, rt, stop_flag)
-            # Stop the recorders so MediaRecorder flushes a final fragment, then let the
-            # transcriber workers drain their queues before the process tears down.
+            # Stop the recorders so MediaRecorder flushes a final fragment, hang up and close
+            # the browser IMMEDIATELY so the bot leaves the call right away, then drain workers.
             if cfg.rtc_audio:
                 _quiet(page.evaluate, "window.__hermesMeetRtcStop && window.__hermesMeetRtcStop()")
-                page.wait_for_timeout(1500)
+                _quiet(page.wait_for_timeout, 1500)
+            _quiet(page.evaluate, _LEAVE_CALL_JS)
+            _quiet(context.close)
+            _quiet(browser.close)
+            if cfg.rtc_audio:
                 stop_flag["stop"] = True
                 for t in rtc["transcriber"].threads:
-                    _quiet(t.join, timeout=30.0)
-            _quiet(page.evaluate, _LEAVE_CALL_JS)
-            context.close()
-            browser.close()
+                    _quiet(t.join, timeout=8.0)
             _teardown_realtime(rt)
             state.set(in_call=False, captioning=False, rtc_capturing=False, exited=True)
             return 0
