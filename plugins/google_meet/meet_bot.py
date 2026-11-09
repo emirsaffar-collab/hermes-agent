@@ -91,7 +91,7 @@ class _BotState:
         out_dir.mkdir(parents=True, exist_ok=True)
         self._flush()
 
-    def record_caption(self, speaker: str, text: str) -> None:
+    def record_caption(self, speaker: str, text: str, offset_s: Optional[float] = None) -> None:
         """Append a caption line unless this exact (speaker, text) was already seen."""
         speaker, text = (speaker or "").strip() or "Unknown", (text or "").strip()
         key = f"{speaker}|{text}"
@@ -99,8 +99,11 @@ class _BotState:
             return
         self._seen.add(key)
         self.transcript_lines += 1
-        self.last_caption_at = time.time()
-        ts = time.strftime("%H:%M:%S", time.localtime(self.last_caption_at))
+        now_ts = time.time()
+        self.last_caption_at = now_ts
+        anchor = self.joined_at or self.join_attempted_at
+        cap_epoch = (float(anchor) + float(offset_s)) if (offset_s is not None and anchor) else now_ts
+        ts = time.strftime("%H:%M:%S", time.localtime(cap_epoch))
         with self.transcript_path.open("a", encoding="utf-8") as f:
             f.write(f"[{ts}] {speaker}: {text}\n")
         self._flush()
@@ -445,10 +448,12 @@ class _RtcTranscriber:
                     initial_prompt=prompt_env,
                 )
                 segs = list(segs_iter)
+            base_offset_s = float(done) / 16000.0
             for s in segs:
                 text = (s.text or "").strip()
                 if text:
-                    self.state.record_caption(speaker=label, text=text)
+                    seg_offset_s = base_offset_s + float(getattr(s, "start", 0.0) or 0.0)
+                    self.state.record_caption(speaker=label, text=text, offset_s=seg_offset_s)
                     self._last_text[stream_id] = text
         except Exception as e:
             sys.stderr.write(f"meet rtc: transcribe {merged.name} failed: {e}\n")
@@ -1049,7 +1054,7 @@ def run_bot() -> int:
             if cfg.rtc_audio:
                 stop_flag["stop"] = True
                 for t in rtc["transcriber"].threads:
-                    _quiet(t.join, timeout=8.0)
+                    _quiet(t.join, timeout=45.0)
             _teardown_realtime(rt)
             state.set(in_call=False, captioning=False, rtc_capturing=False, exited=True)
             return 0
