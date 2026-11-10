@@ -186,9 +186,14 @@ from plugins.platforms.telegram.telegram_ingress import TelegramContactMixin
 from plugins.platforms.telegram.telegram_replacement import TelegramReplacementMixin
 from plugins.platforms.telegram.telegram_polling_probe import TelegramPendingProbeMixin
 from plugins.platforms.telegram.telegram_intake import effective_update_message
-from plugins.platforms.telegram.telegram_media_group import add_item_note, flush_media_group_event, queue_media_group_event, tracking_album_items
+from plugins.platforms.telegram.telegram_media_group import add_item_note, flush_media_group_event, queue_media_group_event
+from plugins.platforms.telegram.telegram_text_photo_pairing import (
+    IMAGE_EXTENSIONS as _TELEGRAM_IMAGE_EXTENSIONS, absorb_claimed_text, claim_pending_text, is_image_document, tracking_media_items,
+    wait_text_flush)
 from plugins.platforms.telegram.telegram_media_flood import TelegramMediaFloodMixin
 from plugins.platforms.telegram import telegram_flood_window as _flood_window
+from plugins.platforms.telegram.telegram_media_fetch import (
+    cache_replied_media, fetch_telegram_file, merged_typed_text, record_typed_text)
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, log_resolved, tap_matches_prompt
@@ -207,7 +212,6 @@ from plugins.platforms.telegram.telegram_picker_labels import model_button_label
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
 from utils import env_float, env_int
 
-_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif", ".avif"}
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
 # closed with ``flood_control:{wait}`` so the caller's retry machinery owns the wait.
 # Longer server penalties fail closed with a ``flood_control:{wait}`` SendResult so the caller's retry
@@ -5727,8 +5731,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if not (0 < self._int_or_zero(file_size) <= getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)):
             return "oversized", file_size
         try:
-            file_obj = await source.get_file()
-            data = bytes(await file_obj.download_as_bytearray())
+            file_obj, data = await fetch_telegram_file(source, what)
             if not filename:
                 filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
             cached = await cache_media_bytes_async(data, filename=filename, mime_type=mime, default_kind=kind)
@@ -5758,27 +5761,20 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             event.media_text_inlined = []
             self._attach_cached(event, cached, observed_media_note(cached), "[Telegram] Cached observed group %s at %s")
 
-    def _attach_cached(self, event: MessageEvent, cached, note: str, log_fmt: str) -> None:
-        """Append a cached attachment to the event (message type follows the kind only for the first one)."""
+    def _attach_cached(self, event: MessageEvent, cached, note: str, log_fmt: str, *, retype: bool = True) -> None:
+        """Append a cached attachment to the event (with ``retype``, the first one's kind sets the message type)."""
         from plugins.platforms.telegram.telegram_batching import pad_inline_flags
         event.media_text_inlined = pad_inline_flags(event) + [False]
         event.media_urls.append(cached.path)
         event.media_types.append(cached.media_type)
-        if len(event.media_urls) == 1 and cached.kind in self._CACHED_KIND_TO_MESSAGE_TYPE:
+        if retype and len(event.media_urls) == 1 and cached.kind in self._CACHED_KIND_TO_MESSAGE_TYPE:
             event.message_type = self._CACHED_KIND_TO_MESSAGE_TYPE[cached.kind]
         event.text = self._append_observed_note(event.text, note)
         logger.info(log_fmt, cached.kind, cached.path)
 
     async def _cache_replied_media(self, msg: Any, event: MessageEvent) -> None:
-        """Cache media from the message this turn replies to, if any."""
-        reply_msg = getattr(msg, "reply_to_message", None)
-        if reply_msg is None:
-            return
-        status, cached = await self._download_observed_media(reply_msg, "replied-to media")
-        if status == "ok":
-            self._attach_cached(
-                event, cached, f"[Replied-to {cached.kind} '{cached.display_name}' saved at: {cached.path}]",
-                "[Telegram] Cached replied-to %s at %s")
+        """Cache media from the message this turn replies to, if any (see telegram_media_fetch)."""
+        await cache_replied_media(self, msg, event)
 
     def _observed_media_source(self, msg: Message):
         """Return (telegram_file_source, filename, mime, default_kind) or Nones."""
@@ -6040,17 +6036,21 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if self._should_drop_delayed_delivery():
             self._hold_inbound_event(event, where="text-enqueue")
             return
+        existing = self._pending_text_batches.get(self._text_batch_key(event))
+        before, merged = getattr(existing, "text", None), merged_typed_text(existing, event)
         super()._enqueue_text_event(event)
+        if merged is not None and existing.text != before:  # merged (not dropped)
+            record_typed_text(existing, merged)
         self._accept_update()
 
-    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None) -> None:
-        """Shared delayed-flush body: sleep, pop, hold if teardown started, else dispatch. A cancel after
-        the pop but before durable dispatch re-holds the event (never lose it)."""
+    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None, pause=None) -> None:
+        """Shared delayed-flush body: sleep (or ``pause(delay)``), pop, hold if teardown started, else dispatch.
+        A cancel after the pop but before durable dispatch re-holds the event (never lose it)."""
         current_task = asyncio.current_task()
         committed = self.__dict__.setdefault("_committed_flush_tasks", {})
         event = None
         try:
-            await asyncio.sleep(delay)
+            await (pause or asyncio.sleep)(delay)
             # Superseded flush (a newer chunk re-armed the timer while our sleep was already done):
             # CancelledError only lands at the next await, so check synchronously before the pop.
             owner = tasks.get(key)
@@ -6098,13 +6098,12 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         return self._text_batch_delay_seconds
 
     async def _flush_text_batch(self, key: str) -> None:
-        """Telegram keeps its own flush body: a cancel after the pop must HOLD the event and re-raise
-        (PTB already acked the update; the hold queue redispatches after reconnect) rather than shield
-        the dispatch — teardown must be able to stop a flush from reaching a torn-down session."""
+        """Own flush body (a cancel after the pop HOLDs the event: PTB acked it); a claiming image holds it (#33270)."""
         await self._flush_buffered(
             self._pending_text_batches, self._pending_text_batch_tasks, key,
             self._text_batch_delay_for(self._pending_text_batches.get(key)), "text",
-            lambda ev: logger.info("[Telegram] Flushing text batch %s (%d chars)", key, len(ev.text or "")))
+            lambda ev: logger.info("[Telegram] Flushing text batch %s (%d chars)", key, len(ev.text or "")),
+            pause=lambda delay: wait_text_flush(self, key, delay))
 
     # -- Photo batching --
 
@@ -6121,10 +6120,13 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             self._pending_photo_batches, self._pending_photo_batch_tasks, batch_key, self._media_batch_delay_seconds, "photo",
             lambda ev: logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(ev.media_urls)))
 
-    def _merge_into_pending(self, pending: dict, key: str, event: MessageEvent) -> None:
-        """Merge ``event`` into ``pending[key]`` (media, caption, reply expectation) or seed it."""
-        from plugins.platforms.telegram.telegram_batching import merge_batched_event
-        merge_batched_event(pending, key, event, merge_caption=self._merge_caption)
+    def _merge_into_pending(self, pending: dict, key: str, event: MessageEvent) -> str:
+        """Merge ``event`` into ``pending[key]`` (media, caption, reply expectation) or seed it; return the lane used."""
+        from plugins.platforms.telegram.telegram_batching import merge_batched_event, resolve_routing
+        resolve_routing(self, event)  # routed BEFORE it may join a batch: one resolved session key per batch
+        return merge_batched_event(pending, key, event, merge_caption=self._merge_caption,
+                                   route_key=lambda ev: ev.source and self._event_session_key(ev),
+                                   reroute=lambda ev: resolve_routing(self, ev, unbound_again=True))
 
     def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
@@ -6132,7 +6134,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if self._should_drop_delayed_delivery():
             self._hold_inbound_event(event, where="photo-enqueue")
             return
-        self._merge_into_pending(self._pending_photo_batches, batch_key, event)
+        batch_key = self._merge_into_pending(self._pending_photo_batches, batch_key, event)
         self._accept_update()
         prior_task = self._pending_photo_batch_tasks.get(batch_key)
         if prior_task and not prior_task.done():
@@ -6144,10 +6146,12 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if self._drop_unresolved(event):  # identity FIRST: the batch lane is derived from it
             return
         media_group_id = getattr(msg, "media_group_id", None)
+        burst_key = "" if media_group_id else self._photo_batch_key(event, msg)  # pre-absorb: one lane per burst
+        absorb_claimed_text(self, msg, event)  # the question typed just before this image joins its turn (and topic)
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
         else:
-            self._enqueue_photo_event(self._photo_batch_key(event, msg), event)
+            self._enqueue_photo_event(burst_key, event)
 
     @staticmethod
     def _ext_from_path(file_path: Optional[str], candidates, default: str) -> str:
@@ -6169,8 +6173,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 self._note_instead_of_media(event, note or "")
                 logger.info("[Telegram] Skipped oversized user %s (size=%s)", kind, getattr(source, "file_size", None))
                 return
-            file_obj = await source.get_file()
-            data = await file_obj.download_as_bytearray()
+            file_obj, data = await fetch_telegram_file(source, f"user {kind}")
             if kind == "video":
                 ext = self._ext_from_path(getattr(file_obj, "file_path", None), SUPPORTED_VIDEO_TYPES, ext)
                 cached_path = await cache_video_from_bytes_async(bytes(data), ext=ext)
@@ -6216,9 +6219,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 return self._note_instead_of_media(
                     event, f"Document '{display}' is too large or its size could not be verified. Maximum: {self._max_doc_bytes // (1024 * 1024)} MB.")
             # Screenshots/photos sent as documents take the image cache + batching path.
-            if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
-                file_obj = await doc.get_file()
-                image_bytes = await file_obj.download_as_bytearray()
+            if is_image_document(doc) or ext in _TELEGRAM_IMAGE_EXTENSIONS:
+                _, image_bytes = await fetch_telegram_file(doc, "image document")
                 image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
                 try:
                     cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=image_ext)
@@ -6241,16 +6243,14 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     image_mime_to_ext.setdefault(_mime, _ext)
                 ext = image_mime_to_ext.get(doc.mime_type, "")
             if ext in SUPPORTED_VIDEO_TYPES:
-                file_obj = await doc.get_file()
-                video_bytes = await file_obj.download_as_bytearray()
+                _, video_bytes = await fetch_telegram_file(doc, "video document")
                 self._set_cached_media(
                     event, await cache_video_from_bytes_async(bytes(video_bytes), ext=ext), SUPPORTED_VIDEO_TYPES[ext], MessageType.VIDEO,
                     "[Telegram] Cached user video document at %s")
                 return False  # the caller's tail dispatches (album queue for an album item)
             # Any file type is accepted (authorization is the gate, not the extension); unknown types get
             # application/octet-stream. Image documents already returned above.
-            file_obj = await doc.get_file()
-            raw_bytes = bytes(await file_obj.download_as_bytearray())
+            _, raw_bytes = await fetch_telegram_file(doc, "document")
             from gateway.platforms.base import cache_media_bytes_async
             cached = await cache_media_bytes_async(raw_bytes, filename=original_filename or f"document{ext or '.bin'}", mime_type=doc_mime)
             if cached is None:
@@ -6279,7 +6279,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             await self._surface_media_cache_failure(msg, event, "attachment", e, display_name=getattr(doc, "file_name", None) or None)
         return False
 
-    @tracking_album_items
+    @tracking_media_items
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         msg = self._effective_update_message(update)  # channel posts arrive as update.channel_post
@@ -6306,11 +6306,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             await self.handle_message(self._apply_telegram_group_observe_attribution(event))
             return
         event = self._apply_telegram_group_observe_attribution(event)
+        claim_pending_text(self, msg, event)  # before the first await: the question typed just before waits for us
         # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
         if msg.photo:
             try:
-                file_obj = await msg.photo[-1].get_file()  # PhotoSize list sorted by size; largest last
-                image_bytes = await file_obj.download_as_bytearray()
+                file_obj, image_bytes = await fetch_telegram_file(msg.photo[-1], "photo")  # PhotoSize list: largest last
                 ext = self._ext_from_path(file_obj.file_path, [".png", ".webp", ".gif", ".jpeg", ".jpg"], ".jpg")
                 self._set_cached_media(
                     event, await cache_image_from_bytes_async(bytes(image_bytes), ext=ext), f"image/{ext.lstrip('.')}", event.message_type,
@@ -6360,8 +6360,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             return
         fallback = f"a sticker with emoji {emoji}" if emoji else "a sticker"
         try:
-            file_obj = await sticker.get_file()
-            image_bytes = await file_obj.download_as_bytearray()
+            _, image_bytes = await fetch_telegram_file(sticker, "sticker")
             cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=".webp")
             logger.info("[Telegram] Analyzing sticker at %s", cached_path)
             from tools.vision_tools import vision_analyze_tool
