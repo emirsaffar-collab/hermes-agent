@@ -528,7 +528,7 @@ __all__ = [
     "deterministic_call_id", "matches_reasoning_echo_family", "needs_reasoning_echo",
     "normalize_provider_tool_call_ids", "reapply_reasoning_echo", "reasoning_echo_family",
     "reasoning_replay_route", "record_reasoning_field_rejection", "rejected_reasoning_carriers",
-    "route_reasoning_carriers",
+    "repair_message_alternation", "route_reasoning_carriers",
     "sanitize_outbound_kwargs", "stale_thinking_reaches_wire", "strip_images_for_rejecting_model",
     "tool_call_id_variants", "tool_result_id_variants", "uniquify_tool_call_ids",
 ]
@@ -1068,7 +1068,7 @@ def record_reasoning_field_rejection(agent: Any, error_body: Any, sent_messages:
 
 
 def repair_message_alternation(
-    messages: list[dict[str, Any]], *, agent: Any = None
+    messages: list[dict[str, Any]], agent: Any = None
 ) -> tuple[list[dict[str, Any]], int]:
     """Repair malformed role alternation in ``messages`` in-place and return ``(messages, repairs)``.
 

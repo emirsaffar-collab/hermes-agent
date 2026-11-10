@@ -90,6 +90,25 @@ def test_turn_preflight_repairs_alternation_immediately_after_compression():
     assert len(repaired_msgs2) == 1
     assert dummy_agent._last_flushed_db_idx == 1
 
+    # Positional agent argument also supported + exported in __all__
+    from agent import message_sanitization
+    assert "repair_message_alternation" in message_sanitization.__all__
+    msgs_pos = [{"role": "user", "content": "p1"}, {"role": "user", "content": "p2"}]
+    _, repairs_pos = repair_message_alternation(msgs_pos, SimpleNamespace(_last_flushed_db_idx=2))
+    assert repairs_pos == 1
+
+    # AST guard: every lazy `from <mod> import <name>` inside agent/turn_preflight.py must resolve
+    import ast
+    import importlib
+    from pathlib import Path
+
+    tree = ast.parse(Path(turn_preflight.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            mod = importlib.import_module(node.module)
+            for alias in node.names:
+                assert hasattr(mod, alias.name), f"Unresolvable import in turn_preflight.py: from {node.module} import {alias.name}"
+
 
 def test_propagate_context_to_thread_preserves_session_logging_context():
     prev = hermes_logging.get_session_context()
