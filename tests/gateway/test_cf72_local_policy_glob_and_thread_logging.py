@@ -61,12 +61,34 @@ def test_boot_receipts_sql_and_moved_receipts_use_glob_and_skip_local_oneshots()
 
 
 def test_turn_preflight_repairs_alternation_immediately_after_compression():
+    from types import SimpleNamespace
     from agent import turn_preflight
+    from agent.message_sanitization import repair_message_alternation
 
     src_pre = inspect.getsource(turn_preflight.run_preflight_compression)
     src_post = inspect.getsource(turn_preflight.compress_after_tool_results)
     assert "repair_message_alternation" in src_pre
     assert "repair_message_alternation" in src_post
+
+    msgs = [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+    ]
+    repaired_msgs, repairs = repair_message_alternation(msgs)
+    assert repairs == 1
+    assert repaired_msgs is msgs
+    assert len(msgs) == 1
+    assert msgs[0]["content"] == "first\n\nsecond"
+
+    dummy_agent = SimpleNamespace(_last_flushed_db_idx=2, _db_flush_scan_prefix=2)
+    msgs_with_agent = [
+        {"role": "user", "content": "u1"},
+        {"role": "user", "content": "u2"},
+    ]
+    repaired_msgs2, repairs2 = repair_message_alternation(msgs_with_agent, agent=dummy_agent)
+    assert repairs2 == 1
+    assert len(repaired_msgs2) == 1
+    assert dummy_agent._last_flushed_db_idx == 1
 
 
 def test_propagate_context_to_thread_preserves_session_logging_context():

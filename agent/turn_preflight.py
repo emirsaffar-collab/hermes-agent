@@ -184,7 +184,7 @@ def run_preflight_compression(
         else:
             _reset_retry_state_after_compaction(agent)
             from agent.message_sanitization import repair_message_alternation
-            v.messages, _ = repair_message_alternation(v.messages)
+            v.messages, _ = repair_message_alternation(v.messages, agent=agent)
             # Re-baseline the flush cursor: rotation returns None (child flushes
             # whole); in-place returns list(messages) — None would re-append
             # persisted rows. See conversation_history_after_compression().
@@ -364,7 +364,7 @@ def compress_after_tool_results(
             compression_attempts -= 1
         else:
             from agent.message_sanitization import repair_message_alternation
-            messages, _ = repair_message_alternation(messages)
+            messages, _ = repair_message_alternation(messages, agent=agent)
             conversation_history = conversation_history_after_compression(
                 agent, messages, conversation_history
             )

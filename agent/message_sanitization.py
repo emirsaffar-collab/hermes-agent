@@ -1065,3 +1065,29 @@ def record_reasoning_field_rejection(agent: Any, error_body: Any, sent_messages:
 
 # Image / multimodal parts are deliberately NOT consolidated here: per-adapter handling is
 # format-specific SYNTAX. The one shared image POLICY is ``_strip_images_from_messages``.
+
+
+def repair_message_alternation(
+    messages: list[dict[str, Any]], *, agent: Any = None
+) -> tuple[list[dict[str, Any]], int]:
+    """Repair malformed role alternation in ``messages`` in-place and return ``(messages, repairs)``.
+
+    Delegates to :func:`agent.agent_runtime_helpers.repair_message_sequence_with_cursor` when
+    ``agent`` is provided (keeping ``_last_flushed_db_idx`` and ``_db_flush_scan_prefix``
+    aligned after compaction) or :func:`agent.agent_runtime_helpers.repair_message_sequence`
+    otherwise.
+    """
+    if not messages:
+        return messages, 0
+    from agent.agent_runtime_helpers import (
+        repair_message_sequence,
+        repair_message_sequence_with_cursor,
+    )
+
+    repairs = (
+        repair_message_sequence_with_cursor(agent, messages)
+        if agent is not None
+        else repair_message_sequence(None, messages)
+    )
+    return messages, repairs
+
