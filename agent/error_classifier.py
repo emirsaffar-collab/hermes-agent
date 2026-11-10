@@ -421,9 +421,16 @@ _THINKING_MUTATION_WORDS = ("signature", "cannot be modified", "must remain as t
 def _is_anthropic_thinking_rejection(msg: str) -> bool:
     """A thinking block the upstream will not verify: a signature broken by transcript mutation, or a
     ``redacted_thinking`` blob it cannot open (another model's sealed reasoning after a /model switch or
-    fallback: ``Invalid `data` in `redacted_thinking` block``). Both heal by stripping the replayed blocks."""
-    return "thinking" in msg and (
-        any(p in msg for p in _THINKING_MUTATION_WORDS) or ("redacted_thinking" in msg and "invalid" in msg))
+    fallback: ``Invalid `data` in `redacted_thinking` block``), or an OpenRouter/Gemini cross-upstream
+    ``thoughtSignature`` mismatch (``Corrupted thought signature`` / ``Gemini models require OpenRouter
+    reasoning details to be preserved``). All heal by stripping the replayed blocks."""
+    return (
+        ("thinking" in msg and (
+            any(p in msg for p in _THINKING_MUTATION_WORDS) or ("redacted_thinking" in msg and "invalid" in msg)
+        ))
+        or "corrupted thought signature" in msg
+        or "gemini models require openrouter reasoning details to be preserved" in msg
+    )
 
 
 # Local MoA streaming adapter-shape bugs (see _moa_special_cases).
@@ -1000,9 +1007,9 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     # strips Anthropic thinking blocks and resends the same encrypted item forever.
     if status == 400 and (c.code == "thinking_signature_invalid" or "thinking_signature_invalid" in msg):
         return _V_INVALID_ENCRYPTED
-    # Anthropic thinking-block 400s (signature mismatch after transcript mutation, or a sealed blob
-    # the upstream cannot open). Not gated on provider — OpenRouter proxies Anthropic errors.
-    if status == 400 and _is_anthropic_thinking_rejection(msg):
+    # Anthropic/Gemini thinking-block 400s or SSE stream errors (signature mismatch after transcript
+    # mutation, cross-upstream Gemini thoughtSignature rejection, or a sealed blob the upstream cannot open).
+    if status in (None, 400) and _is_anthropic_thinking_rejection(msg):
         return _v(_R.thinking_signature)
     # Anthropic long-context tier gate (429 "extra usage" + "long context").
     if status == 429 and "extra usage" in msg and "long context" in msg:

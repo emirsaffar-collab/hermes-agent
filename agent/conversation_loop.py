@@ -1769,7 +1769,16 @@ def _run_conversation_turn(
         _run_phase(announce_api_call, agent, s)
 
         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
-        s._retry, s.finish_reason, s.response, s.api_kwargs = TurnRetryState(), "stop", None, None
+        _prev_wrap_attempted = bool(
+            getattr(s._retry, "primary_fallback_wrap_attempted", False)
+            and getattr(agent, "_rebuilt_restarts_since_response", 0) > 0
+        )
+        s._retry, s.finish_reason, s.response, s.api_kwargs = (
+            TurnRetryState(primary_fallback_wrap_attempted=_prev_wrap_attempted),
+            "stop",
+            None,
+            None,
+        )
         s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
 
         early_result = _run_api_retry_loop(agent, s)

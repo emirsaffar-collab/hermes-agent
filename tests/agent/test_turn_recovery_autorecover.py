@@ -327,4 +327,151 @@ def test_openrouter_upstream_429_retries_reordered_upstream_before_cross_provide
         reset_circuit_breaker()
 
 
+def test_route_classified_error_does_not_eagerly_wrap_back_during_inflight_rebuild_or_sticky_content_filter():
+    """CF-74 (RC-2 & RC-4): when on terminal fallback, route_classified_error must NOT
+    eagerly wrap back to primary on attempt 1/3 when _rebuilt_restarts_since_response > 0
+    (primary just failed in this same unresponded step) or when _content_filter_fallback_sticky
+    is True (primary failed on 403 content_filter); when both are False/0 and cooldown expired,
+    it wraps back once."""
+    from agent.error_classifier import FailoverReason, classify_api_error
+    from agent.turn_recovery import route_classified_error
+
+    def _run_route(rebuilt_restarts: int, sticky_cf: bool):
+        agent = _Agent(fallback_left=False)
+        agent.provider = "vertex"
+        agent.model = "google/gemini-4-argon"
+        agent.base_url = "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"
+        agent._fallback_activated = True
+        agent._fallback_index = 1
+        agent._fallback_chain = [{"provider": "vertex", "model": "google/gemini-4-argon"}]
+        agent._rate_limited_until = 0
+        agent._rebuilt_restarts_since_response = rebuilt_restarts
+        agent._content_filter_fallback_sticky = sticky_cf
+        restored = []
+        agent._restore_primary_runtime = lambda: restored.append(True) or True
+        err = _Err(429, "Resource exhausted (DSQ 429)")
+        classified = classify_api_error(err, provider="vertex", model="google/gemini-4-argon")
+        assert classified.reason == FailoverReason.rate_limit
+        retry = TurnRetryState()
+        verdict = route_classified_error(
+            agent,
+            err,
+            classified,
+            retry,
+            error_msg=str(err),
+            error_context={"status_code": 429},
+            recovered_with_pool=False,
+            base_url=agent.base_url,
+            model=agent.model,
+            messages=[],
+            api_messages=[],
+            system_message=None,
+            active_system_prompt=None,
+            conversation_history=[],
+            retry_count=0,
+            max_retries=3,
+            compression_attempts=0,
+            max_compression_attempts=2,
+            api_call_count=1,
+            effective_task_id=None,
+        )
+        return verdict, retry, restored
+
+    # Negative control A: in-flight rebuild chain (_rebuilt_restarts_since_response=1) must fallthrough to retry Vertex
+    v_inflight, retry_inflight, restored_inflight = _run_route(rebuilt_restarts=1, sticky_cf=False)
+    assert v_inflight.action == "fallthrough"
+    assert restored_inflight == []
+    assert retry_inflight.primary_fallback_wrap_attempted is False
+
+    # Negative control B: sticky content filter (_content_filter_fallback_sticky=True) must fallthrough to retry Vertex
+    v_sticky, retry_sticky, restored_sticky = _run_route(rebuilt_restarts=0, sticky_cf=True)
+    assert v_sticky.action == "fallthrough"
+    assert restored_sticky == []
+    assert retry_sticky.primary_fallback_wrap_attempted is False
+
+    # Positive control: steady-state fallback with expired cooldown wraps back once
+    v_ok, retry_ok, restored_ok = _run_route(rebuilt_restarts=0, sticky_cf=False)
+    assert v_ok.action == "break"
+    assert restored_ok == [True]
+    assert retry_ok.primary_fallback_wrap_attempted is True
+    assert retry_ok.restart_with_rebuilt_messages is True
+
+
+def test_openrouter_gemini_corrupted_thought_signature_and_preserved_reasoning_classify_as_thinking_signature():
+    """CF-74 (RC-3): OpenRouter/Gemini cross-upstream thoughtSignature rejections (both HTTP 400
+    'Corrupted thought signature.' and status-less SSE stream error 'Gemini models require OpenRouter
+    reasoning details to be preserved in each request.') classify as FailoverReason.thinking_signature
+    and trigger one-shot reasoning_details strip in _recover_format_errors."""
+    import copy
+    from agent.error_classifier import FailoverReason, classify_api_error
+    from agent.turn_recovery import _recover_format_errors
+
+    err_400 = _Err(
+        400,
+        "Error code: 400 - {'error': {'message': 'Provider returned error', 'code': 400, "
+        "'metadata': {'raw': 'Corrupted thought signature.'}}}",
+    )
+    c_400 = classify_api_error(err_400, provider="openrouter", model="google/gemini-4-argon")
+    assert c_400.reason == FailoverReason.thinking_signature
+
+    err_sse = Exception(
+        "Gemini models require OpenRouter reasoning details to be preserved in each request. "
+        "Please refer to our docs: https://openrouter.ai/docs/guides/best-practices/reasoning-tokens"
+    )
+    c_sse = classify_api_error(err_sse, provider="openrouter", model="google/gemini-4-argon")
+    assert c_sse.reason == FailoverReason.thinking_signature
+
+    # Negative control: unrelated 400 stays format_error
+    err_other = _Err(400, "Invalid JSON payload received")
+    c_other = classify_api_error(err_other, provider="openrouter", model="google/gemini-4-argon")
+    assert c_other.reason == FailoverReason.format_error
+
+    # Verify _recover_format_errors strips reasoning_details from api_messages without mutating canonical messages
+    canonical = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_details": [{"type": "reasoning.encrypted", "data": "corrupted", "id": "c1"}],
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ]
+    before = copy.deepcopy(canonical)
+    api_msgs = copy.deepcopy(canonical)
+    retry = TurnRetryState()
+    agent = _Agent()
+    agent.api_mode = "chat_completions"
+    assert _recover_format_errors(agent, err_sse, c_sse, retry, canonical, api_msgs) is True
+    assert retry.thinking_sig_retry_attempted is True
+    assert "reasoning_details" not in api_msgs[1]
+    assert canonical == before
+
+
+def test_merge_assistant_into_carries_reasoning_details_for_appended_tool_calls():
+    """CF-74 (RC-3b): when _merge_assistant_into folds a tool-call assistant turn into a preceding
+    text-only assistant turn, it preserves the tool-call turn's reasoning_details."""
+    from agent.agent_runtime_helpers import _merge_assistant_into
+
+    prev = {
+        "role": "assistant",
+        "content": "Text preface",
+        "reasoning_details": [{"type": "reasoning.text", "text": "plan", "index": 0}],
+        "_db_persisted": True,
+    }
+    later = {
+        "role": "assistant",
+        "content": "",
+        "reasoning_details": [
+            {"type": "reasoning.encrypted", "data": "sig_c1", "id": "call_1", "format": "google-gemini-v1", "index": 0}
+        ],
+        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "skill_view", "arguments": "{}"}}],
+    }
+    _merge_assistant_into(prev, later)
+    assert len(prev["reasoning_details"]) == 2
+    assert any(d.get("id") == "call_1" for d in prev["reasoning_details"])
+    assert "_db_persisted" not in prev
+
+
+
 

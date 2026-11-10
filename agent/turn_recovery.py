@@ -1944,6 +1944,8 @@ def route_classified_error(
     elif (
         _should_fallback
         and getattr(agent, "_fallback_activated", False)
+        and not getattr(agent, "_content_filter_fallback_sticky", False)
+        and not getattr(agent, "_rebuilt_restarts_since_response", 0)
         and not getattr(_retry, "primary_fallback_wrap_attempted", False)
         and getattr(agent, "_rate_limited_until", 0) <= time.monotonic()
         and callable(getattr(agent, "_restore_primary_runtime", None))

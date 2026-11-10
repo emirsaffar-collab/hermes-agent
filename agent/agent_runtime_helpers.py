@@ -434,12 +434,21 @@ def _merge_assistant_into(prev: dict, msg: dict) -> bool:
         prev["content"] = new_content
         content_rewritten = new_content != prev_content
         text_kept = True
-    # Carry reasoning_content from the later turn only if the earlier lacks it (strict thinking
-    # providers need one on the merged tool-call turn).
+    # Carry reasoning_content / reasoning_details from the later turn so merged tool-call turns
+    # preserve OpenRouter/Gemini encrypted thoughtSignatures for appended tool_calls.
     reasoning_carried = False
     if not prev.get("reasoning_content") and msg.get("reasoning_content"):
         prev["reasoning_content"] = msg["reasoning_content"]
         reasoning_carried = True
+    msg_rd = msg.get("reasoning_details")
+    if isinstance(msg_rd, list) and msg_rd:
+        prev_rd = prev.get("reasoning_details")
+        if not isinstance(prev_rd, list) or not prev_rd:
+            prev["reasoning_details"] = list(msg_rd)
+            reasoning_carried = True
+        elif new_calls:
+            prev["reasoning_details"] = prev_rd + [d for d in msg_rd if d not in prev_rd]
+            reasoning_carried = True
     # A stale ``api_content`` sidecar overrides ``content`` at API-build time and would replay
     # pre-merge bytes; drop it only when content actually changed.
     # ``prev`` may carry an ``api_content`` sidecar (the exact bytes previously sent to the API, e.g. a
