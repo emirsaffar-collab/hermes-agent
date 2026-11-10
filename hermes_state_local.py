@@ -179,8 +179,9 @@ def moved_receipts(conn, target_ids=None):
     scan to the rows one repoint rewrote."""
     rows = conn.execute(
         "SELECT substr(m.key, ?), s.id, s.source FROM state_meta m JOIN sessions s "
-        "ON s.id = CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.entry.session_id') END "
-        "WHERE m.key GLOB ? AND s.session_key IS NOT NULL "
+        "ON s.id = CASE WHEN m.key NOT GLOB 'gateway.local_policy.v1:local-*' AND json_valid(m.value) "
+        "THEN json_extract(m.value, '$.entry.session_id') END "
+        "WHERE m.key GLOB ? AND m.key NOT GLOB 'gateway.local_policy.v1:local-*' AND s.session_key IS NOT NULL "
         "AND s.session_key IS NOT CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.route') END",
         (len(POLICY_PREFIX) + 1, POLICY_PREFIX + '*')).fetchall()
     return {owner: (target, source) for owner, target, source in rows

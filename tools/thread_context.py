@@ -24,6 +24,7 @@ def _callback_api():
     Add a new per-thread prompt here — a callback missing from this table is silently absent on
     every parallel/timeout worker, so the tool believes nobody can answer."""
     from agent.vault_backends import unlock as vault_unlock
+    import hermes_logging
     from tools import terminal_tool as tt
 
     return ((tt._get_approval_callback, tt.set_approval_callback),
@@ -32,7 +33,8 @@ def _callback_api():
             (vault_unlock.get_save_login_prompt_callback, vault_unlock.set_save_login_prompt_callback),
             (vault_unlock.get_code_prompt_callback, vault_unlock.set_code_prompt_callback),
             # The unlock owner: a manager unlocked on a worker must still be released with its session.
-            (vault_unlock.get_current_session_id, vault_unlock.set_current_session_id))
+            (vault_unlock.get_current_session_id, vault_unlock.set_current_session_id),
+            (hermes_logging.get_session_context, hermes_logging.set_session_context))
 
 
 def propagate_context_to_thread(target: Callable) -> Callable:
