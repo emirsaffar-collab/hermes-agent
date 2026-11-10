@@ -284,7 +284,8 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
         force=True, diagnostic=True,
     )
     agent._emit_diagnostic_status("Content filter terminated stream; switching to fallback...")
-    if agent._try_activate_fallback():
+    if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
+        logger.warning("%sContent filter terminated the stream — switched to fallback", agent.log_prefix)
         # Roll partial content back to the last clean turn so the fallback gets a
         # coherent continuation point; unmark survivors (their text left the partial).
         if st.truncated_response_parts:
@@ -686,6 +687,7 @@ def continue_codex_incomplete(
 
     if reasoning_only and streak >= 3:
         if agent._try_activate_fallback(reason=FailoverReason.incomplete_response):
+            logger.warning("%sCodex reasoning-only stall after %d attempts — switched to fallback", agent.log_prefix, streak)
             # The trigger may have consumed the turn budget; without a grace call the loop
             # exits before the fallback is ever asked.
             if api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0:
@@ -851,8 +853,21 @@ def handle_content_policy_refusal(
 
     agent._content_filter_retries = 0
     agent._ephemeral_reasoning_off = False
+    # native_stop_reason tells an Anthropic classifier refusal (``refusal``) from a Bedrock guardrail
+    # block (``end_turn``); both arrive here as content_filter. Logged before the fallback try so a
+    # refusal the fallback answers still leaves its cause in agent.log (#124874).
+    logger.warning(
+        "%sModel declined to respond (finish_reason=content_filter). model=%s provider=%s "
+        "native_stop_reason=%s stop_details=%s refusal=%s",
+        agent.log_prefix, agent.model, agent.provider,
+        getattr(response, "stop_reason", None) or "n/a", str(_stop_details or "n/a")[:500],
+        _refusal_log or "(no text)",
+    )
     if agent._has_pending_fallback():
         agent._buffer_diagnostic_status("⚠️ Model declined to respond (safety refusal) — trying fallback...")
+    # Name the cause: without a reason the switch notice reads "unavailable (provider failure)",
+    # while the same refusal raised as an HTTP 400 (DeepSeek's "Content Exists Risk") says
+    # "content policy blocked the request" (#124874). Not a rate-limit reason, so no cooldown is armed.
     if _activate_refusal_fallback(agent):
         agent._content_filter_fallback_sticky = True
         logger.warning(
@@ -864,15 +879,6 @@ def handle_content_policy_refusal(
         return RefusalVerdict("break", None, active_system_prompt)
 
     agent._flush_status_buffer()
-    # native_stop_reason tells an Anthropic classifier refusal (``refusal``) from a Bedrock guardrail
-    # block (``end_turn``); both arrive here as content_filter.
-    logger.warning(
-        "%sModel declined to respond (finish_reason=content_filter). model=%s provider=%s "
-        "native_stop_reason=%s stop_details=%s refusal=%s",
-        agent.log_prefix, agent.model, agent.provider,
-        getattr(response, "stop_reason", None) or "n/a", _stop_details or "n/a",
-        _refusal_log or "(no text)",
-    )
     agent._emit_diagnostic_status("⚠️ The model declined to respond to this request (safety refusal).")
     _refusal_response = "⚠️ " + content_policy_copy(
         label=provider_label_for(agent.provider),
