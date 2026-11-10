@@ -109,8 +109,17 @@ def anchored_context_tokens(messages: list[dict[str, Any]], anchor: Optional[dic
     """Anchored prompt+completion tokens plus a rough estimate of ONLY the messages appended since;
     None when the anchor is missing or stale. The anchored response's own reply is skipped (already
     in completion_tokens). ``charge_stale_thinking`` is forwarded to the delta estimate."""
-    if not isinstance(anchor, dict) or not isinstance(messages, list) or not _anchor_matches(messages, anchor):
+    if not isinstance(anchor, dict) or not isinstance(messages, list):
         return None
+    if not _anchor_matches(messages, anchor):
+        try:
+            from agent.message_sanitization import repair_message_alternation
+            repaired, rep_cnt = repair_message_alternation(list(messages))
+        except Exception:
+            repaired, rep_cnt = messages, 0
+        if not (rep_cnt and _anchor_matches(repaired, anchor)):
+            return None
+        messages = repaired
     from agent.model_metadata import estimate_messages_tokens_rough
 
     total = int(anchor["prompt_tokens"]) + int(anchor.get("completion_tokens") or 0)
@@ -183,7 +192,15 @@ def restore_usage_anchor(agent: Any, conversation_history: Optional[list[dict[st
         return
     if anchor is None:
         return
-    if _anchor_matches(conversation_history, anchor):
+    matched = _anchor_matches(conversation_history, anchor)
+    if not matched:
+        try:
+            from agent.message_sanitization import repair_message_alternation
+            repaired, rep_cnt = repair_message_alternation(list(conversation_history))
+            matched = bool(rep_cnt and _anchor_matches(repaired, anchor))
+        except Exception:
+            matched = False
+    if matched:
         agent._usage_anchor = anchor
     else:
         persist_usage_anchor(agent, None)

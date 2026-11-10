@@ -3705,7 +3705,10 @@ def _refresh_vertex_credentials() -> bool:
     """Mirrors run_agent's Vertex refresh; the cache key ignores the rotating bearer, so
     without the eviction that follows, a ~1h-expired aux Vertex client 401s forever."""
     from agent.vertex_adapter import get_vertex_config
-    token, base_url = get_vertex_config()
+    try:
+        token, base_url = get_vertex_config(force_refresh=True)
+    except TypeError:
+        token, base_url = get_vertex_config()
     return bool(isinstance(token, str) and token.strip() and isinstance(base_url, str) and base_url.strip())
 
 
@@ -4693,7 +4696,7 @@ def _build_bedrock_client(provider: str, model: Optional[str], *, raw_codex: boo
 def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[Any], Optional[str]]:
     """Google Vertex AI: Gemini via the OpenAI-compatible endpoint with an OAuth2 bearer (standard OpenAI client)."""
     try:
-        from agent.vertex_adapter import get_vertex_config, has_vertex_credentials
+        from agent.vertex_adapter import get_vertex_config, has_vertex_credentials, vertex_access_token
     except ImportError:
         logger.warning("resolve_provider_client: vertex requested but google-auth not installed")
         return None, None
@@ -4708,7 +4711,7 @@ def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[
     try:
         # Aliased import: a bare `from openai import OpenAI` would shadow the module-level lazy proxy.
         from openai import OpenAI as _VertexOpenAI
-        client = _VertexOpenAI(api_key=token, base_url=base_url)
+        client = _VertexOpenAI(api_key=vertex_access_token, base_url=base_url)
     except Exception as exc:
         logger.warning("resolve_provider_client: cannot create Vertex client: %s", exc)
         return None, None

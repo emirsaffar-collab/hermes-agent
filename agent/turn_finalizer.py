@@ -609,6 +609,7 @@ def _mirror_turn_to_memory(
         final_response
         and not interrupted
         and not getattr(agent, "skip_background_review", False)
+        and not str(original_user_message or "").lstrip().startswith('[Cronjob "')
         and (review_memory or review_skills)
     ):
         with suppress(Exception):
