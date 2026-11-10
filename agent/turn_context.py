@@ -319,9 +319,10 @@ def reanchor_current_turn_user_idx(messages: list[Any], user_message: Any) -> in
     Compaction handoffs must never become the fallback anchor (#80622) — they are reference-only
     scaffolding, not the active ask.
     """
-    from agent.context_compressor import user_originated_turn_view
+    from agent.context_compressor import split_inflight_replay_turn, user_originated_turn_view
 
     fallback = -1
+    inflight_fallback = -1
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if not (isinstance(msg, dict) and msg.get("role") == "user"):
@@ -332,6 +333,12 @@ def reanchor_current_turn_user_idx(messages: list[Any], user_message: Any) -> in
             return i
         live_view = user_originated_turn_view(msg)
         if live_view is None:
+            _, inflight_view = split_inflight_replay_turn(msg)
+            if inflight_view is not None:
+                if inflight_view.get("content") == user_message:
+                    return i
+                if inflight_fallback < 0:
+                    inflight_fallback = i
             continue
         if live_view.get("content") == user_message:
             return i
@@ -339,7 +346,7 @@ def reanchor_current_turn_user_idx(messages: list[Any], user_message: Any) -> in
         # when the exact content was rewritten by merge-into-tail.
         if fallback < 0:
             fallback = i
-    return fallback
+    return fallback if fallback >= 0 else inflight_fallback
 
 
 def history_before_current_turn(
@@ -357,7 +364,13 @@ def history_before_current_turn(
     """
     if (isinstance(messages, list) and isinstance(current_turn_user_idx, int)
             and 0 <= current_turn_user_idx <= len(messages)):
-        return list(messages[:current_turn_user_idx])
+        prefix = list(messages[:current_turn_user_idx])
+        if current_turn_user_idx < len(messages):
+            from agent.context_compressor import split_inflight_replay_turn
+            handoff, live_view = split_inflight_replay_turn(messages[current_turn_user_idx])
+            if handoff is not None and live_view is not None:
+                prefix.append(handoff)
+        return prefix
     return list(fallback) if isinstance(fallback, list) else []
 
 

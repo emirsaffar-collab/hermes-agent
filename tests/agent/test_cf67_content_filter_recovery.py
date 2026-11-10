@@ -400,4 +400,196 @@ def test_mid_turn_secret_value_guard_block_rehydrates_scrubbed_assistant_msg_in_
     assert assistant_pos["reasoning_content"] == "scrubbed reasoning 0x948f…a1b2"
 
 
+def test_cf76_openrouter_gemini4_disable_clamps_to_low_and_emits_thinking_config():
+    from agent.gemini_native_adapter import GEMINI_SAFETY_SETTINGS_OFF
+    from providers import get_provider_profile
 
+    profile = get_provider_profile("openrouter")
+    disabled_cfg = {"enabled": False, "effort": "none"}
+    eb, _tl = profile.build_api_kwargs_extras(
+        reasoning_config=disabled_cfg,
+        supports_reasoning=True,
+        model="google/gemini-4-argon",
+    )
+    assert eb["reasoning"] == {"effort": "low", "exclude": True}
+    body = profile.build_extra_body(
+        model="google/gemini-4-argon",
+        reasoning_config=disabled_cfg,
+    )
+    assert body["google"]["thinking_config"] == {
+        "include_thoughts": False,
+        "thinking_level": "low",
+    }
+    assert body["google"]["safety_settings"] == [dict(item) for item in GEMINI_SAFETY_SETTINGS_OFF]
+
+
+def test_cf76_fallback_activation_preserves_low_effort_and_summarizes_gate_scripts():
+    from agent.turn_truncation import _CONTENT_FILTER_STEER_NOTE, _inject_content_filter_steer_note
+
+    agent = _make_mock_agent(has_fallback=True)
+    agent._content_filter_retries = 1
+
+    messages = [
+        {"role": "user", "content": "deploy PR #114"},
+        {"role": "tool", "tool_call_id": "t1", "content": "read warehouse-deploy-gate.py and .approved-shas"},
+    ]
+    api_messages = [dict(m) for m in messages]
+    verdict = handle_content_policy_refusal(
+        agent,
+        _chat_refusal_response(),
+        TurnRetryState(),
+        thinking_spinner=None,
+        messages=messages,
+        api_messages=api_messages,
+        api_kwargs={},
+        active_system_prompt="sys",
+        conversation_history=list(messages),
+        api_call_count=5,
+        effective_task_id="t1",
+        turn_id="u1",
+        api_request_id="r1",
+        api_start_time=0.0,
+        retry_count=0,
+        max_retries=2,
+        current_turn_user_idx=0,
+    )
+    assert verdict.action == "break"
+    assert agent._content_filter_fallback_sticky is True
+    assert agent._ephemeral_reasoning_off is True
+    assert agent._pending_content_filter_steer is True
+
+    rebuilt_api_messages = [dict(m) for m in messages]
+    _inject_content_filter_steer_note(rebuilt_api_messages)
+    assert ".approved-shas" not in rebuilt_api_messages[-1]["content"]
+    assert "warehouse-deploy-gate" not in rebuilt_api_messages[-1]["content"]
+    assert _CONTENT_FILTER_STEER_NOTE in rebuilt_api_messages[-1]["content"]
+
+
+def test_cf76_inflight_replay_compaction_carrier_reanchors_and_retains_refused_turn(tmp_path):
+    from agent.compaction_display import project_compaction_message_for_display
+    from agent.context_compressor import (
+        HISTORICAL_TASK_HEADING,
+        SUMMARY_PREFIX,
+        _INFLIGHT_TASK_REPLAY_HEADER,
+        _SUMMARY_END_MARKER,
+    )
+    from agent.turn_context import (
+        history_before_current_turn,
+        reanchor_current_turn_user_idx,
+        refused_turn_boundary_row_id,
+    )
+    from agent.turn_failure_copy import CONTENT_REFUSED_DISPLAY_KIND
+    from hermes_state import SessionDB
+    from hermes_state_rewind import retain_refused_turn_for_display
+
+    carrier_text = (
+        f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold summary\n\n"
+        f"{_SUMMARY_END_MARKER}\n\n"
+        f"{_INFLIGHT_TASK_REPLAY_HEADER}\n@url:https://mail.google.com/mail/u/0/#chat/space/AAQADqzvLBY"
+    )
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("s_cf76", "tui")
+        boundary_id = db.append_message("s_cf76", "user", carrier_text)
+        db.append_message(
+            "s_cf76",
+            "assistant",
+            "",
+            tool_calls=[{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+        )
+        db.append_message("s_cf76", "tool", "warehouse-deploy-gate.py content", tool_call_id="c1")
+
+        in_mem = db.get_messages_as_conversation("s_cf76", include_row_ids=True)
+        idx = reanchor_current_turn_user_idx(
+            in_mem, "@url:https://mail.google.com/mail/u/0/#chat/space/AAQADqzvLBY"
+        )
+        assert idx == 0
+        assert refused_turn_boundary_row_id(in_mem, idx) == boundary_id
+
+        clean_hist = history_before_current_turn(in_mem, idx, list(in_mem))
+        assert len(clean_hist) == 1
+        assert clean_hist[0]["role"] == "user"
+        assert clean_hist[0].get("display_kind") == "hidden"
+        assert _INFLIGHT_TASK_REPLAY_HEADER not in clean_hist[0]["content"]
+
+        notice = "This message was refused by the model's safety filter — try a different query."
+        assert retain_refused_turn_for_display(db, "s_cf76", notice=notice, boundary_row_id=boundary_id) is True
+
+        model_rows = db.get_messages_as_conversation("s_cf76")
+        assert len(model_rows) == 1
+        assert model_rows[0]["display_kind"] == "hidden"
+        assert "warehouse-deploy-gate.py" not in str(model_rows)
+
+        all_rows = db.get_messages_as_conversation("s_cf76", include_compacted=True)
+        refused_rows = [m for m in all_rows if m.get("display_kind") == CONTENT_REFUSED_DISPLAY_KIND]
+        assert len(refused_rows) == 1
+        projected = project_compaction_message_for_display(refused_rows[0])
+        assert projected is not None
+        assert projected.get("display_kind") == CONTENT_REFUSED_DISPLAY_KIND
+        assert "AAQADqzvLBY" in projected.get("content", "")
+    finally:
+        db.close()
+
+
+
+def test_cf76_settle_unrecovered_error_wraps_sticky_fallback_with_low_effort_and_steer():
+    """CF-76 / VG-08: When Vertex fallback exhausts 3/3 retries on HTTP 429 while
+    _content_filter_fallback_sticky is True, settle_unrecovered_error wraps back to
+    primary with _ephemeral_reasoning_off=True and _pending_content_filter_steer=True,
+    and _inject_content_filter_steer_note handles list-shaped content parts."""
+    from agent.error_classifier import ClassifiedError, FailoverReason
+    from agent.turn_api_error import settle_unrecovered_error
+    from agent.turn_truncation import _inject_content_filter_steer_note, _CONTENT_FILTER_STEER_NOTE
+
+    list_msgs = [{"role": "user", "content": [{"type": "text", "text": "hello world"}]}]
+    _inject_content_filter_steer_note(list_msgs)
+    assert _CONTENT_FILTER_STEER_NOTE in list_msgs[0]["content"][0]["text"]
+
+    agent = _make_mock_agent(has_fallback=False)
+    agent.provider = "vertex"
+    agent._fallback_activated = True
+    agent._content_filter_fallback_sticky = True
+    agent._ephemeral_reasoning_off = False
+    agent._pending_content_filter_steer = False
+    agent._try_recover_primary_transport = lambda *a, **kw: False
+    agent._restore_primary_runtime = lambda: setattr(agent, "provider", "openrouter") or True
+
+    retry = TurnRetryState()
+    classified = ClassifiedError(
+        reason=FailoverReason.rate_limit,
+        retryable=True,
+        should_compress=False,
+        should_fallback=True,
+        message="429 RESOURCE_EXHAUSTED",
+    )
+    v = settle_unrecovered_error(
+        agent,
+        api_error=RuntimeError("429 RESOURCE_EXHAUSTED"),
+        classified=classified,
+        _retry=retry,
+        status_code=429,
+        error_msg="429 RESOURCE_EXHAUSTED",
+        is_context_length_error=False,
+        is_rate_limited=True,
+        _is_zai_coding_overload=False,
+        _provider="vertex",
+        _base="https://aiplatform.googleapis.com/v1beta1",
+        _model="google/gemini-4-argon",
+        messages=[{"role": "user", "content": "hi"}],
+        api_messages=[{"role": "user", "content": "hi"}],
+        api_kwargs={},
+        active_system_prompt="sys",
+        conversation_history=[{"role": "user", "content": "hi"}],
+        approx_tokens=100,
+        retry_count=3,
+        max_retries=3,
+        compression_attempts=0,
+        api_call_count=2,
+        error_context={},
+        current_turn_user_idx=0,
+    )
+    assert v.action == "break"
+    assert agent.provider == "openrouter"
+    assert agent._content_filter_fallback_sticky is False
+    assert agent._ephemeral_reasoning_off is True
+    assert agent._pending_content_filter_steer is True

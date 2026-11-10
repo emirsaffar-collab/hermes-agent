@@ -1962,9 +1962,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
     def _split_rewind_target(self, target_row: dict[str, Any], expected_target_content: Any, preserve_compaction_handoff: bool):
         """Validate an active rewind target; return its handoff scaffold (or None). ``ValueError``: inactive /
         non-user-originated / missing composite carrier; ``RuntimeError``: live payload changed."""
+        from agent.context_compressor import split_inflight_replay_turn
         if not target_row.get("active"):
             raise ValueError("rewind target is not active")
-        handoff, live_view = split_user_originated_turn({
+        handoff, live_view = split_inflight_replay_turn({
             **target_row, "content": self._decode_content(target_row.get("content")),
             "display_metadata": self._decode_display_metadata(target_row.get("display_metadata"))})
         if live_view is None:

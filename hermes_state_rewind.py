@@ -160,7 +160,7 @@ class SessionRewindMixin:
         pin ``rewind_user_turn`` needs is unnecessary here. Falls back to the newest user turn when no
         usable boundary was supplied.
         """
-        from agent.context_compressor import split_user_originated_turn
+        from agent.context_compressor import split_inflight_replay_turn
         if isinstance(boundary_row_id, int) and boundary_row_id > 0:
             with self._read_ctx() as conn:
                 row = conn.execute(
@@ -169,13 +169,20 @@ class SessionRewindMixin:
             if row is not None and row["role"] == "user" and row["active"]:
                 decoded = {"role": "user", "content": self._decode_content(row["content"]),
                            "display_metadata": self._decode_display_metadata(row["display_metadata"])}
-                handoff, _live_view = split_user_originated_turn(decoded)
-                return boundary_row_id, handoff is not None, self.get_active_message_ids(session_id)
+                handoff, _live_view = split_inflight_replay_turn(decoded)
+                if _live_view is not None:
+                    return boundary_row_id, handoff is not None, self.get_active_message_ids(session_id)
             # The boundary vanished, was already rewound, or is not a rewindable user row: fall
             # through to the newest-user-turn best effort rather than failing the retention.
         try:
             plan = self.plan_user_turn_rewind(session_id, -1)
         except RewindTargetUnavailableError:
+            durable = self.get_messages_as_conversation(session_id, include_row_ids=True)
+            for m in reversed(durable):
+                if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("_row_id"), int):
+                    handoff, live_view = split_inflight_replay_turn(m)
+                    if live_view is not None:
+                        return int(m["_row_id"]), handoff is not None, self.get_active_message_ids(session_id)
             return None
         return plan.target_row_id, plan.scaffold is not None, plan.expected_active_ids
 

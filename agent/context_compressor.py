@@ -6037,6 +6037,33 @@ def user_originated_turn_view(message: Any) -> Optional[dict[str, Any]]:
     return split_user_originated_turn(message)[1]
 
 
+def split_inflight_replay_turn(message: Any) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    """Like ``split_user_originated_turn``, but also unwraps a mid-turn split-compaction carrier
+    whose post-marker remainder starts with ``_INFLIGHT_TASK_REPLAY_HEADER`` (#CF-76)."""
+    handoff, live_view = split_user_originated_turn(message)
+    if live_view is not None or not isinstance(message, dict) or message.get("role") != "user":
+        return handoff, live_view
+    if not ContextCompressor._has_merged_inflight_replay(message):
+        return handoff, None
+    text = _content_text_for_contains(message.get("content"))
+    _, _, remainder = text.rpartition(_SUMMARY_END_MARKER)
+    rest = remainder.lstrip()
+    task_text = rest.removeprefix(_INFLIGHT_TASK_REPLAY_HEADER).lstrip()
+    if not task_text:
+        return handoff, None
+    candidate: dict[str, Any] = {"role": "user", "content": task_text}
+    carrier_metadata = message.get("display_metadata")
+    if isinstance(carrier_metadata, dict):
+        durable_metadata = {
+            key: copy.deepcopy(carrier_metadata[key])
+            for key in SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS
+            if key in carrier_metadata
+        }
+        if durable_metadata:
+            candidate["display_metadata"] = durable_metadata
+    return handoff, candidate
+
+
 def history_before_user_originated_turn(
     messages: list[dict[str, Any]], index: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:

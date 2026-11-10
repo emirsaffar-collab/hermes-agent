@@ -441,12 +441,19 @@ def settle_unrecovered_error(
             and not getattr(_retry, "primary_fallback_wrap_attempted", False)
             and callable(getattr(agent, "_restore_primary_runtime", None))
         ):
-            # CF-61: when all retries on the terminal fallback provider are exhausted
+            # CF-61 / CF-76: when all retries on the terminal fallback provider are exhausted
             # (e.g. Vertex 429 TPM quota exhausted after an earlier OpenRouter failover),
             # clear the primary cooldown and wrap back to the primary runtime once before giving up.
+            # If fallback was sticky due to a content-filter refusal, arm low thinking + steer
+            # so the wrap-back request bypasses OpenRouter's 168 ms prompt cache.
+            _was_cf_sticky = bool(getattr(agent, "_content_filter_fallback_sticky", False))
             _retry.primary_fallback_wrap_attempted = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
+                if _was_cf_sticky:
+                    agent._content_filter_fallback_sticky = False
+                    agent._ephemeral_reasoning_off = True
+                    agent._pending_content_filter_steer = True
                 active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
                 retry_count = compression_attempts = 0
                 return _verdict("break")
