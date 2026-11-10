@@ -87,9 +87,33 @@ class _BotState:
     def __init__(self, out_dir: Path, meeting_id: str, url: str):
         self.__dict__.update({attr: default for _, attr, default in _STATUS_FIELDS if attr})
         self.__dict__.update(out_dir=out_dir, meeting_id=meeting_id, url=url, _seen=set(),  # seen "speaker|text"
+                             speaker_timeline=[],  # list of (epoch_ts, speaker_name) from DOM active-speaker/captions
                              transcript_path=out_dir / "transcript.txt", status_path=out_dir / "status.json")
         out_dir.mkdir(parents=True, exist_ok=True)
         self._flush()
+
+    def record_dom_speaker(self, speaker: str, epoch_ts: Optional[float] = None) -> None:
+        """Record an active human speaker observed in the Meet/Teams DOM at *epoch_ts*."""
+        spk = (speaker or "").strip()
+        if not spk or spk.lower() in {"unknown", "you", "du", "mig", "me"}:
+            return
+        if re.search(r"(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant)", spk, re.IGNORECASE):
+            return
+        ts = float(epoch_ts) if epoch_ts is not None else time.time()
+        self.speaker_timeline.append((ts, spk))
+        if len(self.speaker_timeline) > 5000:
+            self.speaker_timeline = self.speaker_timeline[-2500:]
+
+    def resolve_speaker_at(self, epoch_ts: float, fallback: str, window_s: float = 6.0) -> str:
+        """Return the closest DOM-observed active speaker within *window_s* of *epoch_ts*, or *fallback*."""
+        if not self.speaker_timeline:
+            return fallback
+        best_dt, best_spk = window_s + 1.0, fallback
+        for ts, spk in self.speaker_timeline:
+            dt = abs(float(epoch_ts) - float(ts))
+            if dt <= window_s and dt < best_dt:
+                best_dt, best_spk = dt, spk
+        return best_spk
 
     def record_caption(self, speaker: str, text: str, offset_s: Optional[float] = None) -> None:
         """Append a caption line unless this exact (speaker, text) was already seen."""
@@ -449,11 +473,18 @@ class _RtcTranscriber:
                 )
                 segs = list(segs_iter)
             base_offset_s = float(done) / 16000.0
+            _hallucination_pat = re.compile(
+                r"^(?:mikael wiehe:?|tack till elever och personal.*|undertextning:?.*|textning\.nu.*)$",
+                re.IGNORECASE,
+            )
             for s in segs:
                 text = (s.text or "").strip()
-                if text:
+                if text and not _hallucination_pat.match(text):
                     seg_offset_s = base_offset_s + float(getattr(s, "start", 0.0) or 0.0)
-                    self.state.record_caption(speaker=label, text=text, offset_s=seg_offset_s)
+                    anchor = self.state.joined_at or self.state.join_attempted_at or time.time()
+                    seg_epoch = float(anchor) + seg_offset_s
+                    resolved_speaker = self.state.resolve_speaker_at(seg_epoch, fallback=label)
+                    self.state.record_caption(speaker=resolved_speaker, text=text, offset_s=seg_offset_s)
                     self._last_text[stream_id] = text
         except Exception as e:
             sys.stderr.write(f"meet rtc: transcribe {merged.name} failed: {e}\n")
@@ -513,6 +544,45 @@ _CAPTION_OBSERVER_JS = r"""
   window.__hermesMeetDrain = () => {
     const out = window.__hermesMeetQueue.slice();
     window.__hermesMeetQueue = [];
+    return out;
+  };
+
+  window.__hermesSpeakerQueue = [];
+  window.__hermesActiveSpeaker = () => {
+    const botRe = /(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant|fireflies|otter\.ai)/i;
+    const selfRe = /^(\s*(du|you|mig|me)\s*)$/i;
+    // 1. Check active-speaker indicators on Meet & Teams participant tiles
+    const tiles = Array.from(document.querySelectorAll('[data-participant-id], [data-cid="calling-participant-stream"], [data-tid="roster-participant"]'));
+    for (const t of tiles) {
+      const isSpeaking = !!(
+        t.querySelector('[aria-label*="speaking" i], [aria-label*="pratar" i], [aria-label*="talar" i], [data-tid="voice-level-stream-outline"], .kssMZb, .S7urwe') ||
+        t.getAttribute('data-is-speaking') === 'true' ||
+        t.classList.contains('active-speaker')
+      );
+      if (!isSpeaking) continue;
+      const selfName = (t.getAttribute('data-self-name') || '').trim();
+      const nameEl = t.querySelector('.zWGUib, .KcIKyf, .zs7s8d, [data-tid="participant-name"]');
+      const spk = (selfName || (nameEl ? nameEl.innerText : '') || '').trim();
+      if (spk && !botRe.test(spk) && !selfRe.test(spk)) return spk;
+    }
+    // 2. Fallback: latest speaker header in live caption region
+    const spkEls = document.querySelectorAll('div.KcIKyf, div.zs7s8d, span[jsname="YSxPC"]');
+    if (spkEls.length) {
+      const lastSpk = (spkEls[spkEls.length - 1].innerText || '').trim();
+      if (lastSpk && !botRe.test(lastSpk) && !selfRe.test(lastSpk)) return lastSpk;
+    }
+    return null;
+  };
+  setInterval(() => {
+    const spk = window.__hermesActiveSpeaker && window.__hermesActiveSpeaker();
+    if (spk) {
+      window.__hermesSpeakerQueue.push({ ts: Date.now() / 1000.0, speaker: spk });
+      if (window.__hermesSpeakerQueue.length > 500) window.__hermesSpeakerQueue.shift();
+    }
+  }, 500);
+  window.__hermesDrainSpeakers = () => {
+    const out = window.__hermesSpeakerQueue.slice();
+    window.__hermesSpeakerQueue = [];
     return out;
   };
 })();
@@ -745,7 +815,7 @@ def _config_from_env() -> _BotConfig:
         lobby_timeout=float(env("HERMES_MEET_LOBBY_TIMEOUT", "300")))
 
 
-def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> None:
+def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 60.0) -> None:
     """Fill the guest-name field and click 'Join now' / 'Ask to join' (the latter → lobby_waiting).
 
     Meet renders the pre-join buttons asynchronously after ``domcontentloaded``, so poll for up to
@@ -789,6 +859,7 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> Non
                 teams_guest = re.sub(r"\s+", " ", teams_guest).strip() or "Ur och Penn Motesanteckningar"
                 _quiet(t_name.click, timeout=2_000)
                 _quiet(t_name.fill, teams_guest, timeout=2_000)
+                _quiet(page.wait_for_timeout, 400)
             for t_toggle in ('input[data-tid="toggle-video"]', 'input[data-tid="toggle-mute"]'):
                 tog = _visible(page.locator(t_toggle))
                 if tog is not None and _quiet(tog.is_checked):
@@ -797,6 +868,10 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> Non
             if t_join is not None and _quiet(t_join.is_enabled) and _quiet(lambda: (t_join.click(timeout=3_000, no_wait_after=True), True)):
                 state.set(lobby_waiting=True)
                 return
+            if time.time() >= deadline:
+                return
+            time.sleep(0.5)
+            continue
 
         # Camera and microphone off on pre-join screen (EN + SV).
         for cam_label in ("Turn off camera", "Slå av kameran", "Stäng av kameran", "Slå av kamera"):
@@ -877,6 +952,8 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                 state.set(in_call=True, lobby_waiting=False, joined_at=now,
                           mic_state=(_ensure_mic_muted(page) if (cfg.rtc_audio and not rt["enabled"])
                                      else _ensure_mic_on(page)))
+            elif _visible(page.locator('button[data-tid="prejoin-join-button"], button[data-tid="joinOnWeb"]')) is not None:
+                _join(page, cfg, state, timeout=5.0)
             elif now > lobby_deadline:
                 waited = int(lobby_deadline - state.join_attempted_at) if state.join_attempted_at else 0
                 state.set(error=f"lobby timeout — host never admitted the bot within {waited}s",
@@ -899,7 +976,10 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                 had_other_participants = True
                 alone_since = None
             elif isinstance(pcount, int) and pcount <= 1:
-                if had_other_participants:
+                recent_audio = bool(state.last_caption_at and (now - float(state.last_caption_at)) < 45.0)
+                if recent_audio:
+                    alone_since = None
+                elif had_other_participants:
                     if alone_since is None:
                         alone_since = now
                     elif (now - alone_since) >= 12.0:
@@ -911,10 +991,15 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                     state.set(leave_reason="everyone_left")
                     return
         try:
+            spk_events = page.evaluate("window.__hermesDrainSpeakers && window.__hermesDrainSpeakers()")
+            for sev in (e for e in (spk_events if isinstance(spk_events, list) else ()) if isinstance(e, dict)):
+                state.record_dom_speaker(str(sev.get("speaker", "")), sev.get("ts"))
             queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
             for entry in (e for e in (queued if isinstance(queued, list) else ()) if isinstance(e, dict)):
                 speaker = str(entry.get("speaker", ""))
-                state.record_caption(speaker=speaker, text=str(entry.get("text", "")))
+                state.record_dom_speaker(speaker, now)
+                if not cfg.rtc_audio:
+                    state.record_caption(speaker=speaker, text=str(entry.get("text", "")))
                 # Barge-in: a real human spoke while we may be generating audio.
                 if (rt["session"] is not None and _looks_like_human_speaker(speaker, cfg.guest_name)
                         and _quiet(rt["session"].cancel_response)):
@@ -1049,6 +1134,8 @@ def run_bot() -> int:
                 _quiet(page.evaluate, "window.__hermesMeetRtcStop && window.__hermesMeetRtcStop()")
                 _quiet(page.wait_for_timeout, 1500)
             _quiet(page.evaluate, _LEAVE_CALL_JS)
+            if cfg.auth_state:
+                _quiet(context.storage_state, path=cfg.auth_state)
             _quiet(context.close)
             _quiet(browser.close)
             if cfg.rtc_audio:
