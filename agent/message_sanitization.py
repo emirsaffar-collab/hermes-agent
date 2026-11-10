@@ -7,6 +7,7 @@ characters that would crash ``json.dumps`` in the OpenAI SDK or be rejected upst
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -947,6 +948,64 @@ def _reasoning_shape(msg: dict) -> tuple:
     return tuple(msg.get(key) for key in REASONING_CARRIERS)
 
 
+def _gemini_encrypted_sig_family(data: Any) -> str | None:
+    if not isinstance(data, str) or len(data) < 4:
+        return None
+    try:
+        raw = base64.b64decode(data[:16] + "===")
+        if raw:
+            return "vertex" if raw[0] in (0x01, 0x0A) else ("aistudio" if raw[0] == 0x12 else f"0x{raw[0]:02x}")
+    except Exception:
+        return None
+    return None
+
+
+def harmonize_gemini_reasoning_details(api_messages: list) -> int:
+    """Strip older incompatible google-gemini-v1 encrypted signatures when a session
+    contains mixed Vertex (first_byte 0x01/0x0a) and AI Studio (first_byte 0x12) blocks."""
+    target_fam: str | None = None
+    for msg in reversed(api_messages):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for block in msg.get(RD) or ():
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "reasoning.encrypted"
+                and block.get("format") == "google-gemini-v1"
+            ):
+                target_fam = _gemini_encrypted_sig_family(block.get("data"))
+                if target_fam:
+                    break
+        if target_fam:
+            break
+    if not target_fam:
+        return 0
+    stripped_msgs = 0
+    for msg in api_messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant" or RD not in msg:
+            continue
+        details = msg.get(RD)
+        if not isinstance(details, list):
+            continue
+        kept = [
+            b
+            for b in details
+            if not (
+                isinstance(b, dict)
+                and b.get("type") == "reasoning.encrypted"
+                and b.get("format") == "google-gemini-v1"
+                and _gemini_encrypted_sig_family(b.get("data")) not in (None, target_fam)
+            )
+        ]
+        if len(kept) != len(details):
+            if kept:
+                msg[RD] = kept
+            else:
+                msg.pop(RD, None)
+            stripped_msgs += 1
+    return stripped_msgs
+
+
 def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool, carriers: frozenset | None = None) -> int:
     """Reconcile already-built assistant turns with the ACTIVE route.
 
@@ -965,6 +1024,7 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool, carrier
             continue
         apply_reasoning_content_policy(api_msg, api_msg, needs_thinking_pad, carriers)
         changed += _reasoning_shape(api_msg) != before
+    changed += harmonize_gemini_reasoning_details(api_messages)
     return changed
 
 
