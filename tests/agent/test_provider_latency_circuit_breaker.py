@@ -120,3 +120,26 @@ def test_explicit_failure_demotion_is_not_cleared_early_by_inflight_latency_samp
         reset_circuit_breaker()
 
 
+def test_mixed_context_window_uses_rolling_threshold_mean():
+    """CF-73 / DQ #1991: When large-context calls (165k-311k tokens) are followed by a
+    small-context call (36.8k tokens, 9.4s), the rolling average duration (37.02s) must
+    be compared against the rolling average threshold of the 5-call window (92.50s),
+    not the final small-context call's threshold (36.5s).
+    """
+    reset_circuit_breaker()
+    try:
+        samples = [
+            (12.8, 277_928),
+            (22.5, 165_259),
+            (116.4, 311_630),
+            (24.0, 288_398),
+            (9.4, 36_769),
+        ]
+        for dur, ctx in samples:
+            record_provider_latency("google/gemini-4-argon", "Google AI Studio", dur, context_tokens=ctx)
+        assert not is_provider_demoted("google/gemini-4-argon", "Google AI Studio")
+    finally:
+        reset_circuit_breaker()
+
+
+

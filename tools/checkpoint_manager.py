@@ -1575,7 +1575,11 @@ class CheckpointManager:
 
         # An explicitly checkpointed root owns its ledger even when an
         # ancestor carries a project marker. Prefer the nearest owner.
-        roots = [Path(meta["workdir"]) for meta in _list_projects(_store_path()) if meta.get("workdir")]
+        roots = [
+            Path(meta["workdir"])
+            for meta in _list_projects(_store_path())
+            if meta.get("workdir") and not _too_broad(str(Path(meta["workdir"]).resolve()))
+        ]
         owners = [root for root in roots if candidate.is_relative_to(root)]
         if owners:
             return str(max(owners, key=lambda root: len(root.parts)))

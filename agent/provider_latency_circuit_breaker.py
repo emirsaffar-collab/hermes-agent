@@ -47,6 +47,8 @@ _PROVIDER_KEY_ALIASES = {
 _lock = threading.Lock()
 # (model, provider) -> deque of float durations
 _history: dict[tuple[str, str], collections.deque[float]] = {}
+# (model, provider) -> deque of per-sample context-scaled thresholds matching _history
+_thresholds: dict[tuple[str, str], collections.deque[float]] = {}
 # (model, provider) -> demoted_until_timestamp
 _demoted_until: dict[tuple[str, str], float] = {}
 # (model, provider) -> explicit_failure_demoted_until_timestamp (immune to early latency recovery from in-flight calls)
@@ -93,11 +95,18 @@ def record_provider_latency(model: str, provider: str, duration_s: float,
     with _lock:
         if key not in _history:
             _history[key] = collections.deque(maxlen=_WINDOW_SIZE)
+        if key not in _thresholds or len(_thresholds[key]) != len(_history[key]):
+            _thresholds[key] = collections.deque(
+                [_latency_threshold_s(model, None)] * len(_history[key]),
+                maxlen=_WINDOW_SIZE,
+            )
         _history[key].append(duration_s)
+        _thresholds[key].append(threshold)
 
-        # Check if rolling average exceeds threshold
+        # Check if rolling average exceeds rolling context-scaled window threshold
         avg = sum(_history[key]) / len(_history[key])
-        if len(_history[key]) >= 2 and avg >= threshold:
+        eff_threshold = sum(_thresholds[key]) / len(_thresholds[key])
+        if len(_history[key]) >= 2 and avg >= eff_threshold:
             prev_until = _demoted_until.get(key)
             warn_until = _warned_until.get(key)
             already_demoted = (prev_until is not None and now < prev_until) or (
@@ -110,11 +119,12 @@ def record_provider_latency(model: str, provider: str, duration_s: float,
             log_fn = logger.debug if already_demoted else logger.warning
             log_fn(
                 "provider circuit-breaker: %s @ %s degraded (avg=%.1fs over %d calls, threshold=%.1fs); demoting for %.0fs",
-                model, provider, avg, len(_history[key]), threshold, _COOLDOWN_SECONDS,
+                model, provider, avg, len(_history[key]), eff_threshold, _COOLDOWN_SECONDS,
             )
         elif (
             key in _demoted_until
             and duration_s < threshold
+            and avg < eff_threshold
             and now >= _failure_demoted_until.get(key, 0.0)
         ):
             # Recovered early on probe (only for latency demotions; explicit failure/429
@@ -233,6 +243,7 @@ def reset_circuit_breaker() -> None:
     """Testing helper to clear all in-memory breaker state."""
     with _lock:
         _history.clear()
+        _thresholds.clear()
         _demoted_until.clear()
         _failure_demoted_until.clear()
         _warned_until.clear()
