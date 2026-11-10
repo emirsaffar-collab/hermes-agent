@@ -850,6 +850,99 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             f"WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id",
             [session_id, *tail_ids] if retarget else tail_ids)
 
+    def _strip_superseded_compaction_rows(
+        self,
+        conn,
+        candidate_ids: list[int],
+        compacted_messages: list[dict[str, Any]],
+        covered_set: set[int],
+    ) -> tuple[list[int], set[int]]:
+        """Identify and strip superseded prior compaction generations from *candidate_ids*.
+
+        When a post-compaction hook fails after ``archive_and_compact`` committed to ``state.db``,
+        the caller retains pre-compaction ``_row_id``s while ``state.db`` holds the newly inserted
+        ``_compressed_summary = 1`` block as ``active = 1``. On the next compaction, those rows
+        appear above the old watermark or outside ``covered_set``. Stripping contiguous runs that
+        start at a prior compaction summary (up to the next row in ``covered_set``) archives them
+        as ``active = 0, compacted = 1`` instead of cloning them into ``clone_ids`` (#RC-02).
+        """
+        if not candidate_ids or not any(
+            isinstance(m, dict)
+            and (
+                m.get("_compressed_summary")
+                or str(m.get("content") or "").startswith(
+                    ("[CONTEXT COMPACTION — REFERENCE ONLY]", "[PRIOR CONTEXT — for reference only]")
+                )
+            )
+            for m in compacted_messages
+        ):
+            return candidate_ids, set()
+        meta = {
+            int(r["id"]): (
+                bool(r["_compressed_summary"]),
+                str(r["content"] or "")[:80],
+                (
+                    r["role"],
+                    self._encode_content(
+                        self._loaded_view_content(r["role"], self._decode_content(r["content"]))
+                    ),
+                ),
+            )
+            for r in conn.execute(
+                f"SELECT id, role, _compressed_summary, content "
+                f"FROM messages WHERE id IN ({_placeholders(candidate_ids)})",
+                tuple(candidate_ids),
+            ).fetchall()
+        }
+        summary_ids = {
+            rid
+            for rid, (is_cs, head, _rc) in meta.items()
+            if is_cs
+            or head.startswith(
+                ("[CONTEXT COMPACTION — REFERENCE ONLY]", "[PRIOR CONTEXT — for reference only]")
+            )
+        }
+        if not summary_ids:
+            return candidate_ids, set()
+        compacted_tail_keys = {
+            (
+                m.get("role", "unknown"),
+                self._encode_content(
+                    self._loaded_view_content(m.get("role", "unknown"), m.get("content"))
+                ),
+            )
+            for m in compacted_messages
+            if isinstance(m, dict)
+            and not m.get("_compressed_summary")
+            and not str(m.get("content") or "").startswith(
+                ("[CONTEXT COMPACTION — REFERENCE ONLY]", "[PRIOR CONTEXT — for reference only]")
+            )
+        }
+        superseded: set[int] = set()
+        in_superseded = False
+        seen_tail = False
+        for rid in candidate_ids:
+            if rid in covered_set:
+                in_superseded = False
+                seen_tail = False
+                continue
+            if rid in summary_ids:
+                in_superseded = True
+                seen_tail = False
+                superseded.add(rid)
+                continue
+            if in_superseded:
+                rc_key = meta[rid][2]
+                if rc_key in compacted_tail_keys:
+                    seen_tail = True
+                    superseded.add(rid)
+                elif seen_tail:
+                    in_superseded = False
+                    seen_tail = False
+                else:
+                    superseded.add(rid)
+        return [rid for rid in candidate_ids if rid not in superseded], superseded
+
     def _archive_named_rows(
         self, conn, session_id: str, compacted_messages: list[dict[str, Any]], covered: list[int], *,
         tail_count: int, carried_messages: Optional[list[dict[str, Any]]], patched_model_config: Any,
@@ -865,10 +958,16 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         covered_set = set(covered)
         carried_ids = self._resolve_carried_row_ids(conn, session_id, carried_messages or [])
         covered_set.update(carried_ids)
+        raw_unseen = [row_id for row_id in active_ids if row_id not in covered_set]
+        # An unseen row the compacted set already carries is superseded by that copy, not cloned (#137197).
+        carried_unseen, weak_claims = self._carried_tail_ids(conn, raw_unseen, compacted_messages)
+        _, superseded = self._strip_superseded_compaction_rows(
+            conn, active_ids, compacted_messages, covered_set | set(carried_unseen)
+        )
+        if superseded:
+            covered_set.update(superseded)
         unseen = [row_id for row_id in active_ids if row_id not in covered_set]
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
-        # An unseen row the compacted set already carries is superseded by that copy, not cloned (#137197).
-        carried_unseen, weak_claims = self._carried_tail_ids(conn, unseen, compacted_messages)
         clone_ids = [row_id for row_id in unseen if row_id not in carried_unseen]
         tail_below = tail_count - self._carried_tail_slots(carried_unseen, len(compacted_messages), tail_count)
         rewind_ids = list(carried_ids)
@@ -992,12 +1091,25 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
                 carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
                 merged_away=proved[1])
-        tail_ids: list[int] = [] if watermark is None else [int(row["id"]) for row in conn.execute(
-            "SELECT id FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
-            (session_id, int(watermark))).fetchall()]
+        raw_tail_ids: list[int] = []
+        if watermark is not None:
+            raw_tail_ids = [int(row["id"]) for row in conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
+                (session_id, int(watermark))).fetchall()]
+        elif covered_ids:
+            active_all = [int(row["id"]) for row in conn.execute(_ACTIVE_IDS_SQL, (session_id,)).fetchall()]
+            if any(int(c) in set(active_all) for c in covered_ids):
+                raw_tail_ids = active_all
         # A concurrent-tail row the compacted set already carries is superseded by that copy, not
         # cloned beside it (#137197); its carried dict then has no original below the watermark.
-        carried_tail, weak_claims = self._carried_tail_ids(conn, tail_ids, compacted_messages)
+        carried_tail, weak_claims = self._carried_tail_ids(conn, raw_tail_ids, compacted_messages)
+        fallback_covered = {int(c) for c in (covered_ids or ()) if isinstance(c, int)} | set(carried_tail)
+        tail_ids, superseded_tail = self._strip_superseded_compaction_rows(
+            conn, raw_tail_ids, compacted_messages, fallback_covered
+        )
+        if superseded_tail and watermark is None and covered_ids:
+            explicit_cov = {int(c) for c in covered_ids if isinstance(c, int)}
+            tail_ids = [rid for rid in tail_ids if rid not in explicit_cov]
         clone_ids = [row_id for row_id in tail_ids if row_id not in carried_tail]
         _ids, tail_tool_calls = ([], 0) if not clone_ids else self._tail_rows_after_watermark(
             conn, f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(clone_ids)}) ORDER BY id",

@@ -29,6 +29,27 @@ from agent.turn_context_compaction import (
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _repair_alternation_after_compression(messages: list[dict[str, Any]], agent: Any = None):
+    """Repair message alternation after compression, resilient to in-memory module skew."""
+    try:
+        from agent.message_sanitization import repair_message_alternation
+        return repair_message_alternation(messages, agent=agent)
+    except ImportError:
+        import importlib
+        import sys
+        mod = sys.modules.get("agent.message_sanitization")
+        if mod is not None:
+            try:
+                mod = importlib.reload(mod)
+                fn = getattr(mod, "repair_message_alternation", None)
+                if callable(fn):
+                    return fn(messages, agent=agent)
+            except Exception:
+                pass
+        from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+        return messages, repair_message_sequence_with_cursor(agent, messages)
+
+
 @dataclass
 class PreflightGateVerdict:
     """``action``: ``"fallthrough"`` (make the API call), ``"continue"`` (window grown or
@@ -183,8 +204,8 @@ def run_preflight_compression(
                 )
         else:
             _reset_retry_state_after_compaction(agent)
-            from agent.message_sanitization import repair_message_alternation
-            v.messages, _ = repair_message_alternation(v.messages, agent=agent)
+            # repair_message_alternation (with stale-module reload/fallback)
+            v.messages, _ = _repair_alternation_after_compression(v.messages, agent=agent)
             # Re-baseline the flush cursor: rotation returns None (child flushes
             # whole); in-place returns list(messages) — None would re-append
             # persisted rows. See conversation_history_after_compression().
@@ -363,8 +384,8 @@ def compress_after_tool_results(
             # — a temporary defer, not evidence about compressibility.
             compression_attempts -= 1
         else:
-            from agent.message_sanitization import repair_message_alternation
-            messages, _ = repair_message_alternation(messages, agent=agent)
+            # repair_message_alternation (with stale-module reload/fallback)
+            messages, _ = _repair_alternation_after_compression(messages, agent=agent)
             conversation_history = conversation_history_after_compression(
                 agent, messages, conversation_history
             )

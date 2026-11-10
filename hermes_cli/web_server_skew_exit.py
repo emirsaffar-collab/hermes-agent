@@ -60,11 +60,23 @@ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fe
 
     def _loop() -> None:
         seen = polls = 0
+        hot_reloaded_reason: Optional[str] = None
         while not getattr(server, "should_exit", False) and (max_polls is None or polls < max_polls):
             polls += 1
             reason = observe()
             seen = seen + 1 if reason else 0
             if seen >= _CONFIRMATIONS:
+                if reason and reason != hot_reloaded_reason:
+                    hot_reloaded_reason = reason
+                    try:
+                        import importlib
+                        import sys
+                        for mod_name in ("agent.message_sanitization", "agent.turn_preflight"):
+                            mod = sys.modules.get(mod_name)
+                            if mod is not None:
+                                importlib.reload(mod)
+                    except Exception:
+                        pass
                 active_fn = getattr(fence, "active_count", None)
                 if callable(active_fn):
                     active_val = active_fn()
