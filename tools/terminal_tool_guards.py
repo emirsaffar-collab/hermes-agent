@@ -90,7 +90,7 @@ _LONG_LIVED_FOREGROUND_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
     r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|watch)\b",
     r"\bdocker\s+compose\s+up\b",
     r"\bnext\s+dev\b",
-    r"\bvite(?:\s|$)",
+    r"\bvite(?:\s+(?!build\b|optimize\b)|$)",
     r"\bnodemon\b",
     r"\buvicorn\b",
     r"\bgunicorn\b",

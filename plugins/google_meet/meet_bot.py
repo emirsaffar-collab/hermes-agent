@@ -313,6 +313,184 @@ _RTC_HOOK_JS = r"""
 """
 
 
+def _patch_silero_vad_batch_limit(max_batch: int = 1500) -> None:
+    """Cap SileroVADModel encoder_batch_size from 10000 to max_batch to avoid a 2.4 GB ONNX arena."""
+    try:
+        from faster_whisper import vad as fw_vad
+        import numpy as np
+        if getattr(fw_vad.SileroVADModel, "_hermes_batch_patched", False):
+            return
+        def _bounded_call(self, audio, num_samples: int = 512, context_size_samples: int = 64):
+            h = np.zeros((1, 1, 128), dtype="float32")
+            c = np.zeros((1, 1, 128), dtype="float32")
+            batched_audio = audio.reshape(-1, num_samples)
+            context = batched_audio[..., -context_size_samples:].copy()
+            context[-1] = 0
+            context = np.roll(context, 1, 0)
+            batched_audio = np.concatenate([context, batched_audio], 1).reshape(
+                -1, num_samples + context_size_samples
+            )
+            outputs = []
+            for i in range(0, batched_audio.shape[0], max_batch):
+                output, h, c = self.session.run(
+                    None, {"input": batched_audio[i : i + max_batch], "h": h, "c": c}
+                )
+                outputs.append(output)
+            return np.concatenate(outputs, axis=0)
+        fw_vad.SileroVADModel.__call__ = _bounded_call
+        fw_vad.SileroVADModel._hermes_batch_patched = True
+    except Exception:
+        pass
+
+
+def _is_ct2_float16(model_bin: Path) -> bool:
+    if not model_bin.is_file():
+        return False
+    import struct
+    dtypes = ("float32", "int8", "int16", "int32", "float16", "bfloat16")
+    try:
+        with model_bin.open("rb") as fin:
+            def read_str():
+                n = struct.unpack("H", fin.read(2))[0]
+                s = fin.read(n - 1).decode("utf-8")
+                fin.read(1)
+                return s
+            _ver = struct.unpack("I", fin.read(4))[0]
+            _spec = read_str()
+            _rev = struct.unpack("I", fin.read(4))[0]
+            nvars = struct.unpack("I", fin.read(4))[0]
+            for _ in range(min(nvars, 20)):
+                vname = read_str()
+                rank = struct.unpack("B", fin.read(1))[0]
+                _dims = [struct.unpack("I", fin.read(4))[0] for _ in range(rank)]
+                tid = struct.unpack("B", fin.read(1))[0]
+                nbytes = struct.unpack("I", fin.read(4))[0]
+                if vname.endswith("/weight"):
+                    return dtypes[tid] == "float16"
+                fin.seek(nbytes, 1)
+    except Exception:
+        return False
+    return False
+
+
+def _ensure_ct2_int8_on_disk(model_path_or_id: str) -> bool:
+    """If model_path_or_id points to a float16 CTranslate2 model.bin, atomically pre-quantize it to int8 on disk.
+    Eliminates the 6.1 GB peak / 2.9 GB MALLOC_LARGE runtime float16->int8 quantization spike per process."""
+    p = Path(str(model_path_or_id))
+    model_bin = p / "model.bin" if p.is_dir() else (p if p.name == "model.bin" else None)
+    if model_bin is None or not _is_ct2_float16(model_bin):
+        return False
+    import struct
+    import numpy as np
+    target_bin = model_bin.resolve()
+    dtypes = ("float32", "int8", "int16", "int32", "float16", "bfloat16")
+    np_dtypes = {"float32": np.float32, "int8": np.int8, "int16": np.int16, "int32": np.int32, "float16": np.float16}
+    entries = []
+    with target_bin.open("rb") as fin:
+        def read_str():
+            n = struct.unpack("H", fin.read(2))[0]
+            s = fin.read(n - 1).decode("utf-8")
+            fin.read(1)
+            return s
+        ver = struct.unpack("I", fin.read(4))[0]
+        spec_name = read_str()
+        rev = struct.unpack("I", fin.read(4))[0]
+        nvars = struct.unpack("I", fin.read(4))[0]
+        for _ in range(nvars):
+            vname = read_str()
+            rank = struct.unpack("B", fin.read(1))[0]
+            dims = [struct.unpack("I", fin.read(4))[0] for _ in range(rank)]
+            tid = struct.unpack("B", fin.read(1))[0]
+            nbytes = struct.unpack("I", fin.read(4))[0]
+            offset = fin.tell()
+            fin.seek(nbytes, 1)
+            dt_str = dtypes[tid]
+            is_q = vname.endswith("/weight") and len(dims) == 2 and dt_str in ("float16", "float32") and not vname.endswith(("/conv1/weight", "/conv2/weight", "/embeddings/weight"))
+            entries.append((vname, dims, tid, nbytes, offset, is_q))
+        naliases = struct.unpack("I", fin.read(4))[0]
+        aliases = [(read_str(), read_str()) for _ in range(naliases)]
+
+    plan = []
+    for vname, dims, tid, nbytes, offset, is_q in entries:
+        if is_q:
+            plan.append((vname, "quant_weight", dims, tid, nbytes, offset))
+            plan.append((f"{vname}_scale", "quant_scale", dims, tid, nbytes, offset))
+        elif dtypes[tid] == "float16":
+            plan.append((vname, "to_f32", dims, tid, nbytes, offset))
+        else:
+            plan.append((vname, "raw", dims, tid, nbytes, offset))
+    plan.sort(key=lambda x: x[0])
+
+    out_aliases = []
+    for al, target in aliases:
+        out_aliases.append((al, target))
+        if target.endswith("/weight") and not target.endswith(("/conv1/weight", "/conv2/weight", "/embeddings/weight")):
+            out_aliases.append((f"{al}_scale", f"{target}_scale"))
+
+    tmp_bin = target_bin.parent / f"{target_bin.name}.int8.{os.getpid()}.tmp"
+    cache_last = {}
+    with target_bin.open("rb") as fin, tmp_bin.open("wb") as fout:
+        def write_str(s: str):
+            b = s.encode("utf-8")
+            fout.write(struct.pack("H", len(b) + 1))
+            fout.write(b)
+            fout.write(struct.pack("B", 0))
+        fout.write(struct.pack("I", ver))
+        write_str(spec_name)
+        fout.write(struct.pack("I", rev))
+        fout.write(struct.pack("I", len(plan)))
+
+        for out_name, kind, dims, tid, nbytes, offset in plan:
+            if kind in ("quant_weight", "quant_scale"):
+                base_name = out_name[:-6] if kind == "quant_scale" else out_name
+                if base_name not in cache_last:
+                    cache_last.clear()
+                    fin.seek(offset)
+                    raw = fin.read(nbytes)
+                    arr = np.frombuffer(raw, dtype=np_dtypes[dtypes[tid]]).reshape(dims).astype(np.float32)
+                    old_shape = None
+                    if len(arr.shape) == 3:
+                        old_shape = arr.shape
+                        arr = arr.reshape(arr.shape[0], -1)
+                    amax = np.amax(np.absolute(arr), axis=1)
+                    amax[amax == 0] = 127.0
+                    scale = (127.0 / amax).astype(np.float32)
+                    q_arr = np.rint(arr * np.expand_dims(scale, 1)).astype(np.int8)
+                    if old_shape:
+                        q_arr = q_arr.reshape(old_shape)
+                    cache_last[base_name] = (
+                        (list(q_arr.shape), 1, q_arr.tobytes()),
+                        (list(scale.shape), 0, scale.tobytes()),
+                    )
+                    del arr, q_arr, scale, raw
+                w_item, s_item = cache_last[base_name]
+                out_dims, out_tid, out_bytes = w_item if kind == "quant_weight" else s_item
+            elif kind == "to_f32":
+                fin.seek(offset)
+                raw = fin.read(nbytes)
+                arr = np.frombuffer(raw, dtype=np.float16).reshape(dims).astype(np.float32)
+                out_dims, out_tid, out_bytes = dims, 0, arr.tobytes()
+            else:
+                fin.seek(offset)
+                out_dims, out_tid, out_bytes = dims, tid, fin.read(nbytes)
+
+            write_str(out_name)
+            fout.write(struct.pack("B", len(out_dims)))
+            for d in out_dims:
+                fout.write(struct.pack("I", d))
+            fout.write(struct.pack("B", out_tid))
+            fout.write(struct.pack("I", len(out_bytes)))
+            fout.write(out_bytes)
+
+        fout.write(struct.pack("I", len(out_aliases)))
+        for al, target in out_aliases:
+            write_str(al)
+            write_str(target)
+
+    os.replace(tmp_bin, target_bin)
+    return True
+
+
 class _RtcTranscriber:
     """Decodes recorded WebRTC audio and transcribes it with faster-whisper.
 
@@ -333,22 +511,50 @@ class _RtcTranscriber:
 
     def __init__(self, cfg: _BotConfig, state: _BotState, stop_flag: dict):
         self.cfg, self.state, self.stop = cfg, state, stop_flag
-        self._queue = deque()          # (stream_id, Path)
+        self._queue = deque()          # (stream_id, nbytes)
         self._lock = threading.Lock()
         self._whisper_lock = threading.Lock()
         self.threads = []
         self._last_text = {}
         self._transcribed = {}         # stream_id → samples already transcribed
+        self._decoded_bytes = {}       # stream_id → byte offset in merged WebM already decoded
+        self._webm_headers = {}        # stream_id → EBML+Tracks header bytes before first Cluster
+        self._detected_language = None
         self._model = None
         self._whisper_failed = False
 
     def _whisper(self):
-        if self._model is None:
-            from faster_whisper import WhisperModel
-            self._model = WhisperModel(
-                self.cfg.whisper_model, device="cpu", compute_type="int8",
-                download_root=str(Path.home() / ".open-webui/cache/whisper/models"))
+        if self._model is not None:
+            return self._model
+        with self._whisper_lock:
+            if self._model is None:
+                _patch_silero_vad_batch_limit(1500)
+                _ensure_ct2_int8_on_disk(self.cfg.whisper_model)
+                from faster_whisper import WhisperModel
+                cpu_threads = int(os.environ.get("HERMES_MEET_CPU_THREADS", "2") or 2)
+                self._model = WhisperModel(
+                    self.cfg.whisper_model, device="cpu", compute_type="int8",
+                    cpu_threads=cpu_threads,
+                    download_root=str(Path.home() / ".open-webui/cache/whisper/models"))
         return self._model
+
+    def _decode_bytes(self, buf: bytes):
+        import io
+        import av
+        import numpy as np
+        c = av.open(io.BytesIO(buf))
+        astream = next((s for s in c.streams if s.type == "audio"), None)
+        if astream is None:
+            c.close()
+            return None
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+        pcm = bytearray()
+        for frame in c.decode(astream):
+            rf = resampler.resample(frame)
+            for f in (rf if isinstance(rf, list) else [rf]):
+                pcm.extend(f.to_ndarray().tobytes())
+        c.close()
+        return np.frombuffer(bytes(pcm), dtype=np.int16).astype(np.float32) / 32768.0
 
     def _decode(self, path: Path):
         import av
@@ -374,6 +580,8 @@ class _RtcTranscriber:
             data = path.read_bytes()
             if data.startswith(self._EBML_MAGIC):
                 cluster = data.find(self._CLUSTER_ID)
+                if cluster > 0 and stream_id not in self._webm_headers:
+                    self._webm_headers[stream_id] = data[:cluster]
                 if merged.exists() and merged.stat().st_size > 0 and cluster > 0:
                     data = data[cluster:]
             with merged.open("ab") as f:
@@ -404,6 +612,19 @@ class _RtcTranscriber:
                     return item
         return None
 
+    def _drain_stream_queue(self, stream_id: int) -> int:
+        """Drain all queued items for stream_id whose bytes are already merged on disk."""
+        drained = 0
+        with self._lock:
+            keep = deque()
+            for item in self._queue:
+                if item[0] == stream_id:
+                    drained += int(item[1] or 0)
+                else:
+                    keep.append(item)
+            self._queue = keep
+        return drained
+
     def _worker(self, stream_id: int) -> None:
         label = f"Voice {stream_id}"
         merged = self.cfg.out_dir / "audio" / f"stream_{stream_id:02d}.webm"
@@ -413,10 +634,12 @@ class _RtcTranscriber:
             item = self._pop(stream_id)
             if item is None:
                 if self.stop.get("stop"):
+                    self._drain_stream_queue(stream_id)
                     self._flush_stream(stream_id, merged, label)
                     return
                 # idle: flush whatever accumulated so the transcript stays near-live
                 if fresh_bytes > 0 and time.time() - last_flush > 25:
+                    self._drain_stream_queue(stream_id)
                     self._flush_stream(stream_id, merged, label)
                     fresh_bytes, last_flush = 0, time.time()
                 time.sleep(0.5)
@@ -424,25 +647,71 @@ class _RtcTranscriber:
             _, nbytes = item
             fresh_bytes += int(nbytes or 0)
             if fresh_bytes > 400_000 or time.time() - last_flush > 15:
+                self._drain_stream_queue(stream_id)
                 self._flush_stream(stream_id, merged, label)
                 fresh_bytes, last_flush = 0, time.time()
 
+    def _decode_incremental_tail(self, stream_id: int, merged: Path):
+        """Decode only the newly appended WebM clusters in O(1) time; fall back to full _decode if needed."""
+        done = self._transcribed.get(stream_id, 0)
+        if "_decode" in self.__dict__:
+            audio = self._decode(merged)
+            if audio is None or len(audio) <= done + 16000 * 5:
+                return None, done
+            tail = audio[done:]
+            self._transcribed[stream_id] = len(audio)
+            return tail, done
+
+        file_size = merged.stat().st_size
+        prev_off = self._decoded_bytes.get(stream_id, 0)
+        if prev_off > 0 and file_size <= prev_off:
+            return None, done
+
+        try:
+            with merged.open("rb") as f:
+                if stream_id not in self._webm_headers:
+                    head_probe = f.read(4096)
+                    if head_probe.startswith(self._EBML_MAGIC):
+                        first_cl = head_probe.find(self._CLUSTER_ID)
+                        if first_cl > 0:
+                            self._webm_headers[stream_id] = head_probe[:first_cl]
+                header = self._webm_headers.get(stream_id)
+                if header is not None:
+                    start_off = max(prev_off, len(header))
+                    if file_size <= start_off:
+                        return None, done
+                    f.seek(start_off)
+                    new_clusters = f.read(file_size - start_off)
+                    if new_clusters.startswith(self._CLUSTER_ID):
+                        tail = self._decode_bytes(header + new_clusters)
+                        if tail is not None:
+                            if len(tail) <= 16000 * 5:
+                                return None, done
+                            self._decoded_bytes[stream_id] = file_size
+                            self._transcribed[stream_id] = done + len(tail)
+                            return tail, done
+        except Exception:
+            pass
+
+        audio = self._decode(merged)
+        if audio is None or len(audio) <= done + 16000 * 5:
+            return None, done
+        tail = audio[done:]
+        self._decoded_bytes[stream_id] = file_size
+        self._transcribed[stream_id] = len(audio)
+        return tail, done
+
     def _flush_stream(self, stream_id: int, merged: Path, label: str) -> None:
-        """Decode the merged stream file and transcribe only the PCM not yet done."""
+        """Decode the merged stream file incrementally and transcribe only the PCM not yet done."""
         if not merged.exists() or merged.stat().st_size == 0:
             return
         try:
-            audio = self._decode(merged)
+            tail, done = self._decode_incremental_tail(stream_id, merged)
         except Exception as e:
             sys.stderr.write(f"meet rtc: decode {merged.name} failed: {e}\n")
             return
-        if audio is None:
+        if tail is None:
             return
-        done = self._transcribed.get(stream_id, 0)
-        if len(audio) <= done + 16000 * 5:  # wait for ≥5 s of genuinely new audio
-            return
-        tail = audio[done:]
-        self._transcribed[stream_id] = len(audio)
         try:
             peak = float(abs(tail).max())
             sys.stderr.write(f"meet rtc: flush stream {stream_id}: +{len(tail)/16000:.1f}s new audio, peak {peak:.4f}\n")
@@ -450,6 +719,18 @@ class _RtcTranscriber:
                 return
         except Exception:
             return
+        speech_dur_s = 0.0
+        try:
+            _patch_silero_vad_batch_limit(1500)
+            from faster_whisper.vad import get_speech_timestamps, VadOptions
+            speeches = get_speech_timestamps(
+                tail, VadOptions(threshold=0.5, min_speech_duration_ms=350, speech_pad_ms=200)
+            )
+            if not speeches:
+                return
+            speech_dur_s = sum(sp["end"] - sp["start"] for sp in speeches) / 16000.0
+        except Exception:
+            pass
         try:
             model = self._whisper()
         except Exception as e:
@@ -459,19 +740,28 @@ class _RtcTranscriber:
             return
         try:
             lang_env = os.environ.get("HERMES_MEET_LANGUAGE", "").strip() or None
-            if lang_env == "auto":
-                lang_env = None
+            if lang_env == "auto" or lang_env is None:
+                lang_env = self._detected_language
             prompt_env = os.environ.get("HERMES_MEET_INITIAL_PROMPT", "").strip() or self._last_text.get(stream_id) or None
             with self._whisper_lock:
                 segs_iter, _info = model.transcribe(
                     tail,
                     language=lang_env,
                     vad_filter=True,
+                    vad_parameters=dict(threshold=0.5, min_speech_duration_ms=350, speech_pad_ms=200),
                     beam_size=1,
+                    temperature=0.0,
                     condition_on_previous_text=False,
                     initial_prompt=prompt_env,
                 )
                 segs = list(segs_iter)
+                if (
+                    self._detected_language is None
+                    and speech_dur_s >= 3.0
+                    and getattr(_info, "language", None)
+                    and float(getattr(_info, "language_probability", 0.0) or 0.0) >= 0.80
+                ):
+                    self._detected_language = _info.language
             base_offset_s = float(done) / 16000.0
             _hallucination_pat = re.compile(
                 r"^(?:mikael wiehe:?|tack till elever och personal.*|undertextning:?.*|textning\.nu.*)$",
@@ -479,6 +769,8 @@ class _RtcTranscriber:
             )
             for s in segs:
                 text = (s.text or "").strip()
+                if re.search(r"\b(\w+)(?:[\s,]+\1){4,}", text, re.IGNORECASE):
+                    continue
                 if text and not _hallucination_pat.match(text):
                     seg_offset_s = base_offset_s + float(getattr(s, "start", 0.0) or 0.0)
                     anchor = self.state.joined_at or self.state.join_attempted_at or time.time()
@@ -815,6 +1107,15 @@ def _config_from_env() -> _BotConfig:
         lobby_timeout=float(env("HERMES_MEET_LOBBY_TIMEOUT", "300")))
 
 
+def _click_nowait(el, timeout: int = 2_000) -> bool:
+    try:
+        el.click(timeout=timeout, no_wait_after=True)
+        return True
+    except TypeError:
+        el.click(timeout=timeout)
+        return True
+
+
 def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 60.0) -> None:
     """Fill the guest-name field and click 'Join now' / 'Ask to join' (the latter → lobby_waiting).
 
@@ -836,10 +1137,12 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 60.0) -> Non
         ):
             dlg = _visible(page.locator(dismiss_sel))
             if dlg is not None:
-                _quiet(lambda: (dlg.click(timeout=2_000, no_wait_after=True), True))
+                _quiet(_click_nowait, dlg, 2_000)
                 _quiet(page.wait_for_timeout, 1_500)
         # Microsoft Teams web launcher & pre-join screen handling
-        if "teams.microsoft.com" in page.url or "teams.live.com" in page.url or "teams." in cfg.url:
+        page_url = str(getattr(page, "url", "") or "")
+        cfg_url = str(getattr(cfg, "url", "") or "")
+        if "teams.microsoft.com" in page_url or "teams.live.com" in page_url or "teams." in cfg_url:
             for web_sel in (
                 'button[data-tid="joinOnWeb"]',
                 'button:has-text("Continue on this browser")',
@@ -849,7 +1152,7 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 60.0) -> Non
             ):
                 wbtn = _visible(page.locator(web_sel))
                 if wbtn is not None:
-                    _quiet(lambda: (wbtn.click(timeout=2_000, no_wait_after=True), True))
+                    _quiet(_click_nowait, wbtn, 2_000)
                     _quiet(page.wait_for_timeout, 2_000)
                     break
             t_name = _visible(page.locator('input[data-tid="prejoin-display-name-input"]'))
@@ -863,9 +1166,9 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 60.0) -> Non
             for t_toggle in ('input[data-tid="toggle-video"]', 'input[data-tid="toggle-mute"]'):
                 tog = _visible(page.locator(t_toggle))
                 if tog is not None and _quiet(tog.is_checked):
-                    _quiet(lambda: (tog.click(timeout=2_000, no_wait_after=True), True))
+                    _quiet(_click_nowait, tog, 2_000)
             t_join = _visible(page.locator('button[data-tid="prejoin-join-button"]'))
-            if t_join is not None and _quiet(t_join.is_enabled) and _quiet(lambda: (t_join.click(timeout=3_000, no_wait_after=True), True)):
+            if t_join is not None and _quiet(t_join.is_enabled) and _quiet(_click_nowait, t_join, 3_000):
                 state.set(lobby_waiting=True)
                 return
             if time.time() >= deadline:
@@ -877,13 +1180,13 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 60.0) -> Non
         for cam_label in ("Turn off camera", "Slå av kameran", "Stäng av kameran", "Slå av kamera"):
             cam_off = _visible(page.get_by_role("button", name=cam_label, exact=False))
             if cam_off is not None:
-                _quiet(lambda: (cam_off.click(timeout=2_000, no_wait_after=True), True))
+                _quiet(_click_nowait, cam_off, 2_000)
                 break
-        if cfg.rtc_audio and not cfg.realtime:
+        if getattr(cfg, "rtc_audio", False) and not getattr(cfg, "realtime", False):
             for mic_label in ("Turn off microphone", "Slå av mikrofonen", "Stäng av mikrofonen", "Slå av mikrofon", "Stäng av mikrofon"):
                 mic_off = _visible(page.get_by_role("button", name=mic_label, exact=False))
                 if mic_off is not None:
-                    _quiet(lambda: (mic_off.click(timeout=2_000, no_wait_after=True), True))
+                    _quiet(_click_nowait, mic_off, 2_000)
                     break
         name_box = _visible(page.locator('input[aria-label*="name" i], input[aria-label*="namn" i]'))
         if name_box is not None:
@@ -896,11 +1199,11 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 60.0) -> Non
                 for acc_txt in ("Other ways to join", "Andra sätt att gå med"):
                     accordion = _visible(page.locator(f'text={acc_txt}'))
                     if accordion is not None:
-                        _quiet(lambda: (accordion.click(timeout=2_000, no_wait_after=True), True))
+                        _quiet(_click_nowait, accordion, 2_000)
                         time.sleep(1.5)
                         btn = _visible(page.locator(f'button:has-text("{label}")'))
                         break
-            if btn is not None and _quiet(lambda: (btn.click(timeout=3_000, no_wait_after=True), True)):
+            if btn is not None and _quiet(_click_nowait, btn, 3_000):
                 if label in ("Ask to join", "Be om att få gå med"):
                     state.set(lobby_waiting=True)
                 return
@@ -950,7 +1253,7 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             last_admission_check = now
             if _probe(page, _ADMISSION_PROBE_JS):
                 state.set(in_call=True, lobby_waiting=False, joined_at=now,
-                          mic_state=(_ensure_mic_muted(page) if (cfg.rtc_audio and not rt["enabled"])
+                          mic_state=(_ensure_mic_muted(page) if (getattr(cfg, "rtc_audio", False) and not rt.get("enabled"))
                                      else _ensure_mic_on(page)))
             elif _visible(page.locator('button[data-tid="prejoin-join-button"], button[data-tid="joinOnWeb"]')) is not None:
                 _join(page, cfg, state, timeout=5.0)
@@ -964,7 +1267,7 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                 return
         elif state.in_call and (now - last_admission_check) > 5.0:
             last_admission_check = now
-            if state.mic_state == "unknown" and cfg.rtc_audio and not rt["enabled"]:
+            if state.mic_state == "unknown" and getattr(cfg, "rtc_audio", False) and not rt.get("enabled"):
                 m_st = _ensure_mic_muted(page)
                 if m_st != "unknown":
                     state.set(mic_state=m_st)
