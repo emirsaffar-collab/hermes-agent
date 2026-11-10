@@ -418,6 +418,52 @@ def test_monitor_script_failure_is_error_not_change(hermes_env, monkeypatch):
     assert get_job(job["id"])["monitor_state"]["last_output_hash"] == stored_hash
 
 
+def test_return_to_idle_noop_updates_hash_without_waking_agent(hermes_env, monkeypatch):
+    """When a monitor source transitions from active output back to STATUS=NOOP_COMPLETE
+    (or wakeAgent=false), last_output_hash updates to the idle hash without waking the LLM,
+    and a subsequent transition to a new active state wakes the LLM immediately."""
+    from cron.jobs import get_job
+    from cron.monitor import hash_monitor_output
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    # 1. Start idle: persists baseline hash without waking the agent
+    job = _make_monitor_job(hermes_env, "echo 'STATUS=NOOP_COMPLETE'\n")
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    success, _doc, final, error = run_job(job)
+    assert success is True and error is None
+    assert final == SILENT_MARKER
+    assert observed["agent_runs"] == 0
+    job = get_job(job["id"])
+    assert job["monitor_state"]["last_output_hash"] == hash_monitor_output("STATUS=NOOP_COMPLETE")
+
+    # 2. Transition idle -> active ("OPEN_ASKS=1"): wakes agent
+    _write_script(hermes_env, "mon.sh", "echo 'OPEN_ASKS=1'\n")
+    success, _doc, _final, error = run_job(job)
+    assert success is True and error is None
+    assert observed["agent_runs"] == 1
+    assert "+OPEN_ASKS=1" in observed["prompts"][0]
+    job = get_job(job["id"])
+    assert job["monitor_state"]["last_output_hash"] == hash_monitor_output("OPEN_ASKS=1")
+
+    # 3. Return to idle ("STATUS=NOOP_COMPLETE"): updates hash to idle WITHOUT waking agent
+    _write_script(hermes_env, "mon.sh", "echo 'STATUS=NOOP_COMPLETE'\n")
+    success, _doc, final, error = run_job(job)
+    assert success is True and error is None
+    assert final == SILENT_MARKER
+    assert observed["agent_runs"] == 1  # NOT incremented on return-to-idle!
+    job = get_job(job["id"])
+    assert job["monitor_state"]["last_output_hash"] == hash_monitor_output("STATUS=NOOP_COMPLETE")
+
+    # 4. Re-wake on same active payload ("OPEN_ASKS=1") after idle reset: wakes agent again
+    _write_script(hermes_env, "mon.sh", "echo 'OPEN_ASKS=1'\n")
+    success, _doc, _final, error = run_job(job)
+    assert success is True and error is None
+    assert observed["agent_runs"] == 2
+
+
+
 # ---------------------------------------------------------------------------
 # cronjob tool: API-layer wiring
 # ---------------------------------------------------------------------------

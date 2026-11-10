@@ -119,3 +119,96 @@ def test_rc02_archive_named_rows_archives_superseded_compaction_without_cloning(
         assert active_summaries3 == 1
     finally:
         db.close()
+
+
+def test_rc02_strips_superseded_multiturn_tool_tail_without_false_assistant_match(tmp_path):
+    """When a superseded compaction tail starts with an empty assistant tool_calls turn
+    (role='assistant', content='', tool_calls=[call_1]) whose tool result was summarized away in
+    the newer compaction while a newer tool_calls turn (call_2) remains in the compacted tail,
+    _strip_superseded_compaction_rows must use full _row_identity (including tool_calls /
+    tool_call_id) and strip through the last matching tail row rather than aborting after call_1."""
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("sid-rc02-tools", source="test")
+        db.append_message("sid-rc02-tools", "user", "U1")
+        call_1 = [{"id": "call_1", "type": "function", "function": {"name": "skill_view", "arguments": '{"name":"dab"}'}}]
+        call_2 = [{"id": "call_2", "type": "function", "function": {"name": "skill_view", "arguments": '{"name":"ship"}'}}]
+        db.append_message("sid-rc02-tools", "assistant", "", tool_calls=call_1)
+        db.append_message("sid-rc02-tools", "tool", '{"success": true, "name": "dab", "content": "# dab"}', tool_call_id="call_1", tool_name="skill_view")
+        db.append_message("sid-rc02-tools", "assistant", "", tool_calls=call_2)
+        db.append_message("sid-rc02-tools", "tool", '{"success": true, "name": "ship", "content": "# ship"}', tool_call_id="call_2", tool_name="skill_view")
+        held_before_crash = db.get_messages_as_conversation("sid-rc02-tools", include_row_ids=True)
+
+        # Compaction #1 keeps both call_1 and call_2 in its tail
+        cov1, unres1 = coverage_for_commit(db, "sid-rc02-tools", held_before_crash)
+        compacted_1 = [
+            {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] Summary #1", "_compressed_summary": True},
+            {"role": "assistant", "content": "", "tool_calls": call_1},
+            {"role": "tool", "tool_call_id": "call_1", "tool_name": "skill_view", "content": '{"success": true, "name": "dab", "content": "# dab"}'},
+            {"role": "assistant", "content": "", "tool_calls": call_2},
+            {"role": "tool", "tool_call_id": "call_2", "tool_name": "skill_view", "content": '{"success": true, "name": "ship", "content": "# ship"}'},
+        ]
+        db.archive_and_compact("sid-rc02-tools", compacted_1, tail_count=4, covered_ids=cov1, unresolved_held=unres1)
+        wm = held_before_crash[-1]["_row_id"]
+
+        # Concurrent unseen append after Compaction #1
+        db.append_message("sid-rc02-tools", "user", "UNSEEN_AFTER_TOOLS")
+
+        # Compaction #2 (from pre-crash caller) summarizes call_1 away and keeps only call_2 in tail
+        compacted_2 = [
+            {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] Summary #2", "_compressed_summary": True},
+            {"role": "assistant", "content": "", "tool_calls": call_2},
+            {"role": "tool", "tool_call_id": "call_2", "tool_name": "skill_view", "content": '{"success": true, "name": "ship", "content": "# ship"}'},
+        ]
+        db.archive_and_compact("sid-rc02-tools", compacted_2, watermark=wm, tail_count=2, covered_ids=[wm], unresolved_held=[])
+
+        live_rows = db.get_messages("sid-rc02-tools")
+        live_tcids = [r["tool_call_id"] for r in live_rows if r["role"] == "tool"]
+        assert live_tcids == ["call_2"], f"Expected only ['call_2'], got {live_tcids}"
+        assert [r["content"] for r in live_rows if r["role"] == "user"] == [
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Summary #2",
+            "UNSEEN_AFTER_TOOLS",
+        ]
+    finally:
+        db.close()
+
+
+def test_surviving_tail_skill_stays_deduped_and_omitted_from_reload_notice():
+    import json
+    from agent.context_compressor import _skill_pruned_marker
+    from agent.conversation_compression import _pruned_skill_reload_notice, _reset_read_dedup_caches
+    from tools.skills_tool_dedup import _skill_view_tracker, dedup_skill_view, reset_skill_view_dedup
+
+    task_id = "task-surviving-skill"
+    reset_skill_view_dedup(task_id)
+    kept_body = json.dumps({
+        "success": True,
+        "name": "kept-skill",
+        "content": "# Kept Skill\nFull instructions.",
+        "skill_dir": "/tmp/skills/kept-skill",
+    })
+    pruned_summary = (
+        "[CONTEXT COMPACTION — REFERENCE ONLY] Summary\n\n## Pruned Skills\n"
+        + _skill_pruned_marker("pruned-skill")
+        + "\n"
+        + _skill_pruned_marker("kept-skill")
+    )
+    compressed = [
+        {"role": "user", "content": pruned_summary, "_compressed_summary": True},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "skill_view", "arguments": '{"name":"kept-skill"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": kept_body},
+    ]
+
+    # 1. Reload notice excludes kept-skill (already unpruned in tail) and retains pruned-skill
+    notice = _pruned_skill_reload_notice(compressed)
+    assert "skill_view(name='pruned-skill')" in notice
+    assert "skill_view(name='kept-skill')" not in notice
+
+    # 2. _reset_read_dedup_caches re-seeds kept-skill so a redundant call returns the unchanged stub
+    _reset_read_dedup_caches(task_id, surviving_messages=compressed)
+    assert ("kept-skill", "") in _skill_view_tracker.get(task_id, {})
+    assert ("pruned-skill", "") not in _skill_view_tracker.get(task_id, {})
+    stub = dedup_skill_view(task_id, "kept-skill", None, json.loads(kept_body), kept_body)
+    assert stub is not None and json.loads(stub)["dedup"] is True
+    reset_skill_view_dedup(task_id)
+

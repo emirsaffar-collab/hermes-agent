@@ -47,10 +47,63 @@ def dedup_skill_view(task_id, name, file_path, payload: dict, result: str) -> st
     return None
 
 
-def reset_skill_view_dedup(task_id: str | None = None) -> None:
-    """Clear the dedup cache (all tasks when task_id is None); called on context compression."""
+def seed_skill_view_dedup_from_messages(task_id: str | None, messages: list | None) -> None:
+    """Populate the per-task dedup cache from unpruned ``skill_view`` tool results in *messages*.
+
+    Called after compaction or proactive prune so skills whose full JSON bodies survived in the
+    protected tail stay deduplicated, while skills pruned to ``[SKILL_PRUNED: ...]`` markers are
+    absent and serve full content on reload.
+    """
+    if not task_id or not isinstance(messages, list):
+        return
+    entries: list[tuple[tuple[str, str], str]] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        raw = msg.get("content")
+        if not isinstance(raw, str) or not raw.startswith("{") or '"success": true' not in raw[:80]:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        if (
+            not isinstance(payload, dict)
+            or payload.get("success") is not True
+            or payload.get("dedup")
+            or payload.get("setup_needed")
+            or payload.get("readiness_status") == "setup_needed"
+            or not isinstance(payload.get("content"), str)
+            or not ("skill_dir" in payload or "linked_files" in payload or "file_type" in payload)
+        ):
+            continue
+        resolved = str(payload.get("name") or "")
+        if not resolved:
+            continue
+        key = (resolved, str(payload.get("file") or ""))
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        entries.append((key, digest))
+    if not entries:
+        return
+    with _skill_view_tracker_lock:
+        cache = _skill_view_tracker.setdefault(str(task_id), {})
+        for key, digest in entries:
+            cache.pop(key, None)
+            cache[key] = digest
+            while len(cache) > _SKILL_VIEW_DEDUP_CAP:
+                del cache[next(iter(cache))]
+
+
+def reset_skill_view_dedup(
+    task_id: str | None = None, *, surviving_messages: list | None = None
+) -> None:
+    """Clear the dedup cache (all tasks when task_id is None); called on context compression.
+    When *surviving_messages* is provided, re-seeds unpruned ``skill_view`` results that survived
+    in the kept tail so redundant reloads of still-live skills return the unchanged stub."""
     with _skill_view_tracker_lock:
         if task_id is None:
             _skill_view_tracker.clear()
         else:
             _skill_view_tracker.pop(str(task_id), None)
+    if task_id is not None and surviving_messages:
+        seed_skill_view_dedup_from_messages(task_id, surviving_messages)

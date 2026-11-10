@@ -2309,15 +2309,29 @@ _PRUNED_SKILL_RELOAD_NOTICE_HEADER = "[Skills pruned during compression — relo
 def _pruned_skill_reload_notice(compressed: list) -> str:
     """Reload notice for skills whose bodies were pruned, or ``""``.
     Scans ``[SKILL_PRUNED: ...]`` markers in the post-compression transcript; first-seen order, deduplicated,
-    capped at ``_MAX_PRUNED_SKILL_MARKERS``."""
+    capped at ``_MAX_PRUNED_SKILL_MARKERS``. Any skill whose full unpruned ``skill_view`` body appears later in
+    *compressed* (reloaded in the protected tail) is excluded from the reload notice."""
     from agent.context_compressor import _MAX_PRUNED_SKILL_MARKERS, _extract_pruned_skill_names
     names: list = []
     for message in compressed:
         if not isinstance(message, dict):
             continue
-        for name in _extract_pruned_skill_names(_message_text(message)):
+        text = _message_text(message)
+        for name in _extract_pruned_skill_names(text):
             if name not in names:
                 names.append(name)
+        if message.get("role") == "tool" and text.startswith("{") and '"success": true' in text[:80]:
+            with contextlib.suppress(Exception):
+                payload = json.loads(text)
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("success") is True
+                    and not payload.get("dedup")
+                    and not payload.get("file")
+                    and isinstance(payload.get("content"), str)
+                    and payload.get("name") in names
+                ):
+                    names.remove(payload["name"])
     del names[_MAX_PRUNED_SKILL_MARKERS:]
     if not names:
         return ""
@@ -3372,7 +3386,9 @@ def _warn_summary_or_aux_fallback(agent: Any) -> None:
             )
 
 
-def _reset_read_dedup_caches(task_id: str, *, session_id: str = "") -> None:
+def _reset_read_dedup_caches(
+    task_id: str, *, session_id: str = "", surviving_messages: Optional[list] = None
+) -> None:
     """Advance the file-read and skill_view repeat-read dedup to a fresh generation after a boundary.
     The mtime map is kept: the first read of each unchanged key returns full content compaction may have
     omitted; later reads return stubs, and stub-hit counters restart at the same boundary (#84857).
@@ -3387,7 +3403,7 @@ def _reset_read_dedup_caches(task_id: str, *, session_id: str = "") -> None:
             reset_screenshot_dedup(session_id)
     with contextlib.suppress(Exception):
         from tools.skills_tool import reset_skill_view_dedup
-        reset_skill_view_dedup(task_id)
+        reset_skill_view_dedup(task_id, surviving_messages=surviving_messages)
 
 
 def _finish_compaction_boundary(
@@ -3480,7 +3496,9 @@ def _finish_compaction_boundary(
             )
         else:
             compressor._verify_compaction_cleared_threshold = True
-    _reset_read_dedup_caches(task_id, session_id=agent.session_id or "")
+    _reset_read_dedup_caches(
+        task_id, session_id=agent.session_id or "", surviving_messages=compressed
+    )
     return _compressed_est
 
 

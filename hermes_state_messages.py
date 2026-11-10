@@ -881,15 +881,15 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             int(r["id"]): (
                 bool(r["_compressed_summary"]),
                 str(r["content"] or "")[:80],
-                (
+                self._row_identity(
                     r["role"],
-                    self._encode_content(
-                        self._loaded_view_content(r["role"], self._decode_content(r["content"]))
-                    ),
+                    self._decode_content(r["content"]),
+                    r["tool_call_id"],
+                    _parse_tool_calls(r["tool_calls"]),
                 ),
             )
             for r in conn.execute(
-                f"SELECT id, role, _compressed_summary, content "
+                f"SELECT id, role, _compressed_summary, content, tool_call_id, tool_calls "
                 f"FROM messages WHERE id IN ({_placeholders(candidate_ids)})",
                 tuple(candidate_ids),
             ).fetchall()
@@ -905,11 +905,11 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         if not summary_ids:
             return candidate_ids, set()
         compacted_tail_keys = {
-            (
+            self._row_identity(
                 m.get("role", "unknown"),
-                self._encode_content(
-                    self._loaded_view_content(m.get("role", "unknown"), m.get("content"))
-                ),
+                m.get("content"),
+                m.get("tool_call_id"),
+                _parse_tool_calls(m.get("tool_calls")),
             )
             for m in compacted_messages
             if isinstance(m, dict)
@@ -919,28 +919,35 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             )
         }
         superseded: set[int] = set()
-        in_superseded = False
-        seen_tail = False
-        for rid in candidate_ids:
-            if rid in covered_set:
-                in_superseded = False
-                seen_tail = False
+        n_cand = len(candidate_ids)
+        idx = 0
+        while idx < n_cand:
+            rid = candidate_ids[idx]
+            if rid not in summary_ids or rid in covered_set:
+                idx += 1
                 continue
-            if rid in summary_ids:
-                in_superseded = True
-                seen_tail = False
-                superseded.add(rid)
-                continue
-            if in_superseded:
-                rc_key = meta[rid][2]
-                if rc_key in compacted_tail_keys:
-                    seen_tail = True
-                    superseded.add(rid)
-                elif seen_tail:
-                    in_superseded = False
-                    seen_tail = False
-                else:
-                    superseded.add(rid)
+            superseded.add(rid)
+            # Scan contiguous segment after this summary up to the next covered_set or summary row.
+            seg_end = idx + 1
+            while seg_end < n_cand and candidate_ids[seg_end] not in covered_set and candidate_ids[seg_end] not in summary_ids:
+                seg_end += 1
+            segment = candidate_ids[idx + 1 : seg_end]
+            # Find the last row in segment that matches the new compacted tail; every row up to
+            # that last matching tail row (including earlier summarized-away or demoted tool rows)
+            # belongs to the superseded compaction generation. If no row in segment matches the
+            # new compacted tail (the entire prior tail was summarized away before a covered row),
+            # the entire segment before covered_set is superseded.
+            last_tail_pos = -1
+            for pos, s_rid in enumerate(segment):
+                if meta[s_rid][2] in compacted_tail_keys:
+                    last_tail_pos = pos
+            if last_tail_pos >= 0:
+                for s_rid in segment[: last_tail_pos + 1]:
+                    superseded.add(s_rid)
+            else:
+                for s_rid in segment:
+                    superseded.add(s_rid)
+            idx = seg_end
         return [rid for rid in candidate_ids if rid not in superseded], superseded
 
     def _archive_named_rows(

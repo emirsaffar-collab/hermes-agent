@@ -1534,6 +1534,14 @@ class TestParseWakeGate:
     def test_wake_gate_false_skips(self):
         from cron.scheduler import _parse_wake_gate
         assert _parse_wake_gate('{"wakeAgent": false}') is False
+        assert _parse_wake_gate("STATUS=OK\nwakeAgent=false\n") is False
+        assert _parse_wake_gate("STATUS=NOOP_COMPLETE\n") is False
+        assert _parse_wake_gate('{\n  "status": "NOOP_COMPLETE",\n  "open": []\n}') is False
+        assert _parse_wake_gate("HEALTHY\nlast_ping=2026-11-10T15:00:00Z\n") is False
+        assert _parse_wake_gate("DEGRADED-NEEDS-ALERT\n") is True
+        assert _parse_wake_gate("LOSS-ALERT-NEEDS-SEND\n") is True
+        assert _parse_wake_gate("RECOVERED-NEEDS-ACK\n") is True
+        assert _parse_wake_gate('{\n  "status": "CANDIDATES_FOUND"\n}') is True
 
 class TestRunJobWakeGate:
     """Integration tests for run_job wake-gate short-circuit."""
