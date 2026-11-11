@@ -118,7 +118,8 @@ def _find_lease_owner_entry(key: str, profile_home: str | Path | None) -> dict |
     try:
         from hermes_cli.active_sessions import active_session_registry_snapshot
         snap = active_session_registry_snapshot(registry_home=profile_home)
-        for entry in snap.get("entries") or ():
+        entries = snap.get("entries") if isinstance(snap, dict) else snap
+        for entry in entries or ():
             if isinstance(entry, dict) and str(entry.get("session_id") or "") == key:
                 return entry
     except Exception:

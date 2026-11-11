@@ -182,7 +182,6 @@ def test_mid_turn_cross_surface_submit_relays_events_and_adopts_history(tmp_path
         profile_home = tmp_path / "hermes_home"
         profile_home.mkdir(parents=True, exist_ok=True)
         state_path, _ = _lease_paths(registry_home=profile_home)
-        fake_owner_pid = os.getpid() + 99999
         entry = _lease_entry(
             lease_id="mobile_lease_1",
             session_id="20261111_140951_081c55",
@@ -190,16 +189,11 @@ def test_mid_turn_cross_surface_submit_relays_events_and_adopts_history(tmp_path
             metadata={"live_session_id": "owner_live_sid", "turn_active": True},
             track_liveness=True,
         )
-        entry["pid"] = fake_owner_pid
         _write_entries(state_path, [entry])
 
         monkeypatch.setattr(
-            "tui_gateway.sibling_serve_forward._find_lease_owner_entry",
-            lambda key, home: entry if key == "20261111_140951_081c55" else None,
-        )
-        monkeypatch.setattr(
             "tui_gateway.sibling_serve_forward.discover_sibling_serve_endpoint",
-            lambda pid: ("127.0.0.1", port, "test-token") if pid == fake_owner_pid else None,
+            lambda pid: ("127.0.0.1", port, "test-token") if pid == os.getpid() else None,
         )
 
         emitted: list[tuple[str, str, dict | None]] = []
@@ -256,10 +250,6 @@ def test_sibling_serve_already_idle_reclaims_lease_for_local_turn(tmp_path: Path
         )
         _write_entries(state_path, [entry])
 
-        monkeypatch.setattr(
-            "tui_gateway.sibling_serve_forward._find_lease_owner_entry",
-            lambda key, home: entry,
-        )
         monkeypatch.setattr(
             "tui_gateway.sibling_serve_forward.discover_sibling_serve_endpoint",
             lambda pid: ("127.0.0.1", port, "test-token"),
