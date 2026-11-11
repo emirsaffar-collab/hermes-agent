@@ -509,6 +509,25 @@ class _TurnRun:
     receipt_attempted: bool = False
 
 
+def _history_has_dangling_tool_splice(history: list) -> bool:
+    """True when an in-memory history contains a ``tool`` row not preceded by an ``assistant`` with ``tool_calls``
+    (e.g. a mid-turn resume stripped ``tool_calls`` from the trailing assistant row before the sibling surface
+    finished the tool and appended its ``tool`` result, #CF68)."""
+    in_tool_block = False
+    for m in history:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "assistant":
+            in_tool_block = bool(m.get("tool_calls"))
+        elif role == "tool":
+            if not in_tool_block:
+                return True
+        else:
+            in_tool_block = False
+    return False
+
+
 def _adopt_out_of_band_turns(session: dict) -> None:
     """Fold turns another surface appended to this session (Telegram reply, cron run) into the model-facing
     history before the turn snapshots it. The desktop already repaints them from the DB (#86588); without
@@ -541,7 +560,7 @@ def _adopt_out_of_band_turns(session: dict) -> None:
     # silently never sees them (#123545). Also detect in-place SQLite secret scrubs (rowbak receipt or
     # tool-row content length change on id <= seen) so poisoned in-memory history is re-hydrated (#CF67).
     target_key = _submit_row_target_key(session)  # type: ignore[name-defined]
-    scrubbed = False
+    scrubbed = _history_has_dangling_tool_splice(history)
     with _session_db(session) as db:
         try:
             newer = db.get_messages(target_key, after_id=seen) if db is not None else []
@@ -579,7 +598,12 @@ def _adopt_out_of_band_turns(session: dict) -> None:
     newer = [row for row in newer if _foreign(row.get("id"))]
     if not newer and not scrubbed:
         return
-    rewritten = scrubbed or any(row.get("_compressed_summary") for row in newer)
+    rewritten = (
+        scrubbed
+        or any(row.get("_compressed_summary") for row in newer)
+        or bool(newer and newer[0].get("role") != "user")
+        or bool(history and (history[-1].get("role") != "assistant" or history[-1].get("tool_calls")))
+    )
     rows = _load_durable_truncation_history(session, repair_alternation=rewritten) or []
     keep = _below_ceiling if rewritten else _foreign
     tail = canonicalize_replay_history([m for m in rows if keep(_message_row_id(m))])

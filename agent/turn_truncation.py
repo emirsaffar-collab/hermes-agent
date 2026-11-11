@@ -808,27 +808,50 @@ _GATE_SCRIPT_FILTER_MARKERS = (
     "CDP_EVAL:",
     "tok_policies",
     "permission_groups",
+    "approve.sh",
+    "Download-and-run",
+    "gcloud secrets",
+    "secrets.versions.access",
+    "SUPERUSER_PASSWORD",
+    "SUPERADMIN_PASSWORD",
+    "SYNC_CRON_TOKEN",
+    "Invalid sync token",
+    "run_sql_on_prod_bastion",
+    "|dg:",
+    "|rn:",
+    "PR_MERGE_BLOCKED",
+)
+
+_TOOL_FILTER_SUMMARY = (
+    "[tool output summarized after upstream content_filter — use standard CLI flags "
+    "or stage the artifact without inline gate-token synthesis]"
 )
 
 
 def _inject_content_filter_steer_note(api_messages: Any) -> None:
     """Append ``_CONTENT_FILTER_STEER_NOTE`` to the trailing tool/user message on ``api_messages``
-    and summarize recent gate-script / browser-cookie-CDP payloads across tool results, assistant
-    ``tool_calls`` arguments, and replayed assistant reasoning that trip Gemini's output classifier
-    (#CF-76, #CF-78)."""
+    and summarize recent gate-script / browser-cookie-CDP / secret-probe payloads across tool results
+    (both plain ``str`` and cache-decorated ``list`` block forms), assistant ``tool_calls`` arguments,
+    and all replayed assistant reasoning that trip Gemini's output classifier (#CF-76, #CF-78)."""
     if not isinstance(api_messages, list) or not api_messages:
         return
-    for msg in api_messages[-20:]:
+    for msg in api_messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
         if role == "tool":
             t_content = msg.get("content")
             if isinstance(t_content, str) and any(m in t_content for m in _GATE_SCRIPT_FILTER_MARKERS):
-                msg["content"] = (
-                    "[tool output summarized after upstream content_filter — use standard CLI flags "
-                    "or stage the artifact without inline gate-token synthesis]"
-                )
+                has_note = _CONTENT_FILTER_STEER_NOTE in t_content
+                msg["content"] = _TOOL_FILTER_SUMMARY + (_CONTENT_FILTER_STEER_NOTE if has_note else "")
+            elif isinstance(t_content, list):
+                for part in t_content:
+                    if not isinstance(part, dict):
+                        continue
+                    p_text = part.get("text")
+                    if isinstance(p_text, str) and any(m in p_text for m in _GATE_SCRIPT_FILTER_MARKERS):
+                        has_note = _CONTENT_FILTER_STEER_NOTE in p_text
+                        part["text"] = _TOOL_FILTER_SUMMARY + (_CONTENT_FILTER_STEER_NOTE if has_note else "")
         elif role == "assistant":
             tcs = msg.get("tool_calls")
             if isinstance(tcs, list):

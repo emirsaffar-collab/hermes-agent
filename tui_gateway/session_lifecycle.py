@@ -352,13 +352,18 @@ def _take_over_idle_cross_surface_lease(sid: str, session: dict, key: str, *, su
             existing = entries[idx]
             meta = existing.get("metadata") or {}
             turn_active = meta.get("turn_active")
-            if turn_active is True:
-                return False
             existing_surface = str(existing.get("surface") or "").strip().lower()
             incoming_surface = str(surface or "").strip().lower()
             is_mobile_handoff = "mobile" in {existing_surface, incoming_surface}
             age_s = time.time() - float(existing.get("updated_at") or existing.get("started_at") or 0.0)
-            if turn_active is not False and not (is_mobile_handoff and age_s >= 2.0):
+            if turn_active is True:
+                # Line 330 already verified ``_session_has_live_turn_marker(session, key)`` is False.
+                # If a mobile/desktop handoff sees ``turn_active=True`` with NO live turn marker past
+                # the 10s admission window, the previous turn already retired its marker without
+                # clearing ``turn_active``; allow takeover instead of wedging the session (#CF68).
+                if not (is_mobile_handoff and age_s >= 10.0):
+                    return False
+            elif turn_active is not False and not (is_mobile_handoff and age_s >= 2.0):
                 return False
             lease_id = uuid.uuid4().hex
             new_meta = _lease_metadata(sid, turn_active=True)
