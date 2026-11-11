@@ -211,6 +211,7 @@ class _SiblingServeRelay:
         self.owner_sid = ""
         self.admitted: concurrent.futures.Future = concurrent.futures.Future()
         self._control_queue: list[tuple[str, dict, concurrent.futures.Future | None]] = []
+        self._pending_control_rpcs: dict[int, concurrent.futures.Future] = {}
         self._control_lock = threading.Lock()
         self._next_rpc_id = 10
 
@@ -261,12 +262,26 @@ class _SiblingServeRelay:
                     "method": method_name,
                     "params": {"session_id": self.owner_sid, **extra_params},
                 }
+                if fut is not None:
+                    self._pending_control_rpcs[rpc_id] = fut
                 await ws.send(json.dumps(req) + "\n")
-                if fut is not None and not fut.done():
-                    fut.set_result(True)
             except Exception:
                 if fut is not None and not fut.done():
                     fut.set_result(False)
+
+    def _resolve_control_rpc(self, msg: dict) -> bool:
+        rpc_id = msg.get("id")
+        if not isinstance(rpc_id, int) or rpc_id not in self._pending_control_rpcs:
+            return False
+        fut = self._pending_control_rpcs.pop(rpc_id, None)
+        if fut is not None and not fut.done():
+            if "error" in msg:
+                fut.set_result(False)
+            else:
+                res = msg.get("result") or {}
+                ok = isinstance(res, dict) and str(res.get("status") or "") != "rejected"
+                fut.set_result(ok)
+        return True
 
     async def _run(self) -> None:
         from websockets.asyncio.client import connect
@@ -395,6 +410,8 @@ class _SiblingServeRelay:
                         while time.monotonic() < chk_deadline:
                             raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, chk_deadline - time.monotonic()))
                             msg = json.loads(raw)
+                            if self._resolve_control_rpc(msg):
+                                continue
                             if msg.get("id") == chk_id:
                                 chk_res = msg.get("result") or {}
                                 break
@@ -412,10 +429,16 @@ class _SiblingServeRelay:
                     except TimeoutError:
                         continue
                     msg = json.loads(raw)
+                    if self._resolve_control_rpc(msg):
+                        continue
                     if msg.get("method") == "event":
                         if (done_payload := _forward_event(msg)) is not None:
                             final_complete_payload = done_payload
         finally:
+            for fut in list(self._pending_control_rpcs.values()):
+                if not fut.done():
+                    fut.set_result(False)
+            self._pending_control_rpcs.clear()
             if not self.admitted.done():
                 self.admitted.set_result(None)
             if admitted_ok:
@@ -576,4 +599,62 @@ def try_interrupt_sibling_serve_owner(server, session: dict) -> bool:
         return asyncio.run(_send_interrupt())
     except Exception:
         logger.debug("try_interrupt_sibling_serve_owner failed for %s (pid=%s)", key, owner_pid, exc_info=True)
+        return False
+
+
+def try_correct_sibling_serve_owner(server, session: dict, method_name: str, text: str) -> bool:
+    """Forward ``session.steer`` or ``session.redirect`` to a sibling ``serve`` holding an active lease."""
+    with session["history_lock"]:
+        relay = session.get("_sibling_serve_relay")
+    if isinstance(relay, _SiblingServeRelay):
+        return relay.request_correction(method_name, text)
+
+    key = str(session.get("session_key") or "")
+    owner_entry = _find_lease_owner_entry(key, session.get("profile_home"))
+    if not isinstance(owner_entry, dict):
+        return False
+    meta = owner_entry.get("metadata") or {}
+    if meta.get("turn_active") is not True:
+        return False
+    owner_pid = int(owner_entry.get("pid") or 0)
+    endpoint = discover_sibling_serve_endpoint(owner_pid)
+    if endpoint is None:
+        return False
+    host, port, token = endpoint
+    profile_name = str(session.get("profile_name") or "").strip()
+
+    async def _send_correction() -> bool:
+        from websockets.asyncio.client import connect
+        url = f"ws://{host}:{port}/api/ws?token={token}"
+        async with connect(url, open_timeout=3.0, proxy=None) as ws:
+            await asyncio.wait_for(ws.recv(), timeout=3.0)
+            resume_params: dict[str, Any] = {"session_id": key, "omit_messages": True}
+            if profile_name:
+                resume_params["profile"] = profile_name
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session.resume", "params": resume_params}) + "\n")
+            owner_sid = ""
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+                if msg.get("id") == 1:
+                    res = msg.get("result") or {}
+                    owner_sid = str(res.get("session_id") or "")
+                    break
+            if not owner_sid:
+                return False
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": 2, "method": method_name, "params": {"session_id": owner_sid, "text": text}}) + "\n")
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+                if msg.get("id") == 2:
+                    if "error" in msg:
+                        return False
+                    res = msg.get("result") or {}
+                    return isinstance(res, dict) and str(res.get("status") or "") != "rejected"
+        return False
+
+    try:
+        return asyncio.run(_send_correction())
+    except Exception:
+        logger.debug("try_correct_sibling_serve_owner failed for %s (pid=%s)", key, owner_pid, exc_info=True)
         return False

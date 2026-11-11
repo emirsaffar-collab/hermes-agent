@@ -128,12 +128,14 @@ def _start_mock_sibling_ws_server(*, running: bool = True, submit_status: str = 
                     + "\n"
                 )
             elif method in ("session.interrupt", "session.redirect", "session.steer"):
+                txt_param = str((msg.get("params") or {}).get("text") or "")
+                corr_status = "rejected" if txt_param == "REJECT_ME" else ("interrupted" if method == "session.interrupt" else "redirected")
                 await ws.send(
                     json.dumps(
                         {
                             "jsonrpc": "2.0",
                             "id": rid,
-                            "result": {"status": "interrupted" if method == "session.interrupt" else "redirected"},
+                            "result": {"status": corr_status},
                         }
                     )
                     + "\n"
@@ -403,5 +405,46 @@ def test_publish_host_rendezvous_writes_peer_and_host_record(tmp_path: Path, mon
         assert ep == ("127.0.0.1", 19119, peer_data["token"])
     finally:
         hr.release_host_lock(hr.ROLE_SERVE)
+
+
+def test_sibling_serve_correction_forwards_and_verifies_rpc_polarity(tmp_path: Path, monkeypatch):
+    """try_correct_sibling_serve_owner must return True on accepted redirect/steer and False on 'rejected'."""
+    from tui_gateway.sibling_serve_forward import try_correct_sibling_serve_owner
+
+    profile_home = tmp_path / "hermes_home_corr"
+    profile_home.mkdir(parents=True, exist_ok=True)
+    state_path, _ = _lease_paths(registry_home=profile_home)
+
+    port, received_rpcs, stop_evt = _start_mock_sibling_ws_server(running=True)
+    try:
+        entry = _lease_entry(
+            lease_id="mobile_lease_corr",
+            session_id="20261111_140951_081c55",
+            surface="mobile",
+            metadata={"live_session_id": "owner_live_sid", "turn_active": True},
+            track_liveness=True,
+        )
+        _write_entries(state_path, [entry])
+        monkeypatch.setattr(
+            "tui_gateway.sibling_serve_forward.discover_sibling_serve_endpoint",
+            lambda pid: ("127.0.0.1", port, "test-token"),
+        )
+        session = {
+            "session_key": "20261111_140951_081c55",
+            "profile_home": str(profile_home),
+            "source": "desktop",
+            "history": [],
+            "history_lock": threading.Lock(),
+            "running": False,
+        }
+        server = _make_fake_server([], [])
+        assert try_correct_sibling_serve_owner(server, session, "session.redirect", "Byt spår nu") is True
+        assert try_correct_sibling_serve_owner(server, session, "session.steer", "REJECT_ME") is False
+        methods = [r.get("method") for r in received_rpcs]
+        assert "session.redirect" in methods
+        assert "session.steer" in methods
+    finally:
+        stop_evt.set()
+
 
 

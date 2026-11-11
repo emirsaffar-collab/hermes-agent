@@ -155,6 +155,10 @@ def _correction_method(name: str, verb: str, accepted_status: str, supported, un
         if sibling_relay is not None and hasattr(sibling_relay, "request_correction"):
             accepted = bool(sibling_relay.request_correction(name, text))
             return _ok(rid, {"status": accepted_status if accepted else "rejected", "text": text})  # type: ignore[name-defined]
+        if not session.get("running") and not session.get("_compute_host_active"):
+            from tui_gateway.sibling_serve_forward import try_correct_sibling_serve_owner
+            if try_correct_sibling_serve_owner(_server_module(), session, name, text):
+                return _ok(rid, {"status": accepted_status, "text": text})  # type: ignore[name-defined]
         agent = session.get("agent")
         # Redirect during the turn-build window (running=True, agent None): queue for the next turn instead of
         # a misleading 4010 the client swallows into a lost follow-up.
