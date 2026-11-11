@@ -1933,11 +1933,19 @@ def route_classified_error(
             and error_context.get("openrouter_order_reordered")
             and retry_count < max_retries
         )
+        # CF-82: when primary/current provider is Vertex AI, Dynamic Shared Quota (DSQ) 429s
+        # are transient per-second capacity bursts; retry in-place with backoff before
+        # escalating to the emergency OpenRouter fallback on the final retry attempt.
+        _vertex_dsq_backoff_may_recover = (
+            str(getattr(agent, "provider", "") or "").lower() == "vertex"
+            and is_rate_limited
+            and retry_count < max(2, max_retries)
+        )
         pool_may_recover = (
             _or_order_reordered
             if _is_upstream
             else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
-        )
+        ) or _vertex_dsq_backoff_may_recover
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
