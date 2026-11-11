@@ -98,3 +98,55 @@ def test_token_var_reset_survives_forced_contextvar_replacement():
     finally:
         conv_comp._COMPRESSOR_ATTEMPT_GENERATION = saved_var
 
+
+def test_or_credit_clamp_reload_if_changed_mtime_gate_polarity(tmp_path, monkeypatch):
+    """Verify _reload_if_changed mtime/size gate reloads on first pass / mtime change / force=True
+    and skips reload when (st_mtime_ns, st_size) on disk is unchanged."""
+    import os
+    import sys
+
+    def _reload_if_changed(mod, *, force: bool = False) -> bool:
+        if mod is None:
+            return False
+        mod_file = getattr(mod, "__file__", None)
+        sig = None
+        if mod_file:
+            try:
+                st = os.stat(mod_file)
+                sig = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                sig = None
+        prev_sig = getattr(mod, "_or_credit_clamp_file_sig", None)
+        if not force and sig is not None and prev_sig == sig:
+            return False
+        importlib.reload(mod)
+        if sig is not None:
+            setattr(mod, "_or_credit_clamp_file_sig", sig)
+        return True
+
+    mod_file = tmp_path / "dummy_hotfix_mod.py"
+    mod_file.write_text("VAL = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    d_mod = importlib.import_module("dummy_hotfix_mod")
+    try:
+        assert d_mod.VAL == 1
+
+        # Pass 1: no _or_credit_clamp_file_sig yet -> reloads and stamps sig
+        assert _reload_if_changed(d_mod) is True
+        # Pass 2: unchanged (st_mtime_ns, st_size) -> skips reload (returns False)
+        assert _reload_if_changed(d_mod) is False
+        # Pass 3: force=True -> reloads even when unchanged
+        assert _reload_if_changed(d_mod, force=True) is True
+        # Pass 4: modify file on disk (size + mtime change) -> reloads and updates VAL
+        mod_file.write_text("VAL = 222\n", encoding="utf-8")
+        st = os.stat(mod_file)
+        os.utime(mod_file, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        importlib.invalidate_caches()
+        assert _reload_if_changed(d_mod) is True
+        assert d_mod.VAL == 222
+        assert _reload_if_changed(d_mod) is False
+    finally:
+        sys.modules.pop("dummy_hotfix_mod", None)
+
+
