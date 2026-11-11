@@ -324,12 +324,14 @@ def test_adopt_out_of_band_turns_reloads_history_on_in_place_secret_scrub(tmp_pa
             return [(10, self._tool_len)]
 
     scrubbed_rows = [
-        {"role": "user", "content": "hi", "_row_id": 9},
-        {"role": "tool", "content": "Container 0x3d19…bfbf started", "_row_id": 10},
+        {"role": "user", "content": "hi", "_row_id": 8},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}], "_row_id": 9},
+        {"role": "tool", "tool_call_id": "c1", "content": "Container 0x3d19…bfbf started", "_row_id": 10},
     ]
     orig_history = [
-        {"role": "user", "content": "hi", "_row_id": 9},
-        {"role": "tool", "content": "Container 0x" + ("3d19a91b" * 8) + " started", "_row_id": 10},
+        {"role": "user", "content": "hi", "_row_id": 8},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}], "_row_id": 9},
+        {"role": "tool", "tool_call_id": "c1", "content": "Container 0x" + ("3d19a91b" * 8) + " started", "_row_id": 10},
     ]
 
     session = {
@@ -348,22 +350,22 @@ def test_adopt_out_of_band_turns_reloads_history_on_in_place_secret_scrub(tmp_pa
     # Negative control: matching tool length and no rowbak -> history not rewritten
     @contextmanager
     def _unchanged_db(_s):
-        yield _FakeDB(len(orig_history[1]["content"]))
+        yield _FakeDB(len(orig_history[2]["content"]))
 
     monkeypatch.setattr(pt, "_session_db", _unchanged_db, raising=False)
     pt._adopt_out_of_band_turns(session)
     assert session["history_version"] == 1
-    assert session["history"][1]["content"] == orig_history[1]["content"]
+    assert session["history"][2]["content"] == orig_history[2]["content"]
 
     # Positive control: shortened tool length in SQLite after --scrub -> history re-hydrated
     @contextmanager
     def _scrubbed_db(_s):
-        yield _FakeDB(len(scrubbed_rows[1]["content"]))
+        yield _FakeDB(len(scrubbed_rows[2]["content"]))
 
     monkeypatch.setattr(pt, "_session_db", _scrubbed_db, raising=False)
     pt._adopt_out_of_band_turns(session)
     assert session["history_version"] == 2
-    assert session["history"][1]["content"] == "Container 0x3d19…bfbf started"
+    assert session["history"][2]["content"] == "Container 0x3d19…bfbf started"
 
 
 def test_mid_turn_secret_value_guard_block_rehydrates_scrubbed_assistant_msg_in_memory():
@@ -671,3 +673,98 @@ def test_cf78_browser_cookie_and_cdp_eval_sanitized_across_20_message_tail():
     assert _CONTENT_FILTER_STEER_NOTE in api_messages[-1]["content"]
     assert api_messages[1]["reasoning_content"] == " "
     assert "reasoning_details" not in api_messages[1]
+
+
+def test_cf78_steer_note_summarizes_cache_decorated_list_tool_blocks_and_strips_all_assistant_reasoning():
+    """When ``build_prompt_cache_plan`` has already converted trailing ``role='tool'`` messages
+    into ``list`` content blocks (``[{'type': 'text', 'text': ..., 'cache_control': ...}]``)
+    before the in-place retry in ``handle_content_policy_refusal``, ``_inject_content_filter_steer_note``
+    must summarize matching ``part['text']`` blocks and strip replayed ``reasoning`` / ``reasoning_details``
+    across all assistant messages in ``api_messages`` (even before ``[-20:]``)."""
+    from agent.turn_truncation import _inject_content_filter_steer_note
+
+    api_messages = [
+        {"role": "user", "content": "Execute staged prod SQL"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "Early turn reasoning outside [-20:] referencing prod-sql-review",
+            "reasoning_content": "Early turn reasoning outside [-20:] referencing prod-sql-review",
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": "early thought"},
+                {"type": "reasoning.encrypted", "data": "Er8DCrwDAWkUfROALpeCX2K022cLId==", "format": "google-gemini-v1"},
+            ],
+            "tool_calls": [
+                {
+                    "id": "call_early",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"gcloud secrets versions access latest --secret=PROD_SYNC_CRON_TOKEN"}',
+                    },
+                }
+            ],
+        },
+    ]
+    for i in range(25):
+        api_messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning": f"step {i} thought",
+                "reasoning_content": f"step {i} thought",
+                "reasoning_details": [{"type": "reasoning.encrypted", "data": f"sig_{i}", "format": "google-gemini-v1"}],
+                "tool_calls": [{"id": f"c_{i}", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"true"}'}}],
+            }
+        )
+        api_messages.append({"role": "tool", "tool_call_id": f"c_{i}", "content": "ok"})
+
+    # Trailing cache-decorated tool messages (list of text blocks with cache_control):
+    api_messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": "c_shas",
+            "content": [
+                {
+                    "type": "text",
+                    "text": '{"content": "320|dg:9094757210cb\\n321|rn:47abc"}',
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        }
+    )
+    api_messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": "c_sync",
+            "content": [
+                {
+                    "type": "text",
+                    "text": '{"content": "throw new UnauthorizedException(\'Invalid sync token\'); process.env.SYNC_CRON_TOKEN"}',
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        }
+    )
+
+    _inject_content_filter_steer_note(api_messages)
+
+    # 1. Early assistant message (index 1, well outside [-20:]) has reasoning & reasoning_details stripped:
+    assert api_messages[1]["reasoning"] == ""
+    assert api_messages[1]["reasoning_content"] == " "
+    assert "reasoning_details" not in api_messages[1]
+    assert "gcloud secrets" not in api_messages[1]["tool_calls"][0]["function"]["arguments"]
+
+    # 2. Both cache-decorated list-content tool messages are summarized while preserving cache_control:
+    shas_block = api_messages[-2]["content"][0]
+    assert "|dg:" not in shas_block["text"]
+    assert "summarized after upstream content_filter" in shas_block["text"]
+    assert shas_block["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+    sync_block = api_messages[-1]["content"][0]
+    assert "SYNC_CRON_TOKEN" not in sync_block["text"]
+    assert "Invalid sync token" not in sync_block["text"]
+    assert "summarized after upstream content_filter" in sync_block["text"]
+    assert "[hermes note: Previous response generation was interrupted" in sync_block["text"]
+    assert sync_block["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
