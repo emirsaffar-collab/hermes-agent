@@ -894,7 +894,9 @@ _LEAVE_CALL_JS = (
 _ADMISSION_PROBE_JS = r"""
     (() => {
       const bodyTxt = document.body ? (document.body.innerText || '') : '';
-      if (/Vi har meddelat personerna i mötet att du väntar|Someone in the meeting should let you in soon|Vi släpper in dig snart|Väntar i lobbyn|Waiting in lobby/i.test(bodyTxt)) return false;
+      if (/Vi har meddelat personerna i mötet att du väntar|Someone in the meeting should let you in soon|Vi släpper in dig snart|Väntar i lobbyn|Waiting in lobby|Redo att gå med\?|Ready to join\?/i.test(bodyTxt)) return false;
+      const openDlg = document.querySelector('div[role="dialog"], div[ role="alertdialog"]');
+      if (openDlg && /Gå med nu|Join now|spelas in|being recorded|transkrib|Anteckningar förs|taking notes/i.test(openDlg.innerText || '')) return false;
       if (document.querySelector('button[aria-label*="eave call" i], button[aria-label*="ämna samtal" i], button[aria-label*="Avsluta samtal" i], button[id="hangup-button"], button[data-tid="hangup-main-btn"], button[data-tid*="hangup" i]')) return true;
       if (window.__hermesMeetInstalled && document.querySelector(
           '[role="region"][aria-label*="aption" i], [role="region"][aria-label*="textning" i], div[jsname="YSxPC"], div[jsname="tgaKEf"]')) return true;
@@ -1206,6 +1208,18 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 60.0) -> Non
             if btn is not None and _quiet(_click_nowait, btn, 3_000):
                 if label in ("Ask to join", "Be om att få gå med"):
                     state.set(lobby_waiting=True)
+                _quiet(page.wait_for_timeout, 2_000)
+                for consent_sel in (
+                    'div[role="dialog"] button:has-text("Gå med nu")',
+                    'div[role="dialog"] button:has-text("Join now")',
+                    'div[role="dialog"] button:has-text("Jag förstår")',
+                    'div[role="dialog"] button:has-text("Uppfattat")',
+                    'div[role="dialog"] button:has-text("Got it")',
+                ):
+                    cbtn = _visible(page.locator(consent_sel))
+                    if cbtn is not None:
+                        _quiet(_click_nowait, cbtn, 2_000)
+                        _quiet(page.wait_for_timeout, 1_000)
                 return
         if time.time() >= deadline:
             return
@@ -1290,8 +1304,9 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                         state.set(leave_reason="everyone_left")
                         return
                 elif state.joined_at and (now - state.joined_at) >= 300.0:
-                    print(f"[meet_bot] leave_reason=everyone_left empty_from_start_s={now - state.joined_at:.1f}", flush=True)
-                    state.set(leave_reason="everyone_left")
+                    reason = "empty_room_timeout" if state.transcript_lines == 0 else "everyone_left"
+                    print(f"[meet_bot] leave_reason={reason} empty_from_start_s={now - state.joined_at:.1f}", flush=True)
+                    state.set(leave_reason=reason)
                     return
         try:
             spk_events = page.evaluate("window.__hermesDrainSpeakers && window.__hermesDrainSpeakers()")

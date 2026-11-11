@@ -700,12 +700,19 @@ def skill_view(
                     + "` and reload."
                 )
 
+        _sk_chars = len(rendered_content)
+        _ceil_hint = (
+            f"SKILL.md is at {_sk_chars}/9975 chars ({max(0, 9974 - _sk_chars)} chars remaining before compaction prune ceiling). "
+            "Put new detailed rules in references/<topic>.md via skill_manage(action='write_file' or 'patch', file_path='references/...')."
+            if _sk_chars >= 8800 else None
+        )
         result = {
             "success": True, "name": skill_name, "description": frontmatter.get("description", ""),
             "tags": tags, "related_skills": related_skills, "content": rendered_content,
+            "skill_md_chars": _sk_chars, "skill_md_char_ceiling": 9975,
             "path": rel_path, "skill_dir": str(skill_dir) if skill_dir else None,
             "linked_files": linked_files if linked_files else None,
-            "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'" if linked_files else None,
+            "usage_hint": _ceil_hint or ("To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'" if linked_files else None),
             **readiness,
             **readiness_extras}
         if deps_note:
