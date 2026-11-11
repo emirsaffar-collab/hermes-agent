@@ -32,7 +32,10 @@ PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE = "provider_stream_empty_frame"
 
 # ── Error taxonomy ──────────────────────────────────────────────────────
 
-class FailoverReason(enum.Enum):
+_prev_failover_reason = globals().get("FailoverReason")
+
+
+class _FailoverReason(enum.Enum):
     """Why an API call failed — determines recovery strategy."""
     auth = "auth"                        # Transient auth (401/403) — refresh/rotate
     auth_permanent = "auth_permanent"    # Auth failed after refresh — abort
@@ -67,6 +70,16 @@ class FailoverReason(enum.Enum):
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth rejects 1M beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp grammar rejects regex `pattern`/`format` — strip from tools and retry
     unknown = "unknown"                  # Unclassifiable — retry with backoff
+
+
+if (
+    isinstance(_prev_failover_reason, type)
+    and issubclass(_prev_failover_reason, enum.Enum)
+    and set(_prev_failover_reason.__members__) == set(_FailoverReason.__members__)
+):
+    FailoverReason = _prev_failover_reason
+else:
+    FailoverReason = _FailoverReason
 
 
 # Transient transport verdicts: the provider is expected back (the aux same-provider retry, the turn ladder).

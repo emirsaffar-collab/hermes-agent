@@ -47,10 +47,20 @@ def retain_refused_turn_for_display(
         return False
 
 
-class RewindTargetUnavailableError(ValueError):
+_prev_rewind_err = globals().get("RewindTargetUnavailableError")
+
+
+class _RewindTargetUnavailableError(ValueError):
     """The requested user turn is not a rewindable target of the active transcript: no user turns, an
     ordinal past the newest one, a row that is not user-originated, or a plain turn where the caller
     required a compaction carrier. Surfaces map this to their own "nothing to undo" message."""
+
+
+RewindTargetUnavailableError = (
+    _prev_rewind_err
+    if isinstance(_prev_rewind_err, type) and issubclass(_prev_rewind_err, ValueError)
+    else _RewindTargetUnavailableError
+)
 
 
 @dataclass

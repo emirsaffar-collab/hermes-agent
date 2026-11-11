@@ -444,8 +444,18 @@ def compression_made_progress(
     return new_len < orig_len or (orig_tokens > 0 and new_tokens < orig_tokens * 0.95)
 
 
-class PreflightCompressionTimedOut(RuntimeError):
+_prev_preflight_timed_out = globals().get("PreflightCompressionTimedOut")
+
+
+class _PreflightCompressionTimedOut(RuntimeError):
     """Raised when an oversized turn cannot safely finish preflight."""
+
+
+PreflightCompressionTimedOut = (
+    _prev_preflight_timed_out
+    if isinstance(_prev_preflight_timed_out, type) and issubclass(_prev_preflight_timed_out, RuntimeError)
+    else _PreflightCompressionTimedOut
+)
 
 
 def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:

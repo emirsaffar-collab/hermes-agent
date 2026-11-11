@@ -121,7 +121,7 @@ def test_or_credit_clamp_reload_if_changed_mtime_gate_polarity(tmp_path, monkeyp
             return False
         importlib.reload(mod)
         if sig is not None:
-            setattr(mod, "_or_credit_clamp_file_sig", sig)
+            mod._or_credit_clamp_file_sig = sig
         return True
 
     mod_file = tmp_path / "dummy_hotfix_mod.py"
@@ -148,5 +148,54 @@ def test_or_credit_clamp_reload_if_changed_mtime_gate_polarity(tmp_path, monkeyp
         assert _reload_if_changed(d_mod) is False
     finally:
         sys.modules.pop("dummy_hotfix_mod", None)
+
+
+def test_topological_reload_and_enum_exception_singleton_preservation():
+    """Reloading error_classifier, context_compressor, turn_context, hermes_state_rewind,
+    and skills_tool_dedup preserves Enum/Exception class identity and tracker state."""
+    import sys
+    import agent.error_classifier as ec
+    import agent.turn_context as tc
+    import agent.turn_preflight as tp
+    import agent.turn_recovery as tr
+    import hermes_state_rewind as hsr
+    import tools.skills_tool_dedup as std
+
+    orig_fr = ec.FailoverReason
+    orig_shh = cc_mod.StaleHeldHistory
+    orig_pcto = tc.PreflightCompressionTimedOut
+    orig_rtue = hsr.RewindTargetUnavailableError
+
+    std._skill_view_tracker["test_cf79_sess"] = {("sk", ""): "digest1"}
+    try:
+        importlib.reload(ec)
+        importlib.reload(cc_mod)
+        importlib.reload(tc)
+        importlib.reload(hsr)
+        importlib.reload(std)
+        importlib.reload(conv_comp)
+        importlib.reload(tp)
+
+        assert ec.FailoverReason is orig_fr
+        assert ec.FailoverReason.rate_limit in tr._RATE_LIMIT_REASONS
+        assert cc_mod.StaleHeldHistory is orig_shh
+        assert tc.PreflightCompressionTimedOut is orig_pcto
+        assert hsr.RewindTargetUnavailableError is orig_rtue
+        assert "test_cf79_sess" in std._skill_view_tracker
+        assert tp.request_exceeds_model_window is conv_comp.request_exceeds_model_window
+        assert tp.compression_skipped_due_to_lock is conv_comp.compression_skipped_due_to_lock
+        for m in (
+            "agent.context_compressor",
+            "agent.turn_truncation",
+            "agent.turn_api_error",
+            "agent.turn_response_check",
+            "agent.agent_runtime_helpers",
+            "agent.turn_recovery",
+        ):
+            if m in sys.modules:
+                assert getattr(sys.modules[m], "FailoverReason", None) is ec.FailoverReason
+    finally:
+        std._skill_view_tracker.pop("test_cf79_sess", None)
+
 
 
