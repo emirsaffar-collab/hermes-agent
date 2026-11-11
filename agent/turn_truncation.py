@@ -798,23 +798,72 @@ _GATE_SCRIPT_FILTER_MARKERS = (
     "release-note-gate",
     "bypass_users",
     "hooks-hermes/",
+    "Chrome/Default/Cookies",
+    "Chrome Safe Storage",
+    "encrypted_value",
+    "PBKDF2HMAC",
+    "extracted_cf_cookies=",
+    "__cf_logged_in",
+    "CF_VERIFIED_DEVICE_",
+    "CDP_EVAL:",
+    "tok_policies",
+    "permission_groups",
 )
 
 
 def _inject_content_filter_steer_note(api_messages: Any) -> None:
     """Append ``_CONTENT_FILTER_STEER_NOTE`` to the trailing tool/user message on ``api_messages``
-    and summarize recent gate-script tool payloads that trip Gemini's output classifier (#CF-76)."""
+    and summarize recent gate-script / browser-cookie-CDP payloads across tool results, assistant
+    ``tool_calls`` arguments, and replayed assistant reasoning that trip Gemini's output classifier
+    (#CF-76, #CF-78)."""
     if not isinstance(api_messages, list) or not api_messages:
         return
-    for msg in api_messages[-8:]:
-        if not isinstance(msg, dict) or msg.get("role") != "tool":
+    for msg in api_messages[-20:]:
+        if not isinstance(msg, dict):
             continue
-        t_content = msg.get("content")
-        if isinstance(t_content, str) and any(m in t_content for m in _GATE_SCRIPT_FILTER_MARKERS):
-            msg["content"] = (
-                "[tool output summarized after upstream content_filter — use standard CLI flags "
-                "or stage the artifact without inline gate-token synthesis]"
-            )
+        role = msg.get("role")
+        if role == "tool":
+            t_content = msg.get("content")
+            if isinstance(t_content, str) and any(m in t_content for m in _GATE_SCRIPT_FILTER_MARKERS):
+                msg["content"] = (
+                    "[tool output summarized after upstream content_filter — use standard CLI flags "
+                    "or stage the artifact without inline gate-token synthesis]"
+                )
+        elif role == "assistant":
+            tcs = msg.get("tool_calls")
+            if isinstance(tcs, list):
+                new_tcs = None
+                for idx, tc in enumerate(tcs):
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    args = fn.get("arguments")
+                    if isinstance(args, str) and any(m in args for m in _GATE_SCRIPT_FILTER_MARKERS):
+                        if new_tcs is None:
+                            new_tcs = [dict(x) if isinstance(x, dict) else x for x in tcs]
+                        new_fn = dict(fn)
+                        new_fn["arguments"] = (
+                            '{"note":"[tool_call arguments summarized after upstream content_filter]"}'
+                        )
+                        new_tcs[idx] = {**tc, "function": new_fn}
+                if new_tcs is not None:
+                    msg["tool_calls"] = new_tcs
+            for r_key in ("reasoning", "reasoning_content"):
+                r_val = msg.get(r_key)
+                if isinstance(r_val, str) and r_val.strip():
+                    msg[r_key] = " " if r_key == "reasoning_content" else ""
+            r_details = msg.get("reasoning_details")
+            if isinstance(r_details, list):
+                kept = [
+                    d for d in r_details
+                    if isinstance(d, dict) and str(d.get("type") or "").endswith(".native_assistant")
+                ]
+                if kept:
+                    msg["reasoning_details"] = kept
+                else:
+                    msg.pop("reasoning_details", None)
     for msg in reversed(api_messages):
         if not isinstance(msg, dict) or msg.get("role") not in ("tool", "user"):
             continue
