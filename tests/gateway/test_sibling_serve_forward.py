@@ -383,3 +383,35 @@ def test_take_over_idle_cross_surface_lease_stale_turn_active_polarity(tmp_path:
     ) is True
     assert isinstance(session.get("active_session_lease"), ActiveSessionLease)
 
+
+def test_publish_host_rendezvous_writes_peer_and_host_record(tmp_path: Path, monkeypatch):
+    """_publish_host_rendezvous must write both serve-peer-<pid>.json and host-serve.json cleanly."""
+    from gateway import host_rendezvous as hr
+    from hermes_cli import web_server
+    from tui_gateway.sibling_serve_forward import discover_sibling_serve_endpoint
+
+    lock_dir = tmp_path / "gw-locks"
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(lock_dir))
+    monkeypatch.setattr(hr, "cleanup_on_exit", lambda role: None)
+    monkeypatch.setattr("atexit.register", lambda fn, *a, **kw: fn)
+    monkeypatch.setattr(web_server, "is_desktop_owned_backend", lambda: False)
+
+    web_server._publish_host_rendezvous("127.0.0.1", 19119, isolated=False)
+    try:
+        rec = hr.read_record(hr.ROLE_SERVE)
+        assert rec is not None
+        assert rec.port == 19119
+        peer_file = lock_dir / f"serve-peer-{os.getpid()}.json"
+        assert peer_file.is_file()
+        # Verify discover_sibling_serve_endpoint resolves via peer file for a different simulated pid
+        peer_data = json.loads(peer_file.read_text(encoding="utf-8"))
+        fake_pid = os.getpid() + 77777
+        (lock_dir / f"serve-peer-{fake_pid}.json").write_text(
+            json.dumps({**peer_data, "pid": fake_pid}), encoding="utf-8"
+        )
+        ep = discover_sibling_serve_endpoint(fake_pid)
+        assert ep == ("127.0.0.1", 19119, peer_data["token"])
+    finally:
+        hr.release_host_lock(hr.ROLE_SERVE)
+
+

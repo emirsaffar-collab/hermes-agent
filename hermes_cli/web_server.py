@@ -1150,7 +1150,8 @@ def _publish_host_rendezvous(host: str, port: int, *, isolated: bool = False) ->
     # only. They still publish under their own role so `hermes plugins install` from a terminal
     # can reach the backend hosting the open chats on a Desktop-only box (#119644).
     from gateway import host_rendezvous as hr
-    with contextlib.suppress(Exception):
+    import contextlib as _contextlib
+    with _contextlib.suppress(Exception):
         from tui_gateway.sibling_serve_forward import register_local_serve_peer
         register_local_serve_peer(host=host, port=port, token=_SESSION_TOKEN)
 
