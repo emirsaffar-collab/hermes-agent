@@ -87,7 +87,8 @@ RECLAMATION_LOCKOUT_WARNING = (
 # deliberate main-model retry that must NOT re-issue the pin). The summary call is the ONLY auxiliary LLM
 # call a lean compaction attempt makes (#96603) — there are no sibling digest calls.
 _SUMMARY_ROUTE_PIN: contextvars.ContextVar[Optional[dict[str, Any]]] = (
-    contextvars.ContextVar("hermes_summary_route_pin", default=None)
+    globals().get("_SUMMARY_ROUTE_PIN")
+    or contextvars.ContextVar("hermes_summary_route_pin", default=None)
 )
 
 # ``timeout`` is included so a fallback entry keeps its own deadline.
@@ -101,7 +102,7 @@ def pin_summary_route(route: Optional[dict[str, Any]]):
     try:
         yield
     finally:
-        _SUMMARY_ROUTE_PIN.reset(token)
+        token.var.reset(token)
 
 
 def take_pinned_summary_route() -> Optional[dict[str, Any]]:

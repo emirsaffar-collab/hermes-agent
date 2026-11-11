@@ -226,7 +226,7 @@ def _snapshot_compressor_attempt_state(compressor: Any) -> dict[str, Any]:
 # no-op when a newer attempt owns the compressor. The commit fence still owns COMMIT admission; the
 # generation owns compressor-ATTRIBUTE writes — two different boundaries.
 # ---------------------------------------------------------------------------
-_COMPRESSOR_ATTEMPT_LOCK = threading.Lock()
+_COMPRESSOR_ATTEMPT_LOCK = globals().get("_COMPRESSOR_ATTEMPT_LOCK") or threading.Lock()
 
 # The calling attempt's generation rides a ContextVar (not a compressor attribute) so compressor code
 # deep in the call stack can tell ITS OWN attempt apart from whichever attempt currently owns the
@@ -234,8 +234,9 @@ _COMPRESSOR_ATTEMPT_LOCK = threading.Lock()
 # _run_summary_dispatch around compress_fn, which always runs in the calling attempt's own thread, so
 # worker and fallback threads each see their own generation. Callers outside the dispatch machinery
 # (manual compress, legacy paths) read None and keep unguarded historical behavior.
-_COMPRESSOR_ATTEMPT_GENERATION: contextvars.ContextVar[Any] = contextvars.ContextVar(
-    "hermes_compressor_attempt_generation", default=None
+_COMPRESSOR_ATTEMPT_GENERATION: contextvars.ContextVar[Any] = (
+    globals().get("_COMPRESSOR_ATTEMPT_GENERATION")
+    or contextvars.ContextVar("hermes_compressor_attempt_generation", default=None)
 )
 
 
@@ -700,8 +701,8 @@ class CompressionCommitFence:
 STALL_INTERRUPTED_FAILURE_CLASS = "stall_interrupted"
 
 # Daemon pool so a fence-cancelled hung worker cannot block interpreter exit; never shut down per call.
-_compress_timeout_executor = None
-_compress_timeout_executor_lock = threading.Lock()
+_compress_timeout_executor = globals().get("_compress_timeout_executor")
+_compress_timeout_executor_lock = globals().get("_compress_timeout_executor_lock") or threading.Lock()
 
 # Overrun waits proceed in bounded slices so each window logs (escalating); clamped to ceiling for tiny values.
 _COMMIT_OVERRUN_WAIT_SLICE_SECONDS = 30.0
@@ -751,8 +752,8 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
 _COMPRESS_EXECUTOR_MAX_WORKERS = 8
 _COMPRESS_POOL_ADMISSION_GRACE_SECONDS = 15.0
 _COMPRESS_POOL_ADMISSION_POLL_SECONDS = 0.25
-_compress_admission_lock = threading.Lock()
-_compress_admitted_count = 0
+_compress_admission_lock = globals().get("_compress_admission_lock") or threading.Lock()
+_compress_admitted_count = int(globals().get("_compress_admitted_count", 0) or 0)
 
 
 def _try_admit_compression_job() -> bool:
@@ -3034,7 +3035,7 @@ def _run_summary_dispatch(
                 if hard_cancel_event is not None and hard_cancel_event.is_set():
                     raise AuxiliaryExplicitCancellation()
     finally:
-        _COMPRESSOR_ATTEMPT_GENERATION.reset(_attempt_ctx_token)
+        _attempt_ctx_token.var.reset(_attempt_ctx_token)
         if commit_fence is not None:
             _clear_compression_cancelled_check_if_owner(agent.context_compressor, attempt_generation)
     return compressed
