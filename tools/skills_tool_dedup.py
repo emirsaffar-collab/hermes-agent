@@ -11,8 +11,8 @@ import hashlib
 import json
 import threading
 
-_skill_view_tracker: dict[str, dict[tuple, str]] = {}
-_skill_view_tracker_lock = threading.Lock()
+_skill_view_tracker: dict[str, dict[tuple, str]] = globals().get("_skill_view_tracker") or {}
+_skill_view_tracker_lock = globals().get("_skill_view_tracker_lock") or threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
 
 _SKILL_VIEW_DEDUP_MESSAGE = (

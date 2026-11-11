@@ -460,7 +460,10 @@ def _strip_persistence_markers(messages: list[dict[str, Any]]) -> None:
             msg.pop("_anchor_urls", None)
 
 
-class StaleHeldHistory(RuntimeError):
+_prev_stale_held_history = globals().get("StaleHeldHistory")
+
+
+class _StaleHeldHistory(RuntimeError):
     """The history a lease-less rewrite holds is no longer the session's live generation.
 
     Its newest exact row is inactive: another compaction already committed (a ``/compress`` on this or
@@ -468,6 +471,13 @@ class StaleHeldHistory(RuntimeError):
     winner's rows under the lease-less watermark and clone them back as a "concurrent tail" — two summary
     generations live. Prune and micro-compaction hold no compression lease, so they abort on this instead.
     """
+
+
+StaleHeldHistory = (
+    _prev_stale_held_history
+    if isinstance(_prev_stale_held_history, type) and issubclass(_prev_stale_held_history, RuntimeError)
+    else _StaleHeldHistory
+)
 
 
 def _archive_watermark_for(session_db: Any, session_id: str, held: list[dict[str, Any]],
