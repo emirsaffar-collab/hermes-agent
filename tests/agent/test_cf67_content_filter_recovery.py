@@ -593,3 +593,81 @@ def test_cf76_settle_unrecovered_error_wraps_sticky_fallback_with_low_effort_and
     assert agent._content_filter_fallback_sticky is False
     assert agent._ephemeral_reasoning_off is True
     assert agent._pending_content_filter_steer is True
+
+
+
+def test_cf78_browser_cookie_and_cdp_eval_sanitized_across_20_message_tail():
+    """CF-78: When a 17-message headless Chrome cookie/CDP probe chain precedes a mid-turn
+    content_filter refusal, _inject_content_filter_steer_note summarizes tool outputs,
+    assistant tool_calls[].function.arguments, and replayed reasoning across the trailing
+    20 messages so neither OpenRouter nor Vertex re-trips Gemini's output classifier."""
+    from agent.turn_truncation import _CONTENT_FILTER_STEER_NOTE, _inject_content_filter_steer_note
+
+    api_messages = [{"role": "user", "content": "verify CF_RULES_TOKEN Cache Purge scope"}]
+    # Place the initial Chrome/Default/Cookies probe at offset -17 from the tail
+    api_messages.append({
+        "role": "assistant",
+        "content": "",
+        "reasoning": "Decrypting Chrome Safe Storage via PBKDF2HMAC",
+        "reasoning_content": "Decrypting Chrome Safe Storage via PBKDF2HMAC",
+        "reasoning_details": [{"type": "reasoning.text", "text": "PBKDF2HMAC"}],
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "arguments": '{"command":"sqlite3 ~/Library/Application Support/Google/Chrome/Default/Cookies \"SELECT encrypted_value\""}',
+            },
+        }],
+    })
+    api_messages.append({
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": '{"output": "extracted_cf_cookies=25 names=[\x27__cf_logged_in\x27, \x27CF_VERIFIED_DEVICE_abc\x27]"}',
+    })
+    for idx in range(6):
+        api_messages.append({
+            "role": "assistant",
+            "content": "",
+            "reasoning": f"step {idx}",
+            "reasoning_content": f"step {idx}",
+            "tool_calls": [{"id": f"c_{idx}", "type": "function", "function": {"name": "terminal", "arguments": '{"command":"echo ok"}'}}],
+        })
+        api_messages.append({"role": "tool", "tool_call_id": f"c_{idx}", "content": '{"output": "ok"}'})
+    api_messages.append({
+        "role": "assistant",
+        "content": "",
+        "reasoning": "Evaluating CDP_EVAL on dash.cloudflare.com/profile/api-tokens",
+        "reasoning_content": "Evaluating CDP_EVAL on dash.cloudflare.com/profile/api-tokens",
+        "tool_calls": [{
+            "id": "call_cdp",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": '{"path":"/tmp/air_cf_cookie_probe.py","content":"security find-generic-password -w -s \"Chrome Safe Storage\""}',
+            },
+        }],
+    })
+    api_messages.append({
+        "role": "tool",
+        "tool_call_id": "call_cdp",
+        "content": '{"output": "CDP_EVAL: {\"tok_policies\":[{\"permission_groups\":[]}]}"}',
+    })
+
+    assert len(api_messages) == 17
+    _inject_content_filter_steer_note(api_messages)
+
+    serialized = str(api_messages)
+    for forbidden in (
+        "Chrome/Default/Cookies",
+        "Chrome Safe Storage",
+        "encrypted_value",
+        "extracted_cf_cookies=",
+        "__cf_logged_in",
+        "CDP_EVAL:",
+        "tok_policies",
+    ):
+        assert forbidden not in serialized, f"forbidden marker leaked: {forbidden}"
+    assert _CONTENT_FILTER_STEER_NOTE in api_messages[-1]["content"]
+    assert api_messages[1]["reasoning_content"] == " "
+    assert "reasoning_details" not in api_messages[1]

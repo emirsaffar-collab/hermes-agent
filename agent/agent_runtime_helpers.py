@@ -314,8 +314,8 @@ def sanitize_tool_call_arguments(
 # Session-scoped in-flight registry for note_turn_start: the gateway caches agents per routing key
 # while the transcript is keyed by session_id, so two agent objects can run concurrent turns on one
 # session unseen by per-agent state.
-_INFLIGHT_TURNS_BY_SESSION: dict[str, tuple[str, float]] = {}
-_INFLIGHT_TURNS_LOCK = threading.Lock()
+_INFLIGHT_TURNS_BY_SESSION: dict[str, tuple[str, float]] = globals().get("_INFLIGHT_TURNS_BY_SESSION") or {}
+_INFLIGHT_TURNS_LOCK = globals().get("_INFLIGHT_TURNS_LOCK") or threading.Lock()
 
 
 def note_turn_start(agent, turn_id: str):
