@@ -914,6 +914,22 @@ def _detach_fork_compression(review_agent: Any) -> None:
     review_agent.compression_enabled = detached
     if detached:
         review_agent._review_defer_compaction_before_first_response = True
+        compressor = getattr(review_agent, "context_compressor", None)
+        if compressor is not None:
+            try:
+                if getattr(compressor, "threshold_percent", 0.0) < _REVIEW_INPUT_CONTEXT_FRACTION:
+                    compressor.threshold_percent = _REVIEW_INPUT_CONTEXT_FRACTION
+                    ctx_len = int(getattr(compressor, "context_length", 0) or 0)
+                    if ctx_len > 0:
+                        compressor.threshold_tokens = min(
+                            _REVIEW_MAX_INPUT_TOKENS_CAP,
+                            max(1, int(ctx_len * _REVIEW_INPUT_CONTEXT_FRACTION)),
+                        )
+                compressor._ineffective_compression_count = max(
+                    int(getattr(compressor, "_ineffective_compression_count", 0) or 0), 1
+                )
+            except Exception:
+                logger.debug("background_review fork threshold clamp failed", exc_info=True)
 
 
 def _routed_reasoning_config(task_cfg: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
