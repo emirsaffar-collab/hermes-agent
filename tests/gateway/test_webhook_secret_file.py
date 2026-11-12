@@ -18,6 +18,7 @@ Contracts:
 import hashlib
 import hmac
 import json
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -42,6 +43,11 @@ def _write_secret_file(tmp_path, name, content):
 
 def _generic_signature(body: bytes, secret: str) -> str:
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _generic_v2_signature(body: bytes, secret: str, timestamp: str) -> str:
+    signed_content = timestamp.encode() + b"." + body
+    return hmac.new(secret.encode(), signed_content, hashlib.sha256).hexdigest()
 
 
 def _create_app(adapter: WebhookAdapter) -> web.Application:
@@ -195,10 +201,12 @@ class TestSecretFileHttpRoundTrip:
 
         app = _create_app(adapter)
         body = json.dumps({"data": "value"}).encode()
+        ts = str(int(time.time()))
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
                 "/webhooks/events", data=body,
-                headers={"X-Webhook-Signature": _generic_signature(body, SECRET_A),
+                headers={"X-Webhook-Signature-V2": _generic_v2_signature(body, SECRET_A, ts),
+                         "X-Webhook-Timestamp": ts,
                          "Content-Type": "application/json"})
             assert resp.status in (200, 202)
             adapter.handle_message.assert_called_once()
@@ -206,7 +214,8 @@ class TestSecretFileHttpRoundTrip:
             adapter.handle_message.reset_mock()
             resp = await cli.post(
                 "/webhooks/events", data=body,
-                headers={"X-Webhook-Signature": _generic_signature(body, "wrong-secret"),
+                headers={"X-Webhook-Signature-V2": _generic_v2_signature(body, "wrong-secret", ts),
+                         "X-Webhook-Timestamp": ts,
                          "Content-Type": "application/json"})
             assert resp.status == 401, "invalid signature must fail closed"
             adapter.handle_message.assert_not_called()
