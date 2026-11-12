@@ -337,3 +337,87 @@ class TestCompressTagsCarriedTail:
         # And search_messages must now find the demoted tool payload!
         hits = db.search_messages("REFINED_EXECUTION_TRACER_PAYLOAD", role_filter=["tool"])
         assert [int(h["id"]) for h in hits] == [id_t_big]
+        # Demoted tool original must reconcile its display_order AFTER the summary and its parent assistant
+        displayed = db.get_messages(sid, include_compacted=True)
+        roles_and_calls = [(m["role"], m.get("tool_call_id")) for m in displayed]
+        assert roles_and_calls == [
+            ("user", None),
+            ("user", None),
+            ("assistant", None),
+            ("tool", "call_big"),
+            ("assistant", None),
+            ("tool", "call_small"),
+        ]
+
+    def test_demoted_tail_tool_with_uid_paints_once_after_assistant_and_survives_trailing_prompt(self, tmp_path):
+        """When compress() carries message_uid on a demoted tail tool stub (with or without
+        a pre-populated timestamp) and appends a trailing synthetic user prompt after the
+        carried tail, every display projection must paint the tool result ONCE (as the full
+        original) AFTER its carried parent assistant, and verbatim tail tools must still rewind
+        to (active=0, compacted=0)."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "s_tail_demote_uid"
+        db.create_session(sid, source="cli")
+        db.append_message(sid, role="user", content="older turn")
+        db.append_message(sid, role="assistant", content="calling big tool", tool_calls=[{"id": "call_big"}])
+        big_payload = "FULL_ORIGINAL_PAYLOAD " + ("X" * 1800)
+        id_t_big = db.append_message(
+            sid, role="tool", content=big_payload, tool_call_id="call_big", tool_name="terminal"
+        )
+        db.append_message(sid, role="assistant", content="calling small tool", tool_calls=[{"id": "call_small"}])
+        id_t_small = db.append_message(
+            sid, role="tool", content="short tool output ok", tool_call_id="call_small", tool_name="terminal"
+        )
+
+        live = db.get_messages_as_conversation(sid, include_row_ids=True)
+        stub_text = "[terminal output demoted at compaction]"
+        tail_carried = []
+        for m in live[1:]:
+            copy = dict(m)
+            copy.pop("_row_id", None)
+            copy.pop("timestamp", None)  # exercise _carry_parent_timestamps uid fallback
+            if copy.get("tool_call_id") == "call_big":
+                copy["content"] = stub_text
+            tail_carried.append(copy)
+
+        compacted_messages = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            *tail_carried,
+            {"role": "user", "content": "[SESSION TODO SNAPSHOT — active items]"},
+            {"role": "user", "content": "[STILL IN PROGRESS — continue]"},
+        ]
+        db.archive_and_compact(sid, compacted_messages, tail_count=4)
+
+        assert db._conn is not None
+        rows = {
+            int(r["id"]): (int(r["active"]), int(r["compacted"]), int(r["display_order"]))
+            for r in db._conn.execute(
+                "SELECT id, active, compacted, display_order FROM messages WHERE session_id = ?", (sid,)
+            ).fetchall()
+        }
+        # Verbatim small tool original must still be rewound to (0, 0) despite trailing synthetic prompts
+        assert rows[id_t_small][:2] == (0, 0)
+        assert rows[id_t_big][:2] == (0, 1)
+
+        paged = db.get_messages(sid, include_compacted=True)
+        shown = db.get_messages_as_conversation(sid, include_compacted=True)
+        _model, resumed = db.get_resume_conversations(sid)
+        seg_rows, _, _ = db.transcript_segment_page(sid, latest=True, after=None, count=100)
+
+        for projection in (paged, shown, resumed, seg_rows):
+            roles = [m["role"] for m in projection]
+            assert roles == [
+                "user",
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "user",
+                "user",
+            ]
+            big_tools = [m for m in projection if m["role"] == "tool" and m["tool_call_id"] == "call_big"]
+            assert len(big_tools) == 1
+            assert big_tools[0]["content"] == big_payload
