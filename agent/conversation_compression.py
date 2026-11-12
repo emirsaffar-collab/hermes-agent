@@ -2337,12 +2337,18 @@ def _pruned_skill_reload_notice(compressed: list) -> str:
     if not names:
         return ""
     calls = "; ".join(f"skill_view(name='{name}')" for name in names)
+    batch_note = (
+        " Reload lazily on demand for the current step only (at most 2-3 skills per turn; "
+        "do not batch-reload the full list at once, or you will immediately re-trigger context compression)."
+        if len(names) > 3
+        else ""
+    )
     return (
         f"{_PRUNED_SKILL_RELOAD_NOTICE_HEADER}\n"
         "The task list above crossed the compression boundary verbatim, but "
         "the skill instructions that governed it were pruned. Before "
         f"executing any preserved task that depends on these skills, reload "
-        f"them first: {calls}. After reloading, re-check that each pending "
+        f"them first: {calls}.{batch_note} After reloading, re-check that each pending "
         "task is still justified — findings recorded before the boundary may have invalidated it."
     )
 
@@ -3500,6 +3506,9 @@ def _finish_compaction_boundary(
     _reset_read_dedup_caches(
         task_id, session_id=agent.session_id or "", surviving_messages=compressed
     )
+    _guardrails = getattr(agent, "_tool_guardrails", None)
+    if callable(_reset_guardrails := getattr(_guardrails, "reset_after_compaction", None)):
+        _reset_guardrails()
     return _compressed_est
 
 
