@@ -3217,6 +3217,18 @@ class ContextCompressor(
         the overflow handler compacts reactively in every case."""
         if rough_tokens < self.threshold_tokens:
             return False
+        # Hard safety cap against the 200k long-context pricing cliff (e.g. Vertex
+        # Gemini 2x input tier at >200k tokens): when threshold_tokens is pinned
+        # below 180k on a large-window model (>=500k), never defer an un-anchored
+        # estimate >= 180k unless a native Responses checkpoint (which zeros
+        # last_compression_rough_tokens) is awaiting its first real usage reading.
+        if (
+            rough_tokens >= 180_000
+            and 0 < self.threshold_tokens < 180_000
+            and self.context_length >= 500_000
+            and (not self.awaiting_real_usage_after_compression or self.last_compression_rough_tokens > 0)
+        ):
+            return False
         if self.awaiting_real_usage_after_compression:
             return True
         # Estimate magnitude is not evidence of overflow, even past the full window.

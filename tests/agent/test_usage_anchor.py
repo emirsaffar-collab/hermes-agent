@@ -322,5 +322,27 @@ class TestCodexAppServerAnchor:
         assert agent._usage_anchor is prior
 
 
+class TestPersistUserMessageOverridePreservesAnchor:
+    def test_persist_user_message_override_preserves_anchor_when_api_content_unchanged(self):
+        expanded = "Expanded wire prompt with <skill_content> and [DELEGATION COMPLETED]"
+        display_override = "Short clean user display prompt"
+        messages = [
+            _msg("user", "earlier question"),
+            _msg("assistant", "earlier answer"),
+            {"role": "user", "content": expanded, "api_content": expanded},
+        ]
+        anchor = capture_usage_anchor(145_000, 300, messages)
+        assert anchor is not None
+
+        # Turn finalizer rewrites msg["content"] to display_override while keeping api_content.
+        messages[-1]["content"] = display_override
+        messages.append(_msg("assistant", "turn reply"))
+        messages.append(_msg("user", "next turn prompt"))
+
+        anchored = anchored_context_tokens(messages, anchor)
+        assert anchored is not None
+        assert anchored == 145_000 + 300 + estimate_messages_tokens_rough([messages[-1]])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

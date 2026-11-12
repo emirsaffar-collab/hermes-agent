@@ -294,10 +294,16 @@ def _commit_turn_history(
         current_no_markers = [e for e in current_history if not _is_pivot_marker(e)]
         if current_no_markers == history_no_markers and any(
                 _is_pivot_marker(e) for e in current_history):
-            # Auto-compression can leave the result shorter than the turn-start history.
-            msgs = result["messages"]
-            new_messages = msgs[len(history):] if len(msgs) > len(history) else list(msgs)
-            session["history"] = current_history + new_messages
+            # Auto-compression can rewrite or shorten the prefix compared to turn-start history.
+            msgs = list(result["messages"])
+            if len(msgs) >= len(history) and msgs[:len(history)] == history:
+                session["history"] = current_history + msgs[len(history):]
+            else:
+                added_markers = [
+                    e for e in current_history
+                    if _is_pivot_marker(e) and e not in history
+                ]
+                session["history"] = msgs + added_markers
             session["history_version"] = current_version + 1
             return None
         print(

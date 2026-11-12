@@ -8,6 +8,7 @@ from agent.turn_context_compaction import (
     CompactionOutcome,
     _codex_native_auto_compaction,
     run_turn_start_compaction,
+    should_defer_preflight_to_real_usage,
 )
 
 def _agent(**kw):
@@ -48,3 +49,21 @@ def test_disabled_compression_rearms_overflow_warn_when_under_window():
     agent._clear_context_overflow_warn.assert_called_once()
     assert agent._turn_received_provider_response is False
     assert agent._turn_preflight_display_snapshot is None
+
+
+def test_should_defer_preflight_to_real_usage_respects_180k_pricing_cliff_cap():
+    cc = SimpleNamespace(
+        threshold_tokens=157_286,
+        context_length=1_048_576,
+        last_real_prompt_tokens=140_000,
+        awaiting_real_usage_after_compression=False,
+        _provider_omits_usage=False,
+    )
+    agent = SimpleNamespace(context_compressor=cc, _request_pressure_anchored=False)
+    # Between 157k threshold and 180k cliff cap: un-anchored rough estimate defers once.
+    assert should_defer_preflight_to_real_usage(agent, 165_000) is True
+    # At or above 180k cliff cap: never defers past the 200k long-context pricing cliff.
+    assert should_defer_preflight_to_real_usage(agent, 180_000) is False
+    assert should_defer_preflight_to_real_usage(agent, 205_000) is False
+    # Anchored estimate never defers at any size.
+    assert should_defer_preflight_to_real_usage(agent, 165_000, anchored=True) is False

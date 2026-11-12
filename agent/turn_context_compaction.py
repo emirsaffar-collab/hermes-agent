@@ -39,6 +39,49 @@ class CompactionOutcome:
 
 # ── Helpers shared by every compression-attempt site ──
 
+_PRICING_CLIFF_PREFLIGHT_CAP_TOKENS = 180_000
+
+
+def should_defer_preflight_to_real_usage(
+    agent: Any, preflight_estimate: int, *, anchored: bool = False,
+) -> bool:
+    """Wait one request for real usage when an un-anchored rough estimate crosses threshold.
+
+    Anchored figures (real usage + delta) never defer. On pricing-cliff configurations
+    (threshold < 180k on a large window >= 500k, or an explicit threshold < 180k stub),
+    estimates >= 180k never defer across the 200k long-context pricing cliff unless a
+    native Responses checkpoint (which zeros ``last_compression_rough_tokens``) is
+    awaiting its first provider usage reading.
+    """
+    if anchored or getattr(agent, "_request_pressure_anchored", False):
+        return False
+    cc = getattr(agent, "context_compressor", None)
+    if cc is None:
+        return False
+    threshold = int(getattr(cc, "threshold_tokens", 0) or 0)
+    if preflight_estimate < threshold:
+        return False
+    window = int(getattr(cc, "context_length", 0) or 0)
+    awaiting = bool(getattr(cc, "awaiting_real_usage_after_compression", False))
+    last_comp_rough = getattr(cc, "last_compression_rough_tokens", None)
+    if (
+        preflight_estimate >= _PRICING_CLIFF_PREFLIGHT_CAP_TOKENS
+        and 0 < threshold < _PRICING_CLIFF_PREFLIGHT_CAP_TOKENS
+        and (window == 0 or window >= 500_000)
+        and (not awaiting or last_comp_rough is None or int(last_comp_rough or 0) > 0)
+    ):
+        return False
+    defer_fn = getattr(cc, "should_defer_preflight_to_real_usage", None)
+    if callable(defer_fn):
+        return bool(defer_fn(preflight_estimate))
+    if not hasattr(cc, "last_real_prompt_tokens") and not hasattr(cc, "awaiting_real_usage_after_compression"):
+        return False
+    if awaiting:
+        return True
+    if int(getattr(cc, "last_real_prompt_tokens", 0) or 0) >= threshold:
+        return False
+    return not bool(getattr(cc, "_provider_omits_usage", False))
+
 
 def _clear_overflow_warn(agent: Any) -> None:
     """Re-arm the context-overflow warning dedup (test doubles may lack the method)."""
@@ -269,9 +312,9 @@ def _preflight_compression(
         if isinstance(_snapshot_val, int) and not isinstance(_snapshot_val, bool):
             agent._turn_preflight_display_snapshot = _snapshot_val
     # An anchored figure is real usage + delta: never deferred.
-    _preflight_deferred = not getattr(agent, "_request_pressure_anchored", False) and getattr(
-        _compressor, "should_defer_preflight_to_real_usage", lambda _tokens: False
-    )(_preflight_tokens)
+    _preflight_deferred = should_defer_preflight_to_real_usage(
+        agent, _preflight_tokens, anchored=bool(getattr(agent, "_request_pressure_anchored", False))
+    )
     _codex_native_auto = _codex_native_auto_compaction(agent)
 
     if not _preflight_deferred:

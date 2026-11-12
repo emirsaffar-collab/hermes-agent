@@ -27,8 +27,10 @@ USAGE_ANCHOR_MODEL_CONFIG_KEY = "_usage_anchor"
 
 # Identity of a priced message = the provider-visible fields that round-trip the session DB
 # byte-for-byte. Display/persistence metadata (timestamps, row ids, display kinds) is rewritten
-# on reload and would only ever fail the match closed.
-_FINGERPRINT_KEYS = ("role", "content", "api_content", "tool_call_id", "tool_calls")
+# on reload and would only ever fail the match closed. When ``api_content`` is present on a
+# message, it is the wire payload sent to the provider while ``content`` may be rewritten at
+# turn finalization by ``_apply_persist_user_message_override``.
+_FINGERPRINT_KEYS = ("role", "tool_call_id", "tool_calls")
 
 
 def message_fingerprint(msg: Any) -> Optional[str]:
@@ -36,6 +38,9 @@ def message_fingerprint(msg: Any) -> Optional[str]:
     if not isinstance(msg, dict):
         return None
     payload = {k: msg.get(k) for k in _FINGERPRINT_KEYS if msg.get(k) is not None}
+    effective_content = msg.get("api_content") or msg.get("content")
+    if effective_content is not None:
+        payload["content"] = effective_content
     try:
         raw = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=True, separators=(",", ":"))
     except (TypeError, ValueError):
