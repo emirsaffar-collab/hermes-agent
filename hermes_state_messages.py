@@ -640,11 +640,15 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             if not candidates:
                 return
             donors: dict[tuple[Any, ...], list[Any]] = {}
+            uid_donors: dict[str, Any] = {}
             for row in conn.execute(
-                    "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name FROM messages "
-                    "WHERE session_id = ? AND active = 1 ORDER BY id", (parent_session_id,)).fetchall():
-                donors.setdefault((row["role"], row["content"], row["tool_call_id"], row["tool_calls"],
-                    row["tool_name"]), []).append(row["timestamp"])
+                    "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, active, message_uid "
+                    "FROM messages WHERE session_id = ? ORDER BY id", (parent_session_id,)).fetchall():
+                if row["message_uid"] and row["timestamp"] is not None:
+                    uid_donors.setdefault(row["message_uid"], row["timestamp"])
+                if row["active"]:
+                    donors.setdefault((row["role"], row["content"], row["tool_call_id"], row["tool_calls"],
+                        row["tool_name"]), []).append(row["timestamp"])
             for i in candidates:
                 msg = messages[i]
                 tool_calls = _parse_tool_calls(msg.get("tool_calls"))
@@ -654,6 +658,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 queue = donors.get(key)
                 if queue:
                     msg["timestamp"] = queue.pop(0)
+                elif msg.get("message_uid") and msg["message_uid"] in uid_donors:
+                    msg["timestamp"] = uid_donors[msg["message_uid"]]
         except Exception:
             return  # Best-effort: a failed carry falls back to the publish-time stamp, never breaks publish.
 
@@ -984,7 +990,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             # as compacted=1 (searchable), never rewound to compacted=0. Verbatim match complements
             # upstream's weak_claims (rewritten carry) — the two criteria are disjoint.
             rewind_ids += self._filter_verbatim_tail_originals(
-                conn, tail_orig_ids, compacted_messages[-int(tail_count):])
+                conn, tail_orig_ids, compacted_messages)
         # A weak claim (a rewritten carry naming the row) is archived as compacted history, never rewound out of display.
         rewind_ids += [row_id for row_id in unseen if row_id not in weak_claims]
         rewind_ids = list(dict.fromkeys(rewind_ids))
@@ -1128,13 +1134,12 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             conn, session_id, carried_messages or [])
         if tail_below > 0:
             bound = watermark is not None
-            tail_slice = compacted_messages[-int(tail_count):]
             tail_orig_ids = [int(row["id"]) for row in conn.execute(
                 f"SELECT id FROM messages WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, *((int(watermark),) if bound else ()),
-                 int(tail_below) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
-            rewind_ids += self._filter_verbatim_tail_originals(conn, tail_orig_ids, tail_slice)
+                 int(tail_below) + self._uncounted_merged_rows(compacted_messages))).fetchall()]
+            rewind_ids += self._filter_verbatim_tail_originals(conn, tail_orig_ids, compacted_messages)
         # A weak claim (a rewritten carry naming the row) is archived as compacted history, never rewound out of display.
         rewind_ids += [row_id for row_id in tail_ids if row_id not in weak_claims]
         rewind_ids = list(dict.fromkeys(rewind_ids))
@@ -1281,12 +1286,14 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         Storage interface: port as ``display_generations`` (``first_ids`` is ``session.transcript``'s)."""
         seen: dict[tuple[Any, ...], Any] = {}
         first_id: dict[tuple[Any, ...], int] = {}
+        order_id: dict[tuple[Any, ...], int] = {}
         uid_key: dict[Any, tuple[Any, ...]] = {}  # message_uid -> the display key of its first copy
         removed: dict[Any, bool] = {}  # copy identity -> its newest copy is removed (rows come in id order)
         identities: dict[tuple[Any, ...], list[Any]] = {}
         removed_ts: set[Any] = set()
         removed_first: dict[Any, int] = {}  # copy identity -> its first removed row (rows come in id order)
         rows = rows if isinstance(rows, list) else list(rows)
+        has_display_order = bool(rows) and "display_order" in rows[0].keys()
         later_copies = later_tool_copy_ids(self, rows)  # a compacted tool result paints once, as its original
         if drop_removed:
             # Every display key carries the row's timestamp third, so a live row can share a removed row's identity
@@ -1321,9 +1328,13 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 seen[key] = row
                 identities[key] = copies
             first_id[key] = min(first_id.get(key, row["id"]), row["id"])
+            slot = row["display_order"] if has_display_order and row["display_order"] is not None else row["id"]
+            pos = max(int(row["id"]), int(slot))
+            order_id[key] = pos if key not in order_id else min(order_id[key], pos)
         # Order by the logical message's FIRST row, not the chosen representative's: a protected-tail
-        # copy in a newer generation has a higher id than messages emitted after the original.
-        keys = sorted(seen, key=first_id.__getitem__)
+        # copy in a newer generation has a higher id than messages emitted after the original. Demoted
+        # tail tool originals whose parent assistant was rewound forward carry display_order > id.
+        keys = sorted(seen, key=order_id.__getitem__)
         if drop_removed:
             keys = [key for key in keys if not any(removed[copy] for copy in identities[key])]
         if first_ids is not None:
@@ -1342,6 +1353,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         path's ``ORDER BY candidate.active DESC, candidate.id DESC``. Writes only on drift."""
         first_id: dict[bytes, int] = {}
         uid_identity: dict[str, bytes] = {}  # message_uid -> its first copy's identity (the carrier rule)
+        staged: list[tuple[int, bytes, Optional[int], Optional[bytes]]] = []
+        orders: dict[int, int] = {}
+        asst_by_tcid: dict[str, list[tuple[int, int]]] = {}
+        tool_groups: dict[Any, list[tuple[int, Optional[str]]]] = {}
         last_id = 0
         while True:
             rows = conn.execute(
@@ -1352,20 +1367,61 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 "ORDER BY id LIMIT 1000",
                 (session_id, last_id))
             batch_start = last_id
-            updates = []
             for row in rows:
                 last_id = row["id"]
                 identity = self._fold_summary_carrier(
                     row, self._display_identity(self._display_dedupe_key(row)), uid_identity)
                 # A row already holding this identity keeps its stored slot (an in-place prune changes a
                 # row's content, not its place); otherwise the slot is the identity's first row.
-                kept = row["display_order"] if row["display_identity"] == identity else None
+                kept = (row["display_order"]
+                        if row["display_identity"] == identity
+                        and (row["display_order"] is None or row["display_order"] <= last_id)
+                        else None)
                 order = first_id.setdefault(identity, last_id if kept is None else kept)
-                if order != row["display_order"] or identity != row["display_identity"]:
-                    updates.append((order, identity, last_id))
+                orders[last_id] = order
+                staged.append((last_id, identity, row["display_order"], row["display_identity"]))
+                if row["role"] == "assistant" and row["tool_calls"]:
+                    tcs = _parse_tool_calls(row["tool_calls"])
+                    if isinstance(tcs, list):
+                        for tc in tcs:
+                            if isinstance(tc, dict):
+                                cid = tc.get("id") or (tc.get("function") or {}).get("id")
+                                if cid:
+                                    asst_by_tcid.setdefault(str(cid), []).append((last_id, order))
+                elif row["role"] == "tool":
+                    tkey = (("uid", row["message_uid"])
+                            if row["message_uid"]
+                            else ("tcid", row["timestamp"], row["tool_call_id"]))
+                    tool_groups.setdefault(tkey, []).append((last_id, row["tool_call_id"]))
             rows.close()
             if last_id == batch_start:
                 break
+        p_offsets: dict[int, int] = {}
+        for grp in tool_groups.values():
+            first_rid, tcid = grp[0]
+            last_rid, _ = grp[-1]
+            if not tcid or tcid not in asst_by_tcid:
+                continue
+            candidates = asst_by_tcid[tcid]
+            before_last = [o for aid, o in candidates if aid < last_rid]
+            p_order = (before_last[-1]
+                       if before_last
+                       else next((o for aid, o in candidates if aid > first_rid), None))
+            if p_order is not None and p_order > first_rid:
+                if len(grp) >= 2 and last_rid > p_order:
+                    target = last_rid
+                else:
+                    off = p_offsets.get(p_order, 0) + 1
+                    p_offsets[p_order] = off
+                    target = p_order + off
+                for rid, _ in grp:
+                    orders[rid] = target
+        updates = [
+            (orders[rid], identity, rid)
+            for rid, identity, old_order, old_identity in staged
+            if orders[rid] != old_order or identity != old_identity
+        ]
+        if updates:
             conn.executemany(
                 "UPDATE messages SET display_order = ?, display_identity = ? WHERE id = ?", updates)
 
