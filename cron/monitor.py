@@ -152,6 +152,18 @@ def job_has_monitor(job: dict) -> bool:
     return bool(_field(job, "monitor_script") or _field(job, "monitor_url"))
 
 
+def _is_transient_defer_monitor_output(output: str) -> bool:
+    """Return True if *output* starts with `STATUS=LEASE_IN_FLIGHT`, indicating an active
+    sibling/builder lease is still running. Suppresses the LLM wake WITHOUT overwriting
+    `last_output_hash`, so unchanged open asks do not re-trigger an identical wake loop
+    as soon as the lease expires."""
+    stripped = (output or "").strip()
+    if not stripped:
+        return False
+    first_line = stripped.splitlines()[0].strip()
+    return first_line == "STATUS=LEASE_IN_FLIGHT"
+
+
 def _is_idle_monitor_output(output: str) -> bool:
     """Return True if *output* is an explicit idle sentinel (`STATUS=NOOP_COMPLETE` or
     `wakeAgent=false`) that should update the stored baseline hash without waking the LLM."""
@@ -180,6 +192,9 @@ def check_monitor(job: dict) -> MonitorOutcome:
     ok, output = _run_monitor_source(job)
     if not ok:
         return MonitorOutcome(ok=False, error=output)
+
+    if _is_transient_defer_monitor_output(output):
+        return MonitorOutcome(ok=True, changed=False)
 
     new_hash = hash_monitor_output(output)
     raw_state = job.get("monitor_state")

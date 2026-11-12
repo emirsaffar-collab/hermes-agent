@@ -463,6 +463,47 @@ def test_return_to_idle_noop_updates_hash_without_waking_agent(hermes_env, monke
     assert observed["agent_runs"] == 2
 
 
+def test_monitor_lease_in_flight_preserves_hash(hermes_env, monkeypatch):
+    """When a builder lease is active in flight, the monitor emits
+    `STATUS=LEASE_IN_FLIGHT\\nSTATUS=NOOP_COMPLETE`. The scheduler must suppress
+    the wake WITHOUT overwriting `last_output_hash`, so that if the same open
+    ask is still unclosed when the lease expires, it does not immediately
+    re-trigger an identical agent run in an infinite loop."""
+    from cron.jobs import get_job
+    from cron.monitor import hash_monitor_output
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    # 1. Active payload wakes agent and stores hash("OPEN_ASKS=1")
+    job = _make_monitor_job(hermes_env, "echo 'OPEN_ASKS=1'\n")
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    success, _doc, _final, error = run_job(job)
+    assert success is True and error is None
+    assert observed["agent_runs"] == 1
+    job = get_job(job["id"])
+    assert job is not None
+    active_hash = hash_monitor_output("OPEN_ASKS=1")
+    assert job["monitor_state"]["last_output_hash"] == active_hash
+
+    # 2. Next tick sees active lease -> emits STATUS=LEASE_IN_FLIGHT; suppresses wake AND preserves active_hash
+    _write_script(hermes_env, "mon.sh", "printf 'STATUS=LEASE_IN_FLIGHT\\nSTATUS=NOOP_COMPLETE\\n'\n")
+    success, _doc, final, error = run_job(job)
+    assert success is True and error is None
+    assert final == SILENT_MARKER
+    assert observed["agent_runs"] == 1
+    job = get_job(job["id"])
+    assert job is not None
+    assert job["monitor_state"]["last_output_hash"] == active_hash
+
+    # 3. Lease expires, same open ask ("OPEN_ASKS=1") remains -> hash matches active_hash, so NO duplicate wake!
+    _write_script(hermes_env, "mon.sh", "echo 'OPEN_ASKS=1'\n")
+    success, _doc, final, error = run_job(job)
+    assert success is True and error is None
+    assert final == SILENT_MARKER
+    assert observed["agent_runs"] == 1
+
+
 
 # ---------------------------------------------------------------------------
 # cronjob tool: API-layer wiring
