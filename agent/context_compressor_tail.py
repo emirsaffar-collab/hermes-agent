@@ -25,11 +25,18 @@ TAIL_MAX_THRESHOLD_FRACTION = 0.50
 
 def lean_tail_budget(context_length: int, threshold_tokens: int) -> int:
     """Lean-mode tail selection budget: 2.5% of the window clamped to the 10K floor / 25K cap, then held to
-    :data:`TAIL_MAX_THRESHOLD_FRACTION` of the trigger. At or below ``_MIN_SUMMARY_TOKENS`` the summary alone fills
-    the trigger, so no tail leaves room under it and only the floor is held: trimming the recency window there
-    would lose context without ending the loop."""
+    :data:`TAIL_MAX_THRESHOLD_FRACTION` of the trigger. When ``threshold_tokens`` is lowered below the default
+    ``0.50 * context_length`` (e.g. ``0.15`` cliff-avoidance floor #CF-83), scale the recency window against
+    ``min(context_length, threshold_tokens * 2)`` so a 1M window does not pin the 25K cap against a 157K trigger.
+    At or below ``_MIN_SUMMARY_TOKENS`` the summary alone fills the trigger, so no tail leaves room under it and
+    only the floor is held: trimming the recency window there would lose context without ending the loop."""
     from agent.context_compressor import _MIN_SUMMARY_TOKENS, LEAN_TAIL_CAP_TOKENS, LEAN_TAIL_FLOOR_TOKENS
-    floor, window_term = LEAN_TAIL_FLOOR_TOKENS, min(LEAN_TAIL_CAP_TOKENS, int(context_length * 0.025))
+    effective_window = (
+        min(context_length, threshold_tokens * 2)
+        if threshold_tokens > _MIN_SUMMARY_TOKENS
+        else context_length
+    )
+    floor, window_term = LEAN_TAIL_FLOOR_TOKENS, min(LEAN_TAIL_CAP_TOKENS, int(effective_window * 0.025))
     if threshold_tokens > 0:
         share = int(threshold_tokens * TAIL_MAX_THRESHOLD_FRACTION)
         floor = min(floor, share)
