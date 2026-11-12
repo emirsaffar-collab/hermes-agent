@@ -140,6 +140,24 @@ class TestReinjectPrunedSkillMarkers:
         full = SUMMARY_PREFIX + "\n\n" + body
         assert ContextCompressor.classify_summary_content(full) == "standalone"
 
+    def test_relocates_stray_markers_from_wrong_structured_section(self):
+        stray_summary = (
+            "## Goal\nInvestigate logs\n\n"
+            "## Key Decisions\n- Fixed parser\n"
+            + _skill_pruned_marker("rca")
+            + "\n"
+            + _skill_pruned_marker("always-verify")
+            + "\n\n## Errors & Fixes\n- None"
+        )
+        out = _reinject_pruned_skill_markers(stray_summary, ["rca", "always-verify", "hermes-log-debug"])
+        assert "## Pruned Skills" in out
+        key_decisions_sec = out.split("## Key Decisions")[1].split("## Errors & Fixes")[0]
+        assert SKILL_PRUNED_MARKER_PREFIX not in key_decisions_sec
+        pruned_sec = out.split("## Pruned Skills")[1]
+        assert _skill_pruned_marker("rca") in pruned_sec
+        assert _skill_pruned_marker("always-verify") in pruned_sec
+        assert _skill_pruned_marker("hermes-log-debug") in pruned_sec
+
 class TestProtectedSkillPrune:
     """Phase-1 prune must not demote a just-loaded skill (#32106)."""
 
@@ -434,3 +452,19 @@ class TestReinjectionBoundsAndRedaction:
         secret = "ghp_" + "a1B2" * 6
         out = _reinject_pruned_skill_markers("body", [f"x {secret}"])
         assert secret not in out
+
+    def test_reinjection_merges_into_existing_pruned_skills_section(self):
+        existing = (
+            "## Goal\nShip fix.\n\n"
+            "## Pruned Skills\n"
+            f"{_skill_pruned_marker('rca')}\n\n"
+            "## Anchor Index (mechanically extracted, exact)\n"
+            "files: foo.py"
+        )
+        out = _reinject_pruned_skill_markers(existing, ["rca", "always-verify", "hermes-log-debug"])
+        assert out.count("## Pruned Skills") == 1
+        assert _skill_pruned_marker("rca") in out
+        assert _skill_pruned_marker("always-verify") in out
+        assert _skill_pruned_marker("hermes-log-debug") in out
+        assert out.index(_skill_pruned_marker("hermes-log-debug")) < out.index("## Anchor Index")
+

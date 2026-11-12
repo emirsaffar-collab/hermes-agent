@@ -561,3 +561,79 @@ def test_post_handoff_tail_cut_advances_past_leading_standalone_summary():
     assert len(bridge_result) < len(bridge_messages)
 
 
+def test_iterative_prompt_caps_snowballing_lists_and_strips_deterministic_sections():
+    """Iterative compactions must cap monotonically growing Completed Actions (>40)
+    and Detailed Session Log (>50) sections via deterministic rollup lines, strip
+    LLM-free lean tail sections from PREVIOUS SUMMARY:, and merge duplicate Pruned Skills."""
+    from agent.context_compressor import (
+        _LEAN_ANCHOR_HEADING,
+        _LEAN_RECOVERY_HEADING,
+        _LEAN_SESSION_LOG_HEADING,
+        _LEAN_USER_MESSAGES_HEADING,
+        _compact_previous_summary_lists,
+    )
+
+    actions = "\n".join(f"{i}. ACTION_STEP_{i:03d} completed [tool: terminal]" for i in range(1, 61))
+    log_bullets = "\n".join(f"- 2026-11-12: LOG_ENTRY_{i:03d} recorded" for i in range(1, 71))
+    snowballed_previous = (
+        "## Goal\nInvestigate latency.\n\n"
+        f"## Completed Actions\n{actions}\n\n"
+        f"{_LEAN_SESSION_LOG_HEADING}\n{log_bullets}\n\n"
+        "## Pruned Skills\n[SKILL_PRUNED: content lost in compression; reload with skill_view(name='rca')]\n\n"
+        "## Pruned Skills\n[SKILL_PRUNED: content lost in compression; reload with skill_view(name='always-verify')]\n\n"
+        f"{_LEAN_ANCHOR_HEADING}\nfiles: stale_anchor.py\n\n"
+        f"{_LEAN_USER_MESSAGES_HEADING}\n> stale verbatim user quote\n\n"
+        f"{_LEAN_RECOVERY_HEADING}\nThe 10 compacted message(s) remain fully preserved."
+    )
+
+    compacted = _compact_previous_summary_lists(snowballed_previous)
+    # 1..20 consolidated into rollup line; 21..60 (40 items) preserved verbatim.
+    assert "1-20. [Consolidated 20 earlier completed actions" in compacted
+    assert "1. ACTION_STEP_001" not in compacted
+    assert "20. ACTION_STEP_020" not in compacted
+    assert "21. ACTION_STEP_021" in compacted
+    assert "60. ACTION_STEP_060" in compacted
+
+    # Session log keeps first 10 + rollup of 20 intermediate + last 40 = 50 verbatim bullets.
+    assert "LOG_ENTRY_001" in compacted
+    assert "LOG_ENTRY_010" in compacted
+    assert "LOG_ENTRY_011" not in compacted
+    assert "LOG_ENTRY_030" not in compacted
+    assert "- [Consolidated 20 intermediate session-log entries" in compacted
+    assert "LOG_ENTRY_031" in compacted
+    assert "LOG_ENTRY_070" in compacted
+
+    # Duplicate Pruned Skills merged into a single heading; deterministic sections stripped.
+    assert compacted.count("## Pruned Skills") == 1
+    assert "skill_view(name='rca')" in compacted
+    assert "skill_view(name='always-verify')" in compacted
+    assert _LEAN_ANCHOR_HEADING not in compacted
+    assert _LEAN_USER_MESSAGES_HEADING not in compacted
+    assert _LEAN_RECOVERY_HEADING not in compacted
+
+    # End-to-end through _generate_summary: even if the LLM echoes a stale Anchor Index heading,
+    # _generate_summary strips it and attaches the fresh Anchor Index for turns_to_summarize.
+    compressor = _compressor(protect_first_n=1)
+    compressor.tail_mode = "lean"
+    compressor._previous_summary = snowballed_previous
+    llm_echo = (
+        "## Goal\nUpdated goal.\n\n"
+        f"{_LEAN_ANCHOR_HEADING}\nfiles: hallucinated_stale.py\n"
+    )
+    turns = [
+        {"role": "user", "content": "Inspect agent/context_compressor.py and #65919"},
+        {"role": "assistant", "content": "Checked agent/context_compressor.py for #65919."},
+    ]
+    with patch("agent.context_compressor.call_llm", return_value=_response(llm_echo)) as mock_llm:
+        out = compressor._generate_summary(turns)
+
+    assert out is not None
+    prompt_sent = mock_llm.call_args.kwargs["messages"][0]["content"]
+    assert "1-20. [Consolidated 20 earlier completed actions" in prompt_sent
+    assert "stale_anchor.py" not in prompt_sent
+    assert out.count(_LEAN_ANCHOR_HEADING) == 1
+    assert "hallucinated_stale.py" not in out
+    assert "agent/context_compressor.py" in out
+
+
+

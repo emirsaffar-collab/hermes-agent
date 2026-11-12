@@ -1022,19 +1022,181 @@ def _collect_ghosted_skill_names(turns: list[dict[str, Any]]) -> list[str]:
 _PRUNED_SKILLS_SECTION_HEADING = "## Pruned Skills"
 
 
+def _relocate_stray_pruned_skill_markers(
+    summary: str, extra_skill_names: Optional[list[str]] = None
+) -> tuple[str, list[str]]:
+    """In structured ``## `` summaries, remove standalone ``[SKILL_PRUNED: ...]`` lines
+    that the LLM placed inside non-``## Pruned Skills`` sections (such as ``## Key Decisions``
+    or ``## Completed Actions``) and return their skill names so they are emitted under the
+    canonical ``## Pruned Skills`` heading."""
+    base_names = list(extra_skill_names or [])
+    if not summary or ("\n## " not in summary and not summary.lstrip().startswith("## ")):
+        return summary, base_names
+    parts = re.split(r"(?=\n## )", "\n" + summary)
+    cleaned_parts: list[str] = []
+    relocated_names: list[str] = []
+    changed = False
+    for part in parts:
+        sec = part.lstrip("\n")
+        if not sec:
+            continue
+        lines = sec.splitlines()
+        heading = lines[0].strip()
+        if heading == _PRUNED_SKILLS_SECTION_HEADING or not heading.startswith("## "):
+            cleaned_parts.append(sec)
+            continue
+        kept_lines = [lines[0]]
+        for line in lines[1:]:
+            s = line.strip()
+            if s.startswith(SKILL_PRUNED_MARKER_PREFIX) and _SKILL_PRUNED_MARKER_RE.search(s):
+                for name in _extract_pruned_skill_names(s):
+                    if name not in relocated_names:
+                        relocated_names.append(name)
+                changed = True
+                continue
+            kept_lines.append(line)
+        cleaned_parts.append("\n".join(kept_lines).rstrip())
+    merged_names = list(dict.fromkeys(relocated_names + base_names))
+    if not changed:
+        return summary, merged_names
+    return "\n\n".join(cleaned_parts), merged_names
+
+
 def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
     """Deterministically restore prune markers the summarizer dropped.
     Presence is checked against the canonical marker string; the appended block is plain body text (no
     handoff prefix/scaffolding) and is redacted like all others."""
-    missing = [_skill_pruned_marker(name) for name in skill_names if _skill_pruned_marker(name) not in summary]
+    summary, all_skill_names = _relocate_stray_pruned_skill_markers(summary, skill_names)
+    missing = [_skill_pruned_marker(name) for name in all_skill_names if _skill_pruned_marker(name) not in summary]
     if not missing:
         return summary
+    redacted_missing = _redact_compaction_text("\n".join(missing))
+    if _PRUNED_SKILLS_SECTION_HEADING in summary:
+        idx = summary.find(_PRUNED_SKILLS_SECTION_HEADING)
+        after_heading = idx + len(_PRUNED_SKILLS_SECTION_HEADING)
+        next_sec = re.search(r"\n##\s+", summary[after_heading:])
+        if next_sec:
+            insert_at = after_heading + next_sec.start()
+            return summary[:insert_at].rstrip("\n") + "\n" + redacted_missing + summary[insert_at:]
+        return summary.rstrip("\n") + "\n" + redacted_missing
     # How to react to the markers is the handoff's Skill Safety Rule (``with_skill_safety_rule``), not repeated here.
     return summary + _redact_compaction_text("\n\n" + _PRUNED_SKILLS_SECTION_HEADING + "\n" + "\n".join(missing))
 
 
-# Lean tail mode: small recency window; continuity via verbatim user messages in
-# the summary, tool-result stubs with recovery pointers, and a session_search footer.
+_MAX_ITERATIVE_COMPLETED_ACTIONS = 40
+_MAX_ITERATIVE_SESSION_LOG_BULLETS = 50
+
+
+def _strip_deterministic_lean_sections(text: str) -> str:
+    """Remove deterministic lean-mode tail sections and Skill Safety Rule scaffolding
+    so iterative prompts do not ask the LLM to regenerate them and _augment_summary_lean
+    always attaches fresh deterministic sections for the newly compacted turns."""
+    if not text:
+        return text
+    cleaned = without_skill_safety_rule(text)
+    deterministic_headings = {
+        _LEAN_ANCHOR_HEADING.strip(),
+        _LEAN_USER_MESSAGES_HEADING.strip(),
+        _LEAN_RECOVERY_HEADING.strip(),
+        "## Skill Safety Rule",
+    }
+    parts = re.split(r"(?=\n## )", "\n" + cleaned)
+    kept: list[str] = []
+    for part in parts:
+        stripped = part.lstrip("\n")
+        if not stripped:
+            continue
+        first_line = stripped.splitlines()[0].strip()
+        if first_line in deterministic_headings:
+            continue
+        kept.append(stripped)
+    return "\n\n".join(kept)
+
+
+def _compact_previous_summary_lists(
+    text: str,
+    max_actions: int = _MAX_ITERATIVE_COMPLETED_ACTIONS,
+    max_log_bullets: int = _MAX_ITERATIVE_SESSION_LOG_BULLETS,
+) -> str:
+    """Cap monotonically growing Completed Actions and Detailed Session Log lists in
+    a previous summary before feeding it into the next iterative compaction prompt,
+    strip deterministic lean-mode tail sections, and merge duplicate Pruned Skills sections."""
+    if not text:
+        return text
+    stripped_text = _strip_deterministic_lean_sections(text)
+    parts = re.split(r"(?=\n## )", "\n" + stripped_text)
+    out_parts: list[Optional[str]] = []
+    pruned_skill_lines: list[str] = []
+    pruned_skills_idx: Optional[int] = None
+
+    for part in parts:
+        sec = part.lstrip("\n")
+        if not sec:
+            continue
+        lines = sec.splitlines()
+        heading = lines[0].strip()
+        body_lines = lines[1:]
+
+        if heading == "## Completed Actions":
+            action_indices = [
+                i for i, line in enumerate(body_lines)
+                if re.match(r"^\d+\.\s+", line.strip())
+            ]
+            if len(action_indices) > max_actions:
+                keep_start_idx = action_indices[-max_actions]
+                dropped_count = len(action_indices) - max_actions
+                first_kept_match = re.match(r"^(\d+)\.\s+", body_lines[keep_start_idx].strip())
+                last_consolidated_num = (
+                    int(first_kept_match.group(1)) - 1 if first_kept_match else dropped_count
+                )
+                rollup_line = (
+                    f"1-{max(1, last_consolidated_num)}. [Consolidated {dropped_count} earlier completed "
+                    f"actions from prior compactions; durable outcomes are retained in Key Decisions / "
+                    f"Critical Context, and full step-by-step history remains searchable via session_search]"
+                )
+                new_body = [rollup_line] + body_lines[keep_start_idx:]
+                sec = heading + "\n" + "\n".join(new_body)
+
+        elif heading == _LEAN_SESSION_LOG_HEADING:
+            bullet_indices = [
+                i for i, line in enumerate(body_lines)
+                if line.lstrip().startswith("- ") and not line.lstrip().startswith("- [Consolidated ")
+            ]
+            if len(bullet_indices) > max_log_bullets:
+                head_keep = min(10, max_log_bullets // 5)
+                tail_keep = max_log_bullets - head_keep
+                head_end_idx = bullet_indices[head_keep]
+                tail_start_idx = bullet_indices[-tail_keep]
+                dropped_count = len(bullet_indices) - (head_keep + tail_keep)
+                rollup_bullet = (
+                    f"- [Consolidated {dropped_count} intermediate session-log entries from prior "
+                    f"compactions; exact identifiers preserved in Anchor Index and searchable via session_search]"
+                )
+                new_body = body_lines[:head_end_idx] + [rollup_bullet] + body_lines[tail_start_idx:]
+                sec = heading + "\n" + "\n".join(new_body)
+
+        elif heading == _PRUNED_SKILLS_SECTION_HEADING:
+            for bl in body_lines:
+                s = bl.strip()
+                if s and s not in pruned_skill_lines:
+                    pruned_skill_lines.append(s)
+            if pruned_skills_idx is None:
+                pruned_skills_idx = len(out_parts)
+                out_parts.append(None)
+            continue
+
+        out_parts.append(sec)
+
+    if pruned_skills_idx is not None:
+        out_parts[pruned_skills_idx] = (
+            _PRUNED_SKILLS_SECTION_HEADING + "\n" + "\n".join(pruned_skill_lines)
+            if pruned_skill_lines else None
+        )
+
+    joined = "\n\n".join(p for p in out_parts if p)
+    if _SKILL_PRUNED_MARKER_RE.search(joined):
+        joined = _reinject_pruned_skill_markers(joined, [])
+    return joined
 
 # 2.5% of the context window, clamped; floor keeps small models workable.
 LEAN_TAIL_FLOOR_TOKENS = 10_000
@@ -4227,6 +4389,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary = _redact_compaction_text(content.strip())
             # Restore any [SKILL_PRUNED] marker the summarizer paraphrased away.
             # See #32106.
+            summary = _strip_deterministic_lean_sections(summary)
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
@@ -4276,8 +4439,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         _session_log_section = _LEAN_SESSION_LOG_SECTION if getattr(self, "tail_mode", "lean") == "lean" else ""
         _template_sections = self._summary_template_sections(_section, summary_budget, _session_log_section)
         if self._previous_summary:
-            # Iterative update. Bound the previous summary too: a rehydrated handoff can be huge.
-            _bounded_previous_summary = self._bound_summary_input(self._previous_summary)
+            # Iterative update. Compact monotonically growing action/session-log lists and strip
+            # deterministic lean tail sections before bounding total input length.
+            _bounded_previous_summary = self._bound_summary_input(
+                _compact_previous_summary_lists(self._previous_summary)
+            )
             prompt = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
@@ -4288,7 +4454,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering; keep any '1-N. [Consolidated ...]' rollup line intact and cap detailed numbered items to the 40 most recent actions). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
 {_template_sections}"""
         else:
