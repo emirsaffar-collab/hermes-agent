@@ -729,3 +729,118 @@ describe('unhideOpeningUserRows', () => {
     expect(messages[0].display_kind).toBe('hidden')
   })
 })
+
+describe('graftRefreshedTailOntoBackfill disconnected stream tail pruning', () => {
+  it('drops receipt-less assistant-stream bubbles already covered by durable folds and keeps uncovered live streams', () => {
+    const userRow: ChatMessage = {
+      id: '100-0',
+      rowId: 100,
+      role: 'user',
+      parts: [{ type: 'text', text: 'Run full audit' }]
+    }
+
+    const preCompactionFold: ChatMessage = {
+      id: '101-1',
+      rowId: 101,
+      role: 'assistant',
+      durableComplete: false,
+      parts: [
+        { type: 'reasoning', text: 'Thinking...\n**Analyzing Audit Trigger**\n\nInspecting gate.' },
+        { type: 'text', text: 'Inspecting merge_approved in github-review-gate.sh', sourceRowId: 101 },
+        {
+          type: 'tool-call',
+          toolCallId: 'call-1',
+          toolName: 'read_file',
+          args: {},
+          argsText: '{}',
+          result: 'ok'
+        }
+      ]
+    }
+
+    const postCompactionFold: ChatMessage = {
+      id: '150-2',
+      rowId: 150,
+      role: 'assistant',
+      durableComplete: true,
+      parts: [
+        {
+          type: 'tool-call',
+          toolCallId: 'call-2',
+          toolName: 'terminal',
+          args: {},
+          argsText: '{}',
+          result: 'done'
+        },
+        { type: 'text', text: 'All 4 items completed and verified.', sourceRowId: 160 }
+      ]
+    }
+
+    const staleStreamCommentary: ChatMessage = {
+      id: 'assistant-stream-1001',
+      role: 'assistant',
+      pending: false,
+      recovered: true,
+      parts: [{ type: 'text', text: '**Analyzing Audit Trigger**\n\nInspecting gate.' }]
+    }
+
+    const staleStreamToolRound: ChatMessage = {
+      id: 'assistant-stream-1002',
+      role: 'assistant',
+      pending: false,
+      recovered: true,
+      parts: [
+        {
+          type: 'tool-call',
+          toolCallId: 'call-1',
+          toolName: 'read_file',
+          args: {},
+          argsText: '{}',
+          result: 'ok'
+        },
+        { type: 'text', text: 'Inspecting merge_approved in github-review-gate.sh' }
+      ]
+    }
+
+    const previous: ChatMessage[] = [
+      userRow,
+      preCompactionFold,
+      postCompactionFold,
+      staleStreamCommentary,
+      staleStreamToolRound
+    ]
+
+    const refreshedTail: ChatMessage[] = [chat('earlier-turn', 90), userRow, preCompactionFold, postCompactionFold]
+
+    const grafted = graftRefreshedTailOntoBackfill(refreshedTail, previous)
+    expect(grafted.map(message => message.id)).toEqual(['earlier-turn', '100-0', '101-1', '150-2'])
+
+    // Polarity check: an uncovered in-flight stream bubble from a running turn still survives.
+    const uncoveredLiveStream: ChatMessage = {
+      id: 'assistant-stream-9999',
+      role: 'assistant',
+      pending: true,
+      parts: [
+        {
+          type: 'tool-call',
+          toolCallId: 'call-unpersisted',
+          toolName: 'terminal',
+          args: {},
+          argsText: '{}'
+        },
+        { type: 'text', text: 'Running final verification step...' }
+      ]
+    }
+
+    const inFlightRefreshed: ChatMessage[] = [chat('earlier-turn', 90), userRow, preCompactionFold]
+    const inFlightPrevious: ChatMessage[] = [userRow, preCompactionFold, staleStreamToolRound, uncoveredLiveStream]
+
+    const inFlightGrafted = graftRefreshedTailOntoBackfill(inFlightRefreshed, inFlightPrevious)
+    expect(inFlightGrafted.map(message => message.id)).toEqual([
+      'earlier-turn',
+      '100-0',
+      '101-1',
+      'assistant-stream-9999'
+    ])
+  })
+})

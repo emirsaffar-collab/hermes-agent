@@ -20,6 +20,10 @@ import {
   dropPageRowsOfStoppedTurns,
   dropReceiptTurnsThePageHolds
 } from '@/app/chat/transcript-receipt-turns'
+import {
+  committedFoldsOfLocalTurn,
+  durableFoldCoversLiveResponse
+} from '@/app/session/hooks/use-session-actions/committed-reply'
 import { transcriptRowIds } from '@/app/session/hooks/use-session-actions/pending-turn-identity'
 import { getOlderSessionMessages, getSessionMessages, type ProfileScope } from '@/hermes'
 import { type ChatMessage, chatMessageText, toChatMessages } from '@/lib/chat-messages'
@@ -406,7 +410,25 @@ function mergeOverlappingTail(previous: ChatMessage[], refreshedTail: ChatMessag
   // A notice whose anchor row the page dropped after all still stays on screen.
   const unplaced = [...anchored.entries()].filter(([rowId]) => !byRowId.has(rowId)).flatMap(([, notices]) => notices)
 
-  return [...stored, ...refreshedTrailing, ...previousTrailing, ...unplaced]
+  const uncoveredPreviousTrailing = previousTrailing.filter(message => {
+    if (
+      message.role !== 'assistant' ||
+      Boolean(message.error) ||
+      (message.pending !== true && !message.id.startsWith('assistant-stream-'))
+    ) {
+      return true
+    }
+
+    const previousIndex = previous.indexOf(message)
+
+    if (previousIndex < 0) {
+      return true
+    }
+
+    return !durableFoldCoversLiveResponse(committedFoldsOfLocalTurn(stored, previous, previousIndex), message)
+  })
+
+  return [...stored, ...refreshedTrailing, ...uncoveredPreviousTrailing, ...unplaced]
 }
 
 export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], previous: ChatMessage[]): ChatMessage[] {

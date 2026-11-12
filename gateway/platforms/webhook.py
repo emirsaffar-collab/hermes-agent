@@ -830,9 +830,6 @@ class WebhookAdapter(BasePlatformAdapter):
             lambda: self._admission_source(route_name, profile, delivery_id))
         if error_response is not None:
             return error_response
-        # Rate limiting (after auth)
-        if not self._record_rate_limit_hit(route_name, time.time()):
-            return _json_error("Rate limit exceeded", 429)
         payload = self._parse_body(raw_body)
         if payload is _UNPARSEABLE:
             return _json_error("Cannot parse body", 400)
@@ -864,6 +861,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload or payload
+            # Rate limiting (after filter/script ignore so sink-only routes don't trip agent dispatch cap)
+            if not self._record_rate_limit_hit(route_name, time.time()):
+                return _json_error("Rate limit exceeded", 429)
             prompt = (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
                       or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name))
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.

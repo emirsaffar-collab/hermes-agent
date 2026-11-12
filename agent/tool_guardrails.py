@@ -343,6 +343,22 @@ class ToolCallGuardrailController:
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
 
+    def reset_after_compaction(self) -> None:
+        """Clear read-tool no-progress and streak counters across a compaction boundary.
+
+        Context compression prunes prior ``skill_view`` and ``read_file`` bodies out of
+        the transcript and explicitly instructs the model to reload pruned skills on demand.
+        Retaining pre-compaction ``_no_progress`` counts across compactions causes legitimate
+        post-compaction reloads of unchanged files/skills to hit ``idempotent_no_progress_block``.
+        """
+        for sig in [s for s in self._no_progress if s.tool_name in ("skill_view", "read_file")]:
+            self._no_progress.pop(sig, None)
+        if self._identical_streak_sig and self._identical_streak_sig.tool_name in ("skill_view", "read_file"):
+            self._identical_streak_sig = None
+            self._identical_streak_result_hash = ""
+            self._identical_streak_count = 0
+            self._identical_streak_first_call_id = ""
+
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision

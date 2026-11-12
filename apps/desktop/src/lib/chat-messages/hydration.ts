@@ -213,10 +213,22 @@ function parseDisplayMetadata(metadata: SessionMessage['display_metadata']): nul
   return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null
 }
 
+const COMPACTION_SUMMARY_PREFIX = '[CONTEXT COMPACTION — REFERENCE ONLY]'
+
 // A micro-compaction merge (`display_metadata.model_only`) is the model's copy of prompts whose originals
 // the history shows: the owner's resume snapshot keeps it as an undo target, and it is never painted.
+// Mid-turn context compaction summaries (`display_kind: 'hidden'`) are likewise model-only handoff rows
+// and must not split an active tool-calling assistant turn into two separate bubbles.
 function isPainted(message: SessionMessage): boolean {
-  return parseDisplayMetadata(message.display_metadata)?.model_only !== true
+  if (parseDisplayMetadata(message.display_metadata)?.model_only === true) {
+    return false
+  }
+
+  return !(
+    message.display_kind === 'hidden' &&
+    typeof message.content === 'string' &&
+    message.content.trimStart().startsWith(COMPACTION_SUMMARY_PREFIX)
+  )
 }
 
 // `agent/conversation_loop.py::_failed_turn_display_metadata`: the failed turn's error card,

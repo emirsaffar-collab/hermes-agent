@@ -176,8 +176,11 @@ def prepare_iteration(
     # CF-61: a transient mid-turn failover (e.g. a 1-second OpenRouter 429 or stream drop)
     # must not pin a multi-step tool turn onto the fallback provider for its remaining
     # 20-100+ tool iterations once the primary cooldown has elapsed. Restore primary at
-    # the start of the next completed tool iteration (never on an in-flight retry restart).
-    if (
+    # the start of the next completed tool iteration (never on an in-flight retry restart
+    # or on the immediate retry iteration after an empty-response fallback #CF-83).
+    if getattr(agent, "_empty_fallback_retry_pending", False):
+        agent._empty_fallback_retry_pending = False
+    elif (
         api_call_count > 0
         and not getattr(agent, "_rebuilt_restarts_since_response", 0)
         and not getattr(agent, "_content_filter_fallback_sticky", False)
