@@ -3139,7 +3139,12 @@ def _save_compose_deliver(
         # Cron silence suppression — see _is_cron_silence_response. Replaces the old `SILENT_MARKER in
         # ...upper()` substring check, which both leaked bracketless near-markers ("SILENT" / "NO_REPLY")
         # and wrongly swallowed a real report that merely quoted "[SILENT]" mid-sentence (#51438, #46917).
-        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+        logger.info(
+            "Job '%s': %s %s — skipping delivery",
+            job["id"],
+            "gate/script returned" if job.get("script") and not job.get("prompt") else "agent/gate returned",
+            SILENT_MARKER,
+        )
         d.should_deliver = False
 
     if d.should_deliver and fence.lost():

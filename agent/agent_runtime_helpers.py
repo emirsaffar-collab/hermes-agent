@@ -2132,6 +2132,9 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
     if not base_url and new_norm == "openai":
         # An omitted URL means the provider's canonical direct endpoint.
         base_url = "https://api.openai.com/v1"
+    elif not base_url and new_norm in ("vertex", "google-vertex"):
+        from agent.vertex_adapter import get_vertex_config
+        _, base_url = get_vertex_config()
     # Same-provider switches may omit base_url (e.g. credential refresh); resolve capabilities from
     # the endpoint the normalization below retains.
     effective_base_url = base_url
