@@ -47,6 +47,39 @@ def dedup_skill_view(task_id, name, file_path, payload: dict, result: str) -> st
     return None
 
 
+_JSON_DECODER = json.JSONDecoder()
+
+
+def parse_unpruned_skill_view_payload(raw: str | None) -> tuple[dict, str] | None:
+    """Parse the leading JSON object from a ``skill_view`` tool result string.
+
+    Uses ``json.JSONDecoder().raw_decode`` rather than ``json.loads`` so trailing
+    blocks appended by post-tool hooks (``[skill-error-router]...``) or tool-loop
+    guardrails (``[Tool loop warning: ...]``) do not raise ``JSONDecodeError: Extra data``.
+    Returns ``(payload, json_prefix)`` for full unpruned skill/reference bodies, or ``None``.
+    """
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.lstrip()
+    if not stripped.startswith("{") or '"success": true' not in stripped[:120]:
+        return None
+    try:
+        payload, end = _JSON_DECODER.raw_decode(stripped)
+    except Exception:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("success") is not True
+        or payload.get("dedup")
+        or payload.get("setup_needed")
+        or payload.get("readiness_status") == "setup_needed"
+        or not isinstance(payload.get("content"), str)
+        or not ("skill_dir" in payload or "linked_files" in payload or "file_type" in payload)
+    ):
+        return None
+    return payload, stripped[:end]
+
+
 def seed_skill_view_dedup_from_messages(task_id: str | None, messages: list | None) -> None:
     """Populate the per-task dedup cache from unpruned ``skill_view`` tool results in *messages*.
 
@@ -60,28 +93,15 @@ def seed_skill_view_dedup_from_messages(task_id: str | None, messages: list | No
     for msg in messages:
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
-        raw = msg.get("content")
-        if not isinstance(raw, str) or not raw.startswith("{") or '"success": true' not in raw[:80]:
+        parsed = parse_unpruned_skill_view_payload(msg.get("content"))
+        if parsed is None:
             continue
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            continue
-        if (
-            not isinstance(payload, dict)
-            or payload.get("success") is not True
-            or payload.get("dedup")
-            or payload.get("setup_needed")
-            or payload.get("readiness_status") == "setup_needed"
-            or not isinstance(payload.get("content"), str)
-            or not ("skill_dir" in payload or "linked_files" in payload or "file_type" in payload)
-        ):
-            continue
+        payload, json_prefix = parsed
         resolved = str(payload.get("name") or "")
         if not resolved:
             continue
         key = (resolved, str(payload.get("file") or ""))
-        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(json_prefix.encode("utf-8")).hexdigest()
         entries.append((key, digest))
     if not entries:
         return
