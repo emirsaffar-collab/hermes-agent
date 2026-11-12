@@ -302,7 +302,17 @@ def _join_truncated_parts(parts: list[tuple[str, bool]]) -> str:
             # Overlap can't exceed len(part): scan only that tail of ``joined``.
             part = part[_continuation_overlap_length(joined[-len(part):], part):]
         if joined and not joined[-1].isspace() and part and not part[0].isspace():
-            joined += "\n"
+            last_line = joined.rsplit("\n", 1)[-1]
+            in_open_table_row = (
+                last_line.lstrip().startswith("|") and not last_line.rstrip().endswith("|")
+            )
+            mid_number = (
+                previous_was_partial_stub
+                and joined[-1].isdigit()
+                and part[0].isdigit()
+            )
+            if not (in_open_table_row or mid_number):
+                joined += "\n"
         joined += part
         previous_was_partial_stub = is_partial_stub
     return joined

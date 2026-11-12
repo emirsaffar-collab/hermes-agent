@@ -91,15 +91,19 @@ def _recover_marker_reply(
 
 def _absorb_continuation_fragments(final_response: Any, parts: Any, messages: Any) -> tuple[Any, bool]:
     """Stitch length-continuation fragments in front of the closing piece; True when there were
-    any. The continuation recovered, so the fragment rows stay in the transcript, unflagged."""
+    any. The continuation recovered, so the fragment rows stay in the transcript for wire
+    replay, hidden from display projection because the closing row carries the stitched whole."""
     if not parts:
         return final_response, False
     from agent.conversation_loop import _join_truncated_parts
 
     for frag in messages:
         if isinstance(frag, dict):
-            frag.pop("_length_continuation_fragment", None)
-            frag.pop("_length_continuation_nudge", None)
+            if frag.pop("_length_continuation_fragment", None):
+                frag.setdefault("display_kind", "hidden")
+                frag["_absorbed_continuation_fragment"] = True
+            if frag.pop("_length_continuation_nudge", None):
+                frag["_absorbed_continuation_nudge"] = True
     return _join_truncated_parts([*parts, (final_response, False)]), True
 
 
@@ -402,6 +406,13 @@ def finish_text_response(
         else:
             final_msg["content"] = final_response
     publish_held_final_row(agent, final_msg, final_response, _joined)
+    if _joined and final_msg.get("content") and final_msg["content"] != final_response:
+        final_msg.setdefault("api_content", final_msg["content"])
+        final_msg["content"] = final_response
+    for _frag in messages:
+        if isinstance(_frag, dict):
+            _frag.pop("_absorbed_continuation_fragment", None)
+            _frag.pop("_absorbed_continuation_nudge", None)
 
     append_message(messages, final_msg)
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
