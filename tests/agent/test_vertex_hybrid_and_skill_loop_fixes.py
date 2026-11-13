@@ -371,3 +371,32 @@ class TestPostCompactionLoopGuardP02:
         should_now, reason = cc.should_compress_info(178_000)
         assert should_now is False
         assert reason == "ineffective"
+
+    def test_warm_session_class_rebind_has_class_level_compaction_defaults(self, monkeypatch):
+        assert hasattr(ContextCompressor, "_last_post_compaction_prompt_tokens")
+        assert ContextCompressor._last_post_compaction_prompt_tokens == 0
+
+        cc = ContextCompressor(
+            model="google/gemini-4-argon",
+            threshold_percent=0.15,
+            quiet_mode=True,
+        )
+        cc.context_length = 1_048_576
+        cc.threshold_tokens = 157_286
+
+        # Simulate a warm session constructed before P0-2 whose __class__ was rebound across importlib.reload
+        inst_dict: dict = vars(cc)
+        inst_dict.pop("_last_post_compaction_prompt_tokens", None)
+        inst_dict.pop("_verify_compaction_cleared_threshold", None)
+        assert "_last_post_compaction_prompt_tokens" not in inst_dict
+
+        assert cc._effective_compression_threshold() == 157_286
+        assert cc.should_compress(120_000) is False
+        cc.update_from_response({"prompt_tokens": 120_000})
+
+        # Negative polarity: without the class-level default, a warm rebound instance raises AttributeError
+        inst_dict.pop("_last_post_compaction_prompt_tokens", None)
+        monkeypatch.delattr(ContextCompressor, "_last_post_compaction_prompt_tokens")
+        with pytest.raises(AttributeError, match="_last_post_compaction_prompt_tokens"):
+            cc._effective_compression_threshold()
+

@@ -2560,6 +2560,10 @@ class ContextCompressor(
     """Default context engine: prune tool results, protect head/tail, summarize the middle
     with an LLM, and iteratively update the previous summary on later compactions."""
 
+    _verify_compaction_cleared_threshold: bool = False
+    _last_post_compaction_prompt_tokens: int = 0
+    _last_compression_made_progress: bool = False
+
     @property
     def name(self) -> str:
         return "compressor"
@@ -6147,6 +6151,28 @@ Write only the summary body. Do not include any preamble or prefix."""
                 self._merge_summary_into_tail_row(msg, summary, summary_role, force_user_leading)
             compressed.append(msg)
         return compressed
+
+
+def _stamp_compressor_class_defaults() -> None:
+    """Stamp all scalar/None per-session attributes onto ``ContextCompressor`` at class definition time.
+
+    Warm sessions whose ``__class__`` is rebound across an ``importlib.reload(agent.context_compressor)``
+    (or tests constructing bare ``object.__new__(ContextCompressor)`` stubs) do not re-run ``__init__``
+    or ``_reset_session_compaction_state()``. Defining every per-session scalar default on the class itself
+    eliminates any ``AttributeError`` race window during hot-reload and ensures ``hasattr(ContextCompressor, attr)``
+    is true immediately on clean module import.
+    """
+    proto = object.__new__(ContextCompressor)
+    proto.prepared_compaction = None
+    ContextCompressor._reset_session_compaction_state(proto)
+    ContextCompressor._reset_micro_compact_cursor_state(proto)
+    ContextCompressor._clear_terminal_summary_failures(proto)
+    for attr, val in proto.__dict__.items():
+        if (isinstance(val, (int, float, bool, str)) or val is None) and not hasattr(ContextCompressor, attr):
+            setattr(ContextCompressor, attr, val)
+
+
+_stamp_compressor_class_defaults()
 
 
 def is_compaction_summary_message(message: Any) -> bool:
