@@ -201,15 +201,23 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
     return marker_key
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class _TurnScopes:
-    """Reset tokens for the thread/context scopes a turn binds (filled incrementally)."""
+    """Reset tokens for the thread/context scopes a turn binds (filled incrementally).
+
+    Unslotted with legacy default fields so partial/in-flight module reloads never raise
+    ``AttributeError`` on ``.profile`` / ``.secret`` / ``.terminal`` access (#W8).
+    """
 
     approval: Any = None
     session_tokens: list = dataclasses.field(default_factory=list)
     # The turn's profile state (home, secrets, terminal policy, runtime scope) as ONE bind; released
     # whole after post-turn housekeeping, which still runs under the session's own profile.
     profile: Any = None
+    home: Any = None
+    secret: Any = None
+    terminal: Any = None
+    runtime: Any = None
 
 
 def _route_turn_images(agent, prompt: Any, images: list[str]) -> Any:
@@ -469,6 +477,8 @@ def _run_post_turn_followups(
     # not consume session A's event.  Unclaimable events are requeued for the poller.
     try:
         from tools.process_registry import process_registry
+        with contextlib.suppress(Exception):
+            _ensure_notification_poller_alive(sid, session)
         # _release_turn_scopes / _post_turn_housekeeping have released the worker's runtime scopes. Queue ownership,
         # notification policy and nested dispatch still belong to this session.
         from tools.process_registry_awaiting import drained_for
@@ -500,7 +510,7 @@ class _TurnRun:
     one_turn_restore: Any
     terminal_callback: Any
     receipt_committed: bool
-    scopes: _TurnScopes = dataclasses.field(default_factory=_TurnScopes)
+    scopes: _TurnScopes = dataclasses.field(default_factory=lambda: _TurnScopes())
     result: Any = None  # read after the finally for leftover /steer
     tts_queue: Any = None
     thinking_started: bool = False
@@ -1128,10 +1138,11 @@ def _release_turn_scopes(sid: str, session: dict, st: _TurnRun) -> None:
             logger.debug("TUI one-turn model restore failed", exc_info=True)
     scopes = st.scopes
     with contextlib.suppress(Exception):
-        if scopes.approval is not None:
+        if getattr(scopes, "approval", None) is not None:
             from tools.approval_context import reset_current_session_key
             reset_current_session_key(scopes.approval)
-    _clear_session_context(scopes.session_tokens)
+    with contextlib.suppress(Exception):
+        _clear_session_context(getattr(scopes, "session_tokens", ()))
 
 
 def _post_turn_housekeeping(sid: str, session: dict, st: _TurnRun) -> None:
@@ -1143,8 +1154,14 @@ def _post_turn_housekeeping(sid: str, session: dict, st: _TurnRun) -> None:
             trim_memory(reason="tui turn completion", collect=False)
     except Exception:
         logger.debug("post-turn memory trim failed", exc_info=True)
-    if st.scopes.profile is not None:
-        st.scopes.profile.reset()
+    try:
+        profile_scope = getattr(getattr(st, "scopes", None), "profile", None)
+        if profile_scope is not None:
+            profile_scope.reset()
+    except Exception:
+        logger.debug("post-turn profile scope reset failed", exc_info=True)
+    with contextlib.suppress(Exception):
+        _ensure_notification_poller_alive(sid, session)
 
 
 # Bounded so a contended state.db cannot hold ``_sessions_lock``; a skipped heal is retried on the next prompt.
