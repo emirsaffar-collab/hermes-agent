@@ -583,3 +583,27 @@ def test_legacy_fallback_never_writes_an_authority_owned_session(monkeypatch, tm
         row = db.get_session("owned")
         assert row is not None and not row.get("archived") and row["runtime_revision"] == revision
         assert "owned" in authority.sessions
+
+
+def test_events_since_rebinds_live_transport_after_ws_disconnect(monkeypatch):
+    """After a mid-turn WS disconnect leaves ``session['transport'] = _detached_ws_transport``,
+    a reconnect calling ``session.events.since`` must rebind ``session['transport']`` to the
+    live client transport so subsequent ``_emit('message.complete', ...)`` pushes reach the UI."""
+    sid = "88b30ebb"
+    fake_live = ws_mod.WSTransport(object(), asyncio.new_event_loop(), peer="127.0.0.1:62798")
+    sess = {
+        "session_id": f"20261112_210035_{sid}",
+        "transport": server._detached_ws_transport,
+        "viewers": {},
+    }
+    monkeypatch.setitem(server._sessions, sid, sess)
+    monkeypatch.setattr(server, "_reattach_refusal", lambda rid, s_id, s: None)
+    monkeypatch.setattr(server, "current_transport", lambda: fake_live)
+    try:
+        resp = server._methods["session.events.since"]("req-1", {"session_id": sid, "last_seen": 0})
+        assert "result" in resp
+        assert sess["transport"] is fake_live
+        assert fake_live in sess["viewers"]
+    finally:
+        fake_live._loop.close()
+

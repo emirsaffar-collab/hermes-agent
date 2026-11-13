@@ -2314,6 +2314,11 @@ def _(rid, params: dict) -> dict:
         last_seen = int(params.get("last_seen", 0))
     except (TypeError, ValueError):
         return _err(rid, -32602, "invalid params: last_seen must be an integer")
+    session = _sessions.get(sid)
+    if session is not None:
+        with _session_resume_lock:
+            if _reattach_refusal(rid, sid, session) is None and (t := current_transport()) is not None:
+                _rebind_live_transport(sid, session, t)
     from tui_gateway import event_replay as er
     frames = er.events_since(sid, last_seen)
     # ``epoch``: in-process seq — clients reset watermarks when this differs from gateway.ready's.
