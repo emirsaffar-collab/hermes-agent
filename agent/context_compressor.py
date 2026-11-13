@@ -1130,6 +1130,44 @@ def _strip_deterministic_lean_sections(text: str) -> str:
     return "\n\n".join(kept)
 
 
+_SUMMARY_DIGIT_TOKEN_RE = re.compile(r"\b\d{3,10}\b")
+_SUMMARY_PAREN_ID_SUFFIX_RE = re.compile(
+    r"(?i)(?:,\s*|\(\s*,\s*)id\s*(?:=|:|\s)\s*`?#?(\d{3,10})`?(?=\s*\))"
+)
+_SUMMARY_LABELED_ID_RE = re.compile(
+    r"(?i)\b(id|kf_id|repnr|repnrid|butik|butiknr|store_no|order_id|ticket_id)(\s*(?:=|:|\s)\s*`?#?)(\d{3,10})(`?)\b"
+)
+
+
+def _scrub_ungrounded_summary_id_labels(summary: str, *source_texts: Optional[str]) -> str:
+    """Strip or tag explicit entity ID numbers in LLM summary prose that never appeared in the source turns."""
+    if not summary:
+        return summary
+    grounded_digits: set[str] = set()
+    for src in source_texts:
+        if isinstance(src, str) and src:
+            grounded_digits.update(_SUMMARY_DIGIT_TOKEN_RE.findall(src))
+    if not grounded_digits:
+        return summary
+
+    def _sub_paren_suffix(m: re.Match) -> str:
+        num = m.group(1)
+        if num in grounded_digits:
+            return m.group(0)
+        return "(" if m.group(0).lstrip().startswith("(") else ""
+
+    cleaned = _SUMMARY_PAREN_ID_SUFFIX_RE.sub(_sub_paren_suffix, summary)
+    cleaned = re.sub(r"\s*\(\s*\)", "", cleaned)
+
+    def _sub_labeled_id(m: re.Match) -> str:
+        label, sep, num, tail_bt = m.group(1), m.group(2), m.group(3), m.group(4)
+        if num in grounded_digits:
+            return m.group(0)
+        return f"{label}{sep}[UNGROUNDED_ID]{tail_bt}"
+
+    return _SUMMARY_LABELED_ID_RE.sub(_sub_labeled_id, cleaned)
+
+
 def _compact_previous_summary_lists(
     text: str,
     max_actions: int = _MAX_ITERATIVE_COMPLETED_ACTIONS,
@@ -4378,6 +4416,38 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             raise AuxiliaryExplicitCancellation()
         self._note_aux_route_fallback(_aux_route)
         # Reasoning-field fallback (DeepSeek/Qwen/Kimi put the summary in reasoning_content); capped.
+        # Heal warm-process auxiliary_client.extract_content_or_reasoning if it predates 564579ae9c
+        # (auxiliary_client is in _STATEFUL_SKIP_MODS so hot-reload skips it unless grafted in-place).
+        if extract_content_or_reasoning({"content": "`_probe`"}) != "`_probe`":
+            import agent.auxiliary_client as _ac_mod
+            from agent.agent_runtime_helpers import _REASONING_BLOCK_PATTERNS as _rbp
+
+            _orig_ecor = _ac_mod.extract_content_or_reasoning
+
+            def _healed_extract_content_or_reasoning(resp, *, max_reasoning_chars: int | None = None) -> str:
+                msg = _ac_mod._coerce_llm_message(resp)
+                if msg is None:
+                    return ""
+                if isinstance(msg, str):
+                    return msg.strip()
+                raw = _ac_mod._message_field(msg, "content")
+                if not isinstance(raw, str):
+                    raw = str(raw) if raw else ""
+                c = raw.strip()
+                if c:
+                    cleaned = c
+                    for pat in _rbp:
+                        cleaned = pat.sub(lambda m: m.group(1) if m.lastindex and m.group(1) is not None else "", cleaned)
+                    cleaned = cleaned.strip()
+                    if cleaned:
+                        return cleaned
+                return _orig_ecor(
+                    {"choices": [{"message": {k: _ac_mod._message_field(msg, k) for k in ("reasoning", "reasoning_content", "reasoning_details")}}]},
+                    max_reasoning_chars=max_reasoning_chars,
+                )
+
+            _ac_mod.extract_content_or_reasoning = _healed_extract_content_or_reasoning
+            globals()["extract_content_or_reasoning"] = _healed_extract_content_or_reasoning
         content = extract_content_or_reasoning(response, max_reasoning_chars=8000)
         where = f"(provider={self.provider or 'auto'} model={self.summary_model or self.model})"
         # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels) return a well-formed HTTP 200
@@ -4462,6 +4532,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary = _compact_previous_summary_lists(summary)
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
+            summary = _scrub_ungrounded_summary_id_labels(
+                summary, content_to_summarize, self._previous_summary, memory_context, focus_topic
+            )
             summary = self._augment_summary_lean(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
             # A detached stale attempt must not publish its late summary onto shared compressor state:
