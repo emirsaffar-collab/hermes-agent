@@ -2029,3 +2029,11 @@ class TestEnsureCronDirWidened:
         with pytest.raises(FileNotFoundError):
             jobs._ensure_cron_dir(scripts_dir)
         assert not deleted_home.exists()
+
+    def test_create_job_sets_default_and_explicit_owner(self, tmp_cron_dir):
+        """KYA Layer 2: every created cron job records accountable owner attribution."""
+        j_default = create_job(prompt="check health", schedule="every 1h")
+        assert j_default["owner"] == "emir"
+        j_explicit = create_job(prompt="check health", schedule="every 1h", owner="ops-team")
+        assert j_explicit["owner"] == "ops-team"
+
