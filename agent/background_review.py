@@ -1283,6 +1283,27 @@ def _publish_review_summary(agent: Any, actions: list[str]) -> None:
             agent.background_review_callback(t("display.review.summary_callback", summary=summary))
 
 
+_BACKGROUND_REVIEW_IDLE_DEBOUNCE_SECONDS: float = 45.0
+
+
+def _resolve_idle_debounce_seconds(
+    *,
+    explicit: bool,
+    task_cfg: Optional[dict[str, Any]],
+    review_run: Optional[_BackgroundReviewRun],
+) -> float:
+    if explicit or review_run is None:
+        return 0.0
+    if isinstance(task_cfg, dict) and "idle_debounce_seconds" in task_cfg:
+        try:
+            return max(0.0, float(task_cfg["idle_debounce_seconds"]))
+        except (TypeError, ValueError):
+            return 0.0
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return 0.0
+    return max(0.0, float(_BACKGROUND_REVIEW_IDLE_DEBOUNCE_SECONDS))
+
+
 def _run_review_in_thread(
     agent: Any, messages_snapshot: list[dict], prompt: str,
     task_cfg: Optional[dict[str, Any]] = None, review_run: Optional[_BackgroundReviewRun] = None,
@@ -1296,6 +1317,19 @@ def _run_review_in_thread(
     See #84423.
     """
     if review_run is not None and review_run.cancel_requested.is_set():
+        finish_background_review_run(agent, review_run)
+        return
+    debounce_s = _resolve_idle_debounce_seconds(
+        explicit=explicit,
+        task_cfg=task_cfg,
+        review_run=review_run,
+    )
+    if debounce_s > 0.0 and review_run is not None and review_run.cancel_requested.wait(timeout=debounce_s):
+        logger.info(
+            "Background review aborted during %.1fs idle-debounce before model call (session=%s)",
+            debounce_s,
+            getattr(agent, "session_id", None) or "unknown",
+        )
         finish_background_review_run(agent, review_run)
         return
     _set_thread_approval_callback(_bg_review_auto_deny)

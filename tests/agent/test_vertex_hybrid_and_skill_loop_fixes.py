@@ -227,6 +227,94 @@ class TestBackgroundReviewPromptCacheOffP12:
         assert captured.get("_cache_disabled") is True
         assert captured.get("_use_prompt_caching") is False
 
+    def test_background_review_idle_debounce_aborts_before_model_call_when_cancelled(self):
+        import threading
+        from agent.background_review import (
+            _run_review_in_thread,
+            prepare_background_review_run,
+        )
+
+        parent = SimpleNamespace(
+            session_id="sess-debounce-test",
+            _background_review_lock=threading.Lock(),
+            _background_review_run=None,
+            _background_review_agent=None,
+        )
+        run = prepare_background_review_run(parent)
+        assert run is not None
+
+        # Schedule cancellation after 30ms while debounce window is 5.0s
+        timer = threading.Timer(0.03, run.cancel_requested.set)
+        timer.start()
+        try:
+            _run_review_in_thread(
+                parent,
+                [{"role": "user", "content": "hi"}],
+                "review prompt",
+                task_cfg={"idle_debounce_seconds": 5.0},
+                review_run=run,
+                explicit=False,
+            )
+        finally:
+            timer.cancel()
+
+        # Review aborted during debounce before creating review_agent
+        assert run.cancel_requested.is_set()
+        assert parent._background_review_run is None
+
+    def test_vertex_pre_expiry_refresh_rotates_token_in_place_without_evicting_pool(self):
+        import threading
+        from agent.client_lifecycle import ClientLifecycleMixin, _OPENAI_SLOT
+
+        class _PoolDummy(ClientLifecycleMixin):
+            def __init__(self):
+                self.provider = "vertex"
+                self.model = "google/gemini-4-argon"
+                self.api_key = "ya29.old-token"
+                self.base_url = "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"
+                self._client_kwargs = {"api_key": self.api_key, "base_url": self.base_url}
+                self._openai_client_mutex = threading.RLock()
+                self.client = SimpleNamespace(api_key="ya29.old-token", _client=SimpleNamespace(is_closed=False))
+                self.context_compressor = SimpleNamespace(api_key="ya29.old-token")
+                self._primary_runtime = {
+                    "provider": "vertex",
+                    "api_key": "ya29.old-token",
+                    "compressor_api_key": "ya29.old-token",
+                    "base_url": self.base_url,
+                    "client_kwargs": {"api_key": "ya29.old-token", "base_url": self.base_url},
+                }
+                self.warm_slot_client = SimpleNamespace(
+                    api_key="ya29.old-token",
+                    _client=SimpleNamespace(is_closed=False),
+                )
+                slot = self._request_slot(_OPENAI_SLOT)
+                slot["client"] = self.warm_slot_client
+                slot["key"] = {
+                    "api_key": "ya29.old-token",
+                    "base_url": "https://europe-west2-aiplatform.googleapis.com/v1beta1/projects/p/locations/europe-west2/endpoints/openapi",
+                }
+
+        ag = _PoolDummy()
+        orig_primary = ag.client
+        assert ag._adopt_openai_credentials(
+            "ya29.new-token",
+            ag.base_url,
+            reason="vertex_pre_expiry_refresh",
+        ) is True
+        # Primary client and _OPENAI_SLOT client kept the same object identity and updated api_key in-place
+        assert ag.client is orig_primary
+        assert ag.client.api_key == "ya29.new-token"
+        assert ag.warm_slot_client.api_key == "ya29.new-token"
+        reused, stale = ag._checkout_request_slot(
+            _OPENAI_SLOT,
+            {
+                "api_key": "ya29.new-token",
+                "base_url": "https://europe-west2-aiplatform.googleapis.com/v1beta1/projects/p/locations/europe-west2/endpoints/openapi",
+            },
+        )
+        assert reused is ag.warm_slot_client
+        assert stale is None
+
 
 class TestPostCompactionLoopGuardP02:
     def test_defers_180k_unanchored_rough_estimate_immediately_after_compaction(self):

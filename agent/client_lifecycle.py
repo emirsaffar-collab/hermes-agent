@@ -287,6 +287,20 @@ class ClientLifecycleMixin:
     def _replace_primary_openai_client(self, *, reason: str) -> bool:
         with self._openai_client_lock():
             old_client = getattr(self, "client", None)
+            if (
+                reason == "vertex_pre_expiry_refresh"
+                and old_client is not None
+                and not self._is_openai_client_closed(old_client)
+                and (getattr(self, "provider", "") or "").strip().lower() != "moa"
+            ):
+                ck = getattr(self, "_client_kwargs", None)
+                new_token = (ck.get("api_key") if isinstance(ck, dict) else None) or getattr(self, "api_key", None)
+                if new_token:
+                    try:
+                        old_client.api_key = new_token
+                        return True
+                    except Exception:
+                        pass
             try:
                 # MoA's ``client`` is an in-process facade, not an SDK client; generic rebuilds must preserve that.
                 if (getattr(self, "provider", "") or "").strip().lower() == "moa":
@@ -639,6 +653,12 @@ class ClientLifecycleMixin:
         if not self._replace_primary_openai_client(reason=reason):
             return False
         if old_token and self.api_key and self.api_key != old_token:
+            self._refresh_cached_request_openai_client_token(
+                old_token=old_token,
+                new_token=self.api_key,
+                prior_base_url=prior_base_url,
+                new_base_url=self.base_url,
+            )
             cc = getattr(self, "context_compressor", None)
             if cc is not None and getattr(cc, "api_key", None) == old_token:
                 cc.api_key = self.api_key
@@ -653,6 +673,35 @@ class ClientLifecycleMixin:
             from agent.auxiliary_key_rotation import rotate_runtime_main_api_key
             rotate_runtime_main_api_key(old_token, self.api_key)
         return True
+
+    def _refresh_cached_request_openai_client_token(
+        self,
+        *,
+        old_token: Optional[str],
+        new_token: Optional[str],
+        prior_base_url: Optional[str],
+        new_base_url: Optional[str],
+    ) -> bool:
+        """Rotate the bearer token in-place on a warm ``_OPENAI_SLOT`` client so
+        hourly ``vertex_pre_expiry_refresh`` keeps the HTTP/2 connection pool alive."""
+        if not old_token or not new_token or old_token == new_token:
+            return False
+        if (prior_base_url or "").strip().rstrip("/") != (new_base_url or "").strip().rstrip("/"):
+            return False
+        with self._openai_client_lock():
+            cache = self._request_slot(_OPENAI_SLOT)
+            cached = cache.get("client")
+            key = cache.get("key")
+            if cached is None or not isinstance(key, dict):
+                return False
+            if key.get("api_key") != old_token:
+                return False
+            try:
+                cached.api_key = new_token
+            except Exception:
+                return False
+            key["api_key"] = new_token
+            return True
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
