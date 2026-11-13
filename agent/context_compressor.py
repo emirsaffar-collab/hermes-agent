@@ -3725,11 +3725,13 @@ class ContextCompressor(
             # the whole region (all roles) makes an undemotable user/assistant row look like
             # pressure — the loop then demotes every tool body, still never reaches the ceiling,
             # and the last resort nukes the newest body too, destroying working memory for zero
-            # reclaimed budget (stacked-skill-bundle sessions, 2026-10-22).
+            # reclaimed budget (stacked-skill-bundle sessions, 2026-10-22). Include parent
+            # assistant(tool_calls) rows paired with tool results so tool-group pressure is accurate.
             return sum(
                 _estimate_msg_budget_tokens(result[i])
                 for i in range(start, len(result))
                 if result[i].get("role") == "tool"
+                or (result[i].get("role") == "assistant" and result[i].get("tool_calls"))
             )
 
         demoted = 0
@@ -5563,15 +5565,15 @@ Write only the summary body. Do not include any preamble or prefix."""
         if cut_idx <= head_end:
             cut_idx = max(fallback_cut, head_end + 1)
         aligned_back = self._align_boundary_backward(messages, cut_idx)
+        aligned_fwd = self._align_boundary_forward(messages, cut_idx) if aligned_back < cut_idx else cut_idx
         if (
             aligned_back < cut_idx
             and (
-                (0 <= last_user_idx < cut_idx and aligned_back <= last_user_idx + 1)
-                or aligned_back - max(head_end, last_user_idx + 1) <= _MAX_TAIL_MESSAGE_FLOOR // 2
+                0 <= last_user_idx < cut_idx
+                or aligned_fwd - aligned_back > 2
             )
             and sum(map(price, range(aligned_back, n))) > soft_ceiling
         ):
-            aligned_fwd = self._align_boundary_forward(messages, cut_idx)
             cut_idx = aligned_fwd if cut_idx < aligned_fwd < n else aligned_back
         else:
             cut_idx = aligned_back

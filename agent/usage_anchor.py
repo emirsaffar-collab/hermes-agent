@@ -181,6 +181,52 @@ def set_usage_anchor(agent: Any, anchor: Optional[dict[str, Any]], *, turn_base:
     persist_usage_anchor(agent, anchor)
 
 
+def rebind_usage_anchor_after_prune(
+    agent: Any, old_messages: list[dict[str, Any]], new_messages: list[dict[str, Any]],
+) -> int:
+    """Update the agent's usage anchor and compressor prompt-token baseline in-place after a
+    deterministic tool-result prune so ``anchored_context_tokens`` stays valid without an extra API call.
+    Returns estimated tokens reclaimed from the priced prefix (or full transcript if unanchored)."""
+    from agent.model_metadata import estimate_messages_tokens_rough
+
+    anchor = getattr(agent, "_usage_anchor", None)
+    reclaimed = max(
+        0,
+        estimate_messages_tokens_rough(old_messages) - estimate_messages_tokens_rough(new_messages),
+    )
+    if isinstance(anchor, dict) and len(old_messages) == len(new_messages) and new_messages:
+        try:
+            base_count = int(anchor.get("base_count") or 0)
+        except (TypeError, ValueError):
+            base_count = 0
+        if 0 < base_count <= len(new_messages):
+            prefix_reclaimed = max(
+                0,
+                estimate_messages_tokens_rough(old_messages[:base_count])
+                - estimate_messages_tokens_rough(new_messages[:base_count]),
+            )
+            new_pt = max(1, int(anchor.get("prompt_tokens") or 0) - prefix_reclaimed)
+            base_last = new_messages[base_count - 1]
+            new_anchor = {
+                **anchor,
+                "prompt_tokens": new_pt,
+                "base_last_role": base_last.get("role") if isinstance(base_last, dict) else None,
+                "base_last_fp": message_fingerprint(base_last),
+                "base_prefix_fp": _priced_prefix_fingerprint(new_messages, base_count),
+            }
+            set_usage_anchor(agent, new_anchor)
+            reclaimed = prefix_reclaimed or reclaimed
+    cc = getattr(agent, "context_compressor", None)
+    if cc is not None:
+        last_pt = getattr(cc, "last_prompt_tokens", 0)
+        if isinstance(last_pt, int) and not isinstance(last_pt, bool) and last_pt > 0 and reclaimed > 0:
+            cc.last_prompt_tokens = max(1, last_pt - reclaimed)
+        last_real_pt = getattr(cc, "last_real_prompt_tokens", 0)
+        if isinstance(last_real_pt, int) and not isinstance(last_real_pt, bool) and last_real_pt > 0 and reclaimed > 0:
+            cc.last_real_prompt_tokens = max(1, last_real_pt - reclaimed)
+    return reclaimed
+
+
 def restore_usage_anchor(agent: Any, conversation_history: Optional[list[dict[str, Any]]]) -> None:
     """On a resumed session, adopt the persisted anchor when ``conversation_history`` still carries
     the priced prefix; otherwise clear the stale blob so it can never suppress compression."""

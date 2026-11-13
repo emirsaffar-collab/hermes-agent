@@ -67,3 +67,32 @@ def test_should_defer_preflight_to_real_usage_respects_180k_pricing_cliff_cap():
     assert should_defer_preflight_to_real_usage(agent, 205_000) is False
     # Anchored estimate never defers at any size.
     assert should_defer_preflight_to_real_usage(agent, 165_000, anchored=True) is False
+
+
+def test_turn1_oversized_tool_batch_excluded_from_protected_head():
+    from agent.context_compressor import ContextCompressor
+
+    cc = ContextCompressor(model="google/gemini-4-argon", quiet_mode=True, protect_first_n=3, protect_last_n=6)
+    cc.tail_token_budget = 10_000
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "initial user task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": f"c{i}", "type": "function", "function": {"name": "skill_view", "arguments": '{"name":"s"}'}}
+                for i in range(6)
+            ],
+        },
+    ]
+    for i in range(6):
+        messages.append({"role": "tool", "tool_call_id": f"c{i}", "content": "S" * 6_000})
+    for i in range(8):
+        messages.append({"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i} " + ("t" * 400)})
+
+    compress_start, compress_end = cc._compress_window(messages)
+    # System prompt (0) and initial user message (1) remain protected, while the oversized Turn-1 tool batch starts at 2.
+    assert compress_start == 2
+    assert compress_end > compress_start
+

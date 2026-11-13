@@ -334,6 +334,26 @@ def compress_after_tool_results(
 
     if agent.compression_enabled and compression_attempts < max_compression_attempts:
         ensure_compression_feasibility_checked(agent, _real_tokens)
+    _proactive_cfg = getattr(_compressor, "proactive_prune_tokens", 0)
+    if (
+        agent.compression_enabled
+        and isinstance(_proactive_cfg, int)
+        and not isinstance(_proactive_cfg, bool)
+        and _proactive_cfg > 0
+        and not bool(getattr(_compressor, "awaiting_real_usage_after_compression", False))
+        and _compressor.should_compress(_real_tokens)
+    ):
+        _pre_pruned = _proactive_tool_result_prune(agent, _compressor, messages, _real_tokens)
+        if _pre_pruned is not messages:
+            messages = _pre_pruned
+            _reset_read_dedup_caches(
+                effective_task_id, session_id=agent.session_id or "", surviving_messages=messages
+            )
+            _anchored_after = anchored_context_tokens(messages, getattr(agent, "_usage_anchor", None))
+            if _anchored_after is not None:
+                _real_tokens = _anchored_after
+            elif isinstance(getattr(_compressor, "last_prompt_tokens", 0), int) and _compressor.last_prompt_tokens > 0:
+                _real_tokens = _compressor.last_prompt_tokens
     if (
         agent.compression_enabled
         and compression_attempts < max_compression_attempts
@@ -456,6 +476,8 @@ def _proactive_tool_result_prune(agent: Any, compressor: Any, messages: list, cu
     if not pruned_n or pruned_msgs is messages:
         return messages
     from agent.compaction_events import publish_prune
+    from agent.usage_anchor import rebind_usage_anchor_after_prune
 
+    rebind_usage_anchor_after_prune(agent, messages, pruned_msgs)
     publish_prune(agent, messages, pruned_msgs, pruned_n)
     return pruned_msgs

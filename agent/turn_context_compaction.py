@@ -59,8 +59,6 @@ def should_defer_preflight_to_real_usage(
     if cc is None:
         return False
     threshold = int(getattr(cc, "threshold_tokens", 0) or 0)
-    if preflight_estimate < threshold:
-        return False
     window = int(getattr(cc, "context_length", 0) or 0)
     awaiting = bool(getattr(cc, "awaiting_real_usage_after_compression", False))
     if (
@@ -73,6 +71,8 @@ def should_defer_preflight_to_real_usage(
     defer_fn = getattr(cc, "should_defer_preflight_to_real_usage", None)
     if callable(defer_fn):
         return bool(defer_fn(preflight_estimate))
+    if preflight_estimate < threshold:
+        return False
     if not hasattr(cc, "last_real_prompt_tokens") and not hasattr(cc, "awaiting_real_usage_after_compression"):
         return False
     if awaiting:
