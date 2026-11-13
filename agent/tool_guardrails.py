@@ -494,7 +494,7 @@ class ToolCallGuardrailController:
             self._same_tool_failure_counts.clear()
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
-            self._turn_productive_calls += 1
+            self._turn_productive_calls = getattr(self, '_turn_productive_calls', 0) + 1
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
         result_hash = _result_hash(result, tool_name)
@@ -502,7 +502,7 @@ class ToolCallGuardrailController:
         repeat_count = previous[1] + 1 if previous is not None and previous[0] == result_hash else 1
         self._no_progress[signature] = (result_hash, repeat_count)
         if repeat_count == 1:
-            self._turn_productive_calls += 1
+            self._turn_productive_calls = getattr(self, '_turn_productive_calls', 0) + 1
         if warnings and repeat_count >= self.config.no_progress_warn_after:
             return self._decide("warn", "idempotent_no_progress_warning", tool_name, repeat_count, signature)
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
@@ -511,7 +511,7 @@ class ToolCallGuardrailController:
         """True when this turn has executed productive calls without active failure/stall streaks."""
         return (
             self._halt_decision is None
-            and self._turn_productive_calls > 0
+            and getattr(self, '_turn_productive_calls', 0) > 0
             and not self._exact_failure_counts
             and self._auth_wall_failure_count == 0
             and self._identical_streak_count < STALL_GUARD_IDENTICAL_CALL_THRESHOLD
