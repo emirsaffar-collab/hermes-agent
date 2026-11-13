@@ -1261,8 +1261,21 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
     while not stop_flag["stop"]:
         now = time.time()
         if deadline and now > deadline:
-            state.set(leave_reason="duration_expired")
-            return
+            joined_ts = getattr(state, "joined_at", None)
+            last_cap_ts = getattr(state, "last_caption_at", None)
+            is_in_call = bool(getattr(state, "in_call", False))
+            in_call_elapsed = (now - float(joined_ts)) if joined_ts else 0.0
+            recent_speech = bool(last_cap_ts and (now - float(last_cap_ts)) < 600.0)
+            still_populated = bool(is_in_call and alone_since is None and in_call_elapsed < 14400.0)
+            if is_in_call and in_call_elapsed < 21600.0 and (recent_speech or still_populated):
+                deadline = now + 900.0
+                print(
+                    f"[meet_bot] overtime_extend new_deadline=+900s elapsed_s={in_call_elapsed:.1f} recent_speech={recent_speech}",
+                    flush=True,
+                )
+            else:
+                state.set(leave_reason="duration_expired")
+                return
         if not state.in_call and (now - last_admission_check) > 3.0:
             last_admission_check = now
             if _probe(page, _ADMISSION_PROBE_JS):
