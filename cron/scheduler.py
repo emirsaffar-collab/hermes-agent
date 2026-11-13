@@ -2469,19 +2469,36 @@ class _CronAgentSetup:
     fallback_notice: Optional[str] = None
 
 
+def _resolve_cron_max_iterations(job: Any, _cfg: Any) -> int:
+    """Resolve per-job -> cron-section -> agent-section max_iterations/max_turns ceiling."""
+    from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
+    _mt = None
+    if isinstance(job, dict):
+        _mt = job.get("max_iterations")
+        if _mt is None:
+            _mt = job.get("max_turns")
+    if _mt is None and isinstance(_cfg, dict):
+        _cron_sec = _cfg.get("cron")
+        if isinstance(_cron_sec, dict):
+            _mt = _cron_sec.get("max_iterations")
+            if _mt is None:
+                _mt = _cron_sec.get("max_turns")
+        if _mt is None:
+            _agent_sec = _cfg.get("agent")
+            if isinstance(_agent_sec, dict):
+                _mt = _agent_sec.get("max_turns")
+        if _mt is None:
+            _mt = _cfg.get("max_turns")
+    return _resolve_turn_limit(_mt)
+
+
 def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
     """Resolve model/runtime/reasoning/pool for the run, in the original gate order: exfil guard ->
     preflight (may block) -> runtime (+ fallback chain) -> credential pool -> MCP."""
     _cfg = jc.cfg
     setup = _CronAgentSetup(model=jc.model)
     setup.prefill_messages = _load_prefill_messages(_cfg, job_id)
-
-    # resolve_turn_limit() honors none/unlimited (sys.maxsize) and explicit 0 / null.
-    from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
-    _mt = _cfg.get("agent", {}).get("max_turns")
-    if _mt is None:
-        _mt = _cfg.get("max_turns")
-    setup.max_iterations = _resolve_turn_limit(_mt)
+    setup.max_iterations = _resolve_cron_max_iterations(job, _cfg)
 
     # Runtime backstop (CWE-200/522): fail closed BEFORE resolution on a provider/base_url pair
     # that would ship a stored credential off-host; hand-written jobs bypass create-time checks.
