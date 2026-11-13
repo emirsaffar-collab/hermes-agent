@@ -24,7 +24,6 @@ import sys
 import tempfile
 import threading
 from contextlib import contextmanager, suppress
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, Any, Literal, Optional, List, Tuple, Set
 
@@ -43,8 +42,9 @@ from hermes_constants import (
     _chown_to_hermes_uid, _container_or_chmod_skipped, _resolve_hermes_uid_gid,
     apply_secure_dir_policy, get_managed_system)
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home, get_process_hermes_home
+from hermes_constants import LAUNCH_ONLY_ENV_KEYS, get_hermes_home, is_launch_only_env_key, get_process_hermes_home
 from utils import atomic_replace, fast_safe_load, file_cache_version, file_signature, mkstemp_beside
+from hermes_cli.config_set_scalars import _SCALAR_WORDS, _coerce_float, _coerce_int, _quoted_bool
 from hermes_cli.config_issues import ConfigIssue, _issue
 from hermes_cli.config_backend import (
     ConfigWriteError, config_cache_version, config_destination, config_exists, config_version,
@@ -131,7 +131,7 @@ _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({
     "HERMES_YOLO_MODE", "HERMES_ACCEPT_HOOKS", "HERMES_REDACT_SECRETS",
     "HERMES_INTERACTIVE", "HERMES_EXEC_ASK", "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION",
-    "HERMES_SESSION_KEY", "HERMES_SESSION_PLATFORM"})
+    "HERMES_SESSION_KEY", "HERMES_SESSION_PLATFORM"}) | LAUNCH_ONLY_ENV_KEYS
 
 
 def _env_var_policy_name(key: str, *, is_windows: Optional[bool] = None) -> str:
@@ -1916,7 +1916,7 @@ TERMINAL_CONFIG_ENV_MAP = {
             "docker_volumes", "docker_env", "docker_mount_cwd_to_workspace", "docker_network",
             "docker_extra_args", "docker_shm_size", "docker_run_as_host_user", "docker_snap_compat",
             "docker_persist_across_processes", "docker_shared_container_key",
-            "docker_orphan_reaper", "sandbox_dir", "persistent_shell")}}
+            "docker_orphan_reaper", "sandbox_dir", "persistent_shell", "home_mode")}}
 
 
 def _terminal_env_value(value: Any) -> str:
@@ -2533,7 +2533,7 @@ def _publish_env_value(key: str, value: Optional[str]) -> None:
     # dashboard launch scope), so a same-request read after the write must see it there too; a
     # routed profile's value never reaches the shared process env.
     targets = [scope] if isinstance(scope, dict) else []
-    if not routed and (scope is None or isinstance(scope, dict)):
+    if not routed and not is_launch_only_env_key(key) and (scope is None or isinstance(scope, dict)):
         targets.append(os.environ)
     for target in targets:
         if value is None:
@@ -2679,7 +2679,7 @@ def reload_env() -> int:
     env_vars = load_env()
     count = 0
     for key, value in env_vars.items():
-        if os.environ.get(key) != value:
+        if not is_launch_only_env_key(key) and os.environ.get(key) != value:  # launch-only: never from .env (#135200)
             os.environ[key] = value
             count += 1
     known = set() if dotenv_unreadable(get_env_path()) else set(OPTIONAL_ENV_VARS) | _EXTRA_ENV_KEYS
@@ -2976,34 +2976,6 @@ def _looks_structured_value(value: str) -> bool:
     return False
 
 
-def _coerce_int(value: str):
-    """int(value) for a clean integer literal (signs/whitespace/underscores OK), else None."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _coerce_float(value: str):
-    """``float(value)`` only when the conversion preserves its decimal value; NaN/inf rejected.
-    Decimal-looking identifiers more precise than a binary float must stay strings."""
-    try:
-        f = float(value)
-        if f != f or f in (float("inf"), float("-inf")) or Decimal(value) != Decimal(str(f)):
-            return None
-    except (TypeError, ValueError, InvalidOperation):
-        return None
-    return f
-
-
-_SCALAR_WORDS = {
-    'true': True, 'yes': True, 'on': True,
-    'false': False, 'no': False, 'off': False,
-    # YAML null. Many DEFAULT_CONFIG leaves are "null/absent = off"; without this,
-    # ``config set X null`` stored the truthy string "null" and the feature could never be cleared.
-    'null': None, 'none': None, '~': None}
-
-
 def _coerce_config_set_value(key: str, value: str) -> Any:
     """Auto-coerce a ``hermes config set`` string to bool/None/int/float/list/dict.
     String-typed settings (per ``DEFAULT_CONFIG``) are preserved verbatim so enum members such as
@@ -3019,6 +2991,9 @@ def _coerce_config_set_value(key: str, value: str) -> Any:
     lower = stripped.lower()
     if lower in _SCALAR_WORDS:
         return _SCALAR_WORDS[lower]
+    quoted = _quoted_bool(stripped) if isinstance(_default_value_for_key(key), bool) else None
+    if quoted is not None:
+        return quoted
     for coerce in (_coerce_int, _coerce_float):
         coerced = coerce(stripped)
         if coerced is not None:
@@ -3286,6 +3261,8 @@ def set_config_value(key: str, value: str, force: bool = False):
     from hermes_cli.config_section_guard import _guard_section_overwrite
     key = _guard_section_overwrite(key, value, user_config, force)
     value = _refuse_container_type_mismatch(key, value, user_config, force)
+    from hermes_cli.config_secret_refs import config_set_secret_value, masked_display_value
+    value = config_set_secret_value(key, value, user_config)
     _old_provider = _model_val.get("provider") if isinstance(_model_val, dict) else None
     try:
         _set_nested(user_config, key, value)
@@ -3336,13 +3313,7 @@ def set_config_value(key: str, value: str, force: bool = False):
         from agent.i18n import reset_language_cache
         reset_language_cache()
 
-    # Mask the echoed value when the (possibly nested) key is credential-shaped, e.g.
-    # ``model.api_key`` (lowercase, so it misses the .env routing above).
-    _display_value = value
-    if _is_secret_config_key(key) and isinstance(value, str) and value:
-        from agent.redact import mask_secret
-        _display_value = mask_secret(value)
-    print(f"✓ Set {key} = {_display_value} in {config_destination(config_path)}")
+    print(f"✓ Set {key} = {masked_display_value(key, value)} in {config_destination(config_path)}")
     if _route_notice:
         print(_route_notice)
 
