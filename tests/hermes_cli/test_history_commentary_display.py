@@ -548,3 +548,164 @@ def test_stale_memory_context_module_self_heals_on_lazy_import():
     fence_result_reply(res)
     assert res["final_response"] == "Reply"
     assert hasattr(mc_mod, "fence_recalled_context")
+
+
+_OCC_PLUGIN_PATH = (
+    __import__("pathlib").Path.home() / ".hermes" / "plugins" / "or-credit-clamp" / "__init__.py"
+)
+_OCC_PLUGIN_SOURCE = (
+    _OCC_PLUGIN_PATH.read_text(encoding="utf-8") if _OCC_PLUGIN_PATH.is_file() else None
+)
+
+
+def _load_or_credit_clamp_plugin():
+    import types
+
+    if _OCC_PLUGIN_SOURCE is None:
+        pytest.skip("or-credit-clamp plugin not installed in ~/.hermes/plugins")
+    assert isinstance(_OCC_PLUGIN_SOURCE, str)
+    mod = types.ModuleType("_occ_test_mod")
+    exec(compile(_OCC_PLUGIN_SOURCE, "<or_credit_clamp_plugin>", "exec"), mod.__dict__)
+    return mod
+
+
+def test_or_credit_clamp_missing_disk_defs_two_way_polarity(tmp_path):
+    """_module_missing_disk_defs detects missing Assign/tuple-Assign/AnnAssign/ImportFrom/Import
+    symbols and new ClassDef methods on disk (positive polarity) and returns False when all are
+    present in memory (negative polarity)."""
+    import importlib.util
+    import sys
+
+    occ = _load_or_credit_clamp_plugin()
+    mod_file = tmp_path / "sample_defs_mod.py"
+    mod_file.write_text(
+        "import json as _json_alias\n"
+        "from os import path as _os_path\n"
+        "PLAIN_CONST = 1\n"
+        "TUP_A, TUP_B = 2, 3\n"
+        "TYPED_CONST: int = 4\n"
+        "class Svc:\n"
+        "    def existing_m(self):\n"
+        "        return 1\n"
+        "    def new_m(self):\n"
+        "        return 2\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("sample_defs_mod", mod_file)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["sample_defs_mod"] = mod
+    try:
+        spec.loader.exec_module(mod)
+        # Negative polarity: all disk definitions are present on the loaded module
+        assert occ._module_missing_disk_defs(mod) is False
+
+        # Positive polarity across each AST construct
+        for attr in ("PLAIN_CONST", "TUP_B", "TYPED_CONST", "_os_path", "_json_alias"):
+            saved = getattr(mod, attr)
+            delattr(mod, attr)
+            if hasattr(mod, "_or_credit_clamp_defs_sig"):
+                delattr(mod, "_or_credit_clamp_defs_sig")
+            assert occ._module_missing_disk_defs(mod) is True, f"missed missing {attr}"
+            setattr(mod, attr, saved)
+
+        # Positive polarity for a new method added to an existing class
+        delattr(mod.Svc, "new_m")
+        if hasattr(mod, "_or_credit_clamp_defs_sig"):
+            delattr(mod, "_or_credit_clamp_defs_sig")
+        assert occ._module_missing_disk_defs(mod) is True
+    finally:
+        sys.modules.pop("sample_defs_mod", None)
+
+
+def test_or_credit_clamp_reload_preserves_contextvar_locks_and_caches(tmp_path, monkeypatch):
+    """_reload_if_changed preserves ContextVar identity (so in-flight tokens reset cleanly),
+    Lock/RLock identity (top-level and inside tuples/dicts), and populated runtime dict/set caches."""
+    import importlib
+    import sys
+
+    occ = _load_or_credit_clamp_plugin()
+    monkeypatch.syspath_prepend(str(tmp_path))
+    mod_file = tmp_path / "sample_stateful_mod.py"
+    mod_file.write_text(
+        "import contextvars, threading\n"
+        "_ACTIVE_CV = contextvars.ContextVar('_ACTIVE_CV', default='idle')\n"
+        "_MOD_LOCK = threading.Lock()\n"
+        "_MOD_RLOCK = threading.RLock()\n"
+        "_TUPLE_LOCKS = (threading.Lock(),)\n"
+        "_DICT_LOCKS = {'lk': threading.Lock()}\n"
+        "_RUNTIME_CACHE = {}\n"
+        "_RUNTIME_SET = set()\n"
+        "def version():\n"
+        "    return 'v1'\n",
+        encoding="utf-8",
+    )
+    importlib.invalidate_caches()
+    mod = importlib.import_module("sample_stateful_mod")
+    try:
+        orig_cv = mod._ACTIVE_CV
+        orig_lock = mod._MOD_LOCK
+        orig_rlock = mod._MOD_RLOCK
+        orig_tup_lock = mod._TUPLE_LOCKS[0]
+        orig_dict_lock = mod._DICT_LOCKS["lk"]
+        mod._RUNTIME_CACHE["k"] = "live"
+        mod._RUNTIME_SET.add("item")
+        token = orig_cv.set("in_flight")
+
+        mod_file.write_text(
+            mod_file.read_text(encoding="utf-8").replace("return 'v1'", "return 'v2'"),
+            encoding="utf-8",
+        )
+        assert occ._reload_if_changed(mod, force=True) is True
+        assert mod.version() == "v2"
+        assert mod._ACTIVE_CV is orig_cv
+        assert mod._MOD_LOCK is orig_lock
+        assert mod._MOD_RLOCK is orig_rlock
+        assert mod._TUPLE_LOCKS[0] is orig_tup_lock
+        assert mod._DICT_LOCKS["lk"] is orig_dict_lock
+        assert mod._RUNTIME_CACHE == {"k": "live"}
+        assert mod._RUNTIME_SET == {"item"}
+        # Token created before reload must reset cleanly without ValueError
+        mod._ACTIVE_CV.reset(token)
+        assert mod._ACTIVE_CV.get() == "idle"
+    finally:
+        sys.modules.pop("sample_stateful_mod", None)
+
+
+def test_or_credit_clamp_topological_sort_handles_pkg_and_relative_imports(tmp_path):
+    """_topological_sort_modules resolves `from pkg import sub_b`, relative imports
+    (`from . import sub_b`, `from .sub_b import X`), and guarantees zero inversions
+    across _HOTFIX_TOPOLOGICAL_MODULES."""
+    import importlib.util
+    import sys
+
+    occ = _load_or_credit_clamp_plugin()
+    pkg_dir = tmp_path / "topo_pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+    (pkg_dir / "sub_b.py").write_text("VAL = 42\n", encoding="utf-8")
+    (pkg_dir / "caller_a.py").write_text("from topo_pkg import sub_b\n", encoding="utf-8")
+    (pkg_dir / "rel_c.py").write_text("from . import sub_b\nfrom .sub_b import VAL\n", encoding="utf-8")
+
+    created = []
+    try:
+        for mname, mpath in (
+            ("topo_pkg", pkg_dir / "__init__.py"),
+            ("topo_pkg.sub_b", pkg_dir / "sub_b.py"),
+            ("topo_pkg.caller_a", pkg_dir / "caller_a.py"),
+            ("topo_pkg.rel_c", pkg_dir / "rel_c.py"),
+        ):
+            spec = importlib.util.spec_from_file_location(mname, mpath)
+            assert spec is not None and spec.loader is not None
+            m = importlib.util.module_from_spec(spec)
+            sys.modules[mname] = m
+            created.append(mname)
+
+        ordered = occ._topological_sort_modules(
+            ["topo_pkg.caller_a", "topo_pkg.rel_c", "topo_pkg.sub_b"]
+        )
+        assert ordered.index("topo_pkg.sub_b") < ordered.index("topo_pkg.caller_a")
+        assert ordered.index("topo_pkg.sub_b") < ordered.index("topo_pkg.rel_c")
+    finally:
+        for mname in created:
+            sys.modules.pop(mname, None)
