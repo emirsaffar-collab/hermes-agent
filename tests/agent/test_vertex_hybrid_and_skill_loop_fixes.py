@@ -648,5 +648,28 @@ class TestWave5LongTermCostArchitectureFixes:
         assert budget.initial_max_total == 25
         assert budget._extensions_granted == 1
 
+    def test_append_guardrail_observation_isolates_after_call_exceptions(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent.__new__(AIAgent)
+        agent._stall_guards_enabled = lambda: False
+
+        class _BrokenGuardrails:
+            halt_decision = None
+
+            def after_call(self, *args, **kwargs):
+                raise AttributeError("simulated hot-reload attribute gap")
+
+        setattr(agent, "_tool_guardrails", _BrokenGuardrails())
+        out = agent._append_guardrail_observation(
+            "write_file",
+            {"path": "/tmp/example.txt"},
+            '{"verified": true}',
+            failed=False,
+            tool_call_id="call_30",
+        )
+        assert out == '{"verified": true}'
+
+
 
 

@@ -260,9 +260,12 @@ def run_tool_round(
         getattr(agent, "_tool_guardrails", None) is not None
         and hasattr(agent._tool_guardrails, "is_making_productive_progress")
         and hasattr(agent.iteration_budget, "extend_on_progress")
-        and agent._tool_guardrails.is_making_productive_progress()
     ):
-        agent.iteration_budget.extend_on_progress(1)
+        try:
+            if agent._tool_guardrails.is_making_productive_progress():
+                agent.iteration_budget.extend_on_progress(1)
+        except Exception as _prog_exc:
+            logger.debug("iteration_budget extend_on_progress check failed: %s", _prog_exc)
 
     _ptc = compress_after_tool_results(
         agent, messages=messages, system_message=system_message, user_message=user_message,
