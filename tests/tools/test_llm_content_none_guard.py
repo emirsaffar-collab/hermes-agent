@@ -85,3 +85,18 @@ class TestExtractContentOrReasoning:
             {"content": "", "reasoning_content": "short"},
             max_reasoning_chars=8000,
         ) == "short"
+
+    def test_backticked_code_spans_and_fences_preserved_in_content(self):
+        """Regression for 5ec912892d: _REASONING_BLOCK_PATTERNS includes CODE_FENCE_OR_SPAN
+        as group(1) so backticked identifiers in compaction summaries must survive."""
+        summary = (
+            "<think>internal</think>"
+            "Reparation `512734` and `499376` in store `612` (`service_kf.accepted = 0`, price `890` kr) "
+            "and `<think>` in backticks."
+        )
+        assert extract_content_or_reasoning(_make_response(summary)) == (
+            "Reparation `512734` and `499376` in store `612` (`service_kf.accepted = 0`, price `890` kr) "
+            "and `<think>` in backticks."
+        )
+        fenced = "Summary:\n```sql\nSELECT * FROM service_reparationer WHERE butiknr = '612';\n```"
+        assert extract_content_or_reasoning(_make_response(fenced)) == fenced

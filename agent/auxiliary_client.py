@@ -8180,7 +8180,7 @@ def extract_content_or_reasoning(response, *, max_reasoning_chars: int | None = 
         from agent.agent_runtime_helpers import _REASONING_BLOCK_PATTERNS
         cleaned = content
         for pattern in _REASONING_BLOCK_PATTERNS:
-            cleaned = pattern.sub("", cleaned)
+            cleaned = pattern.sub(lambda m: m.group(1) if m.lastindex and m.group(1) is not None else "", cleaned)
         cleaned = cleaned.strip()
         if cleaned:
             return cleaned
