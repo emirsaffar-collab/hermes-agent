@@ -91,18 +91,43 @@ def seed_skill_view_dedup_from_messages(task_id: str | None, messages: list | No
         return
     entries: list[tuple[tuple[str, str], str]] = []
     for msg in messages:
-        if not isinstance(msg, dict) or msg.get("role") != "tool":
+        if not isinstance(msg, dict):
             continue
-        parsed = parse_unpruned_skill_view_payload(msg.get("content"))
-        if parsed is None:
-            continue
-        payload, json_prefix = parsed
-        resolved = str(payload.get("name") or "")
-        if not resolved:
-            continue
-        key = (resolved, str(payload.get("file") or ""))
-        digest = hashlib.sha256(json_prefix.encode("utf-8")).hexdigest()
-        entries.append((key, digest))
+        role = msg.get("role")
+        if role == "tool":
+            parsed = parse_unpruned_skill_view_payload(msg.get("content"))
+            if parsed is None:
+                continue
+            payload, json_prefix = parsed
+            resolved = str(payload.get("name") or "")
+            if not resolved:
+                continue
+            key = (resolved, str(payload.get("file") or ""))
+            digest = hashlib.sha256(json_prefix.encode("utf-8")).hexdigest()
+            entries.append((key, digest))
+        elif role == "user":
+            raw_user = msg.get("content")
+            if not isinstance(raw_user, str) or "[IMPORTANT: The " not in raw_user[:64]:
+                continue
+            try:
+                from agent.skill_commands import skills_loaded_by_scaffold
+                from agent.skill_utils import normalize_skill_lookup_name
+                from tools.skills_tool import skill_view
+                for sname in skills_loaded_by_scaffold(raw_user):
+                    norm_name = normalize_skill_lookup_name(sname)
+                    sv_raw = skill_view(norm_name, task_id=task_id, preprocess=True)
+                    parsed_sv = parse_unpruned_skill_view_payload(sv_raw)
+                    if parsed_sv is None:
+                        continue
+                    sv_payload, sv_prefix = parsed_sv
+                    sv_body = str(sv_payload.get("content") or "").strip()
+                    if not sv_body or sv_body not in raw_user:
+                        continue
+                    resolved = str(sv_payload.get("name") or norm_name)
+                    if resolved:
+                        entries.append(((resolved, ""), hashlib.sha256(sv_prefix.encode("utf-8")).hexdigest()))
+            except Exception:
+                continue
     if not entries:
         return
     with _skill_view_tracker_lock:

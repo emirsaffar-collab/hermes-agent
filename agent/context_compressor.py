@@ -2697,6 +2697,9 @@ class ContextCompressor(
         self._fallback_probe_at = 0.0
         # Armed at a completed boundary; consumed by the next real prompt count in update_from_response().
         self._verify_compaction_cleared_threshold = False
+        # P0-2: Real prompt tokens observed immediately after a completed compaction that cleared
+        # threshold_tokens; used to require a minimum growth step before re-triggering compaction.
+        self._last_post_compaction_prompt_tokens = 0
         # Lets the boundary wrapper tell a completed rewrite from a no-op without inferring from length.
         self._last_compression_made_progress = False
         # Transient summary errors must not block a fresh session.
@@ -3108,6 +3111,7 @@ class ContextCompressor(
             # The overload budget rode those cooldowns; a new runtime restarts it too.
             self._reset_consecutive_overload_aborts()
         self._verify_compaction_cleared_threshold = self._last_compression_made_progress = False
+        self._last_post_compaction_prompt_tokens = 0
         # Runway was computed against the previous model's trigger; clear the durable copy too.
         self._reset_proactive_prune_rearm()
         self._clear_durable_proactive_prune_rearm()
@@ -3313,9 +3317,15 @@ class ContextCompressor(
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
             self._provider_omits_usage = False
-            if self.last_prompt_tokens < self.threshold_tokens:
-                # Any real reading below the trigger proves the prompt fits: clear the latch. The fallback streak survives.
-                self._record_ineffective_compression_verdict(0)
+            if not self._verify_compaction_cleared_threshold:
+                clear_line = (
+                    self.threshold_tokens - int(self.threshold_tokens * 0.05)
+                    if (self.threshold_tokens >= 100_000 and self._last_post_compaction_prompt_tokens > 0)
+                    else self.threshold_tokens
+                )
+                if self.last_prompt_tokens < clear_line:
+                    # Any real reading below the trigger proves the prompt fits: clear the latch. The fallback streak survives.
+                    self._record_ineffective_compression_verdict(0)
             # Anti-thrash verdict lives HERE: effectiveness is "prompt under threshold" per the provider's real count,
             # not "messages shrank"; should_compress() runs twice per turn with mixed measures and would reset it.
             # Anti-thrashing verdict, judged HERE because this is the only place that sees the provider's
@@ -3340,7 +3350,16 @@ class ContextCompressor(
                             self._ineffective_compression_count,
                         )
                 else:
-                    self._record_ineffective_compression_verdict(0)
+                    shallow_repeat = (
+                        self.threshold_tokens >= 100_000
+                        and self._last_post_compaction_prompt_tokens > 0
+                        and self.last_prompt_tokens >= self.threshold_tokens - int(self.threshold_tokens * 0.05)
+                    )
+                    self._last_post_compaction_prompt_tokens = self.last_prompt_tokens
+                    if shallow_repeat:
+                        self._record_ineffective_compression_verdict(self._ineffective_compression_count + 1)
+                    else:
+                        self._record_ineffective_compression_verdict(0)
 
     def maybe_seed_preflight_display_tokens(self, preflight_tokens: int) -> None:
         """Display-only seed of ``last_prompt_tokens`` from the 0 state; the -1 sentinel and real readings are preserved."""
@@ -3396,7 +3415,7 @@ class ContextCompressor(
             rough_tokens >= 180_000
             and 0 < self.threshold_tokens < 180_000
             and self.context_length >= 500_000
-            and (not self.awaiting_real_usage_after_compression or self.last_compression_rough_tokens > 0)
+            and not self.awaiting_real_usage_after_compression
         ):
             return False
         if self.awaiting_real_usage_after_compression:
@@ -3407,6 +3426,25 @@ class ContextCompressor(
             return False
         return not self._provider_omits_usage
 
+    def _post_compaction_hard_ceiling(self) -> int:
+        """Maximum prompt token ceiling allowed for the post-compaction step floor."""
+        if 0 < self.threshold_tokens < 180_000 and self.context_length >= 500_000:
+            return 180_000
+        if self.context_length > 0:
+            return max(self.threshold_tokens, int(self.context_length * 0.90))
+        return max(self.threshold_tokens, int(self.threshold_tokens * 1.15))
+
+    def _effective_compression_threshold(self) -> int:
+        """Effective trigger threshold accounting for the post-compaction minimum growth step."""
+        if self._last_post_compaction_prompt_tokens <= 0:
+            return self.threshold_tokens
+        min_step = max(2_000, int(self.threshold_tokens * 0.12))
+        step_floor = min(
+            self._last_post_compaction_prompt_tokens + min_step,
+            self._post_compaction_hard_ceiling(),
+        )
+        return max(self.threshold_tokens, step_floor)
+
     def should_compress(self, prompt_tokens: int | None = None) -> bool:
         """True when compression should run now (anti-thrash included; see :meth:`should_compress_info` for the reason)."""
         return self.should_compress_info(prompt_tokens)[0]
@@ -3416,7 +3454,7 @@ class ContextCompressor(
         ``reason`` is None unless compression is needed but blocked: ``"cooldown:<seconds>"`` or
         ``"ineffective"``. Callers should surface a warning when it is non-None."""
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
-        if tokens < self.threshold_tokens:
+        if tokens < self._effective_compression_threshold():
             return False, None
         if self._automatic_compression_blocked():
             return False, self._compression_block_reason() or "blocked"

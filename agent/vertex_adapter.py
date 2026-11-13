@@ -11,8 +11,10 @@ import hashlib
 import json
 import logging
 import os
+import re
+import threading
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 from agent.credential_source import VERTEX_OAUTH, tag_credential_source
 from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
@@ -52,9 +54,120 @@ def _ensure_google_auth() -> bool:
 logger = logging.getLogger(__name__)
 
 DEFAULT_REGION = "global"
+GLOBAL_VERTEX_REGION = "global"
+EUROPE_WEST2_VERTEX_REGION = "europe-west2"
+EUROPE_WEST2_ARGON_MAX_CONCURRENCY = 5
+EUROPE_WEST2_COOLDOWN_SECONDS = 15.0
+
+_EUROPE_WEST2_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
+_EUROPE_WEST2_STATE_LOCK = threading.Lock()
+_europe_west2_cooldown_until: float = 0.0
+_VERTEX_BASE_URL_RE = re.compile(
+    r"^https://(?:[a-z0-9-]+-)?aiplatform\.googleapis\.com/v1(?:beta1)?/projects/([^/]+)/locations/([^/]+)/endpoints/openapi/?$"
+)
 _CLOUD_PLATFORM_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
 _creds_cache: dict = {}
+
+
+def parse_vertex_base_url(base_url: Optional[str]) -> Optional[tuple[str, str]]:
+    """Extract ``(project_id, region)`` from a Vertex OpenAI-compatible base URL, or None."""
+    m = _VERTEX_BASE_URL_RE.match(str(base_url or "").strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def is_vertex_argon_model(model: Optional[str]) -> bool:
+    """Return True strictly for gemini-4-argon (never gemini-3.8-flash or gemini-3*)."""
+    cleaned = str(model or "").strip().lower()
+    if "/" in cleaned:
+        cleaned = cleaned.rsplit("/", 1)[-1]
+    if "@" in cleaned:
+        cleaned = cleaned.split("@", 1)[0]
+    return cleaned == "gemini-4-argon" or cleaned.startswith("gemini-4-argon-")
+
+
+def is_vertex_global_only_model(model: Optional[str]) -> bool:
+    """Models that return HTTP 404 on regional endpoints (e.g. europe-west2) and must use global."""
+    cleaned = str(model or "").strip().lower()
+    if "/" in cleaned:
+        cleaned = cleaned.rsplit("/", 1)[-1]
+    if "@" in cleaned:
+        cleaned = cleaned.split("@", 1)[0]
+    return (
+        cleaned.startswith("gemini-3.8-flash")
+        or cleaned.startswith("gemini-3-")
+        or cleaned.startswith("gemini-3.")
+    )
+
+
+def record_vertex_regional_429(cooldown_seconds: float = EUROPE_WEST2_COOLDOWN_SECONDS) -> float:
+    """Trip the europe-west2 429 cooldown so subsequent calls route to locations/global."""
+    global _europe_west2_cooldown_until
+    now = time.monotonic()
+    with _EUROPE_WEST2_STATE_LOCK:
+        target = now + max(0.0, float(cooldown_seconds))
+        _europe_west2_cooldown_until = max(_europe_west2_cooldown_until, target)
+        return _europe_west2_cooldown_until
+
+
+def vertex_regional_cooldown_remaining() -> float:
+    """Seconds remaining on the europe-west2 429 cooldown (0.0 when ready)."""
+    with _EUROPE_WEST2_STATE_LOCK:
+        return max(0.0, _europe_west2_cooldown_until - time.monotonic())
+
+
+def reset_vertex_hybrid_router_state() -> None:
+    """Reset cooldown and semaphore state (used by unit tests)."""
+    global _europe_west2_cooldown_until, _EUROPE_WEST2_ARGON_SEMAPHORE
+    with _EUROPE_WEST2_STATE_LOCK:
+        _europe_west2_cooldown_until = 0.0
+        _EUROPE_WEST2_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
+
+
+def acquire_vertex_hybrid_region(
+    model: Optional[str],
+    *,
+    configured_region: Optional[str] = None,
+    interactive: bool = True,
+) -> tuple[str, bool]:
+    """Select the Vertex region for a single request and optionally acquire a regional slot.
+
+    Returns ``(region, slot_acquired)``:
+    - ``gemini-3.8-flash`` / ``gemini-3*`` -> always ``("global", False)`` (HTTP 404 on europe-west2).
+    - ``gemini-4-argon`` when ``interactive=True`` and configured region is ``global`` or
+      ``europe-west2`` -> tries non-blocking checkout of ``_EUROPE_WEST2_ARGON_SEMAPHORE`` (max 5)
+      when not in a 429 cooldown window; returns ``("europe-west2", True)`` on success, or falls
+      back to ``("global", False)`` on slot saturation (6th+ concurrent call) or active cooldown.
+    - All other models/regions -> ``(configured_region or "global", False)``.
+    """
+    reg = (configured_region or DEFAULT_REGION).strip() or DEFAULT_REGION
+    if is_vertex_global_only_model(model):
+        return (GLOBAL_VERTEX_REGION, False)
+    if (
+        interactive
+        and is_vertex_argon_model(model)
+        and reg in (GLOBAL_VERTEX_REGION, EUROPE_WEST2_VERTEX_REGION)
+    ):
+        if vertex_regional_cooldown_remaining() <= 0.0:
+            if _EUROPE_WEST2_ARGON_SEMAPHORE.acquire(blocking=False):
+                return (EUROPE_WEST2_VERTEX_REGION, True)
+        return (GLOBAL_VERTEX_REGION, False)
+    return (reg, False)
+
+
+def release_vertex_hybrid_slot(client: Any) -> bool:
+    """Idempotently release a europe-west2 concurrency slot held on *client*."""
+    if client is None or not getattr(client, "_vertex_regional_slot_held", False):
+        return False
+    try:
+        client._vertex_regional_slot_held = False
+    except Exception:
+        pass
+    try:
+        _EUROPE_WEST2_ARGON_SEMAPHORE.release()
+        return True
+    except ValueError:
+        return False
 
 
 def _vertex_config() -> dict:

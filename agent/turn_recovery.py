@@ -1936,6 +1936,14 @@ def route_classified_error(
         # CF-82: when primary/current provider is Vertex AI, Dynamic Shared Quota (DSQ) 429s
         # are transient per-second capacity bursts; retry in-place with backoff before
         # escalating to the emergency OpenRouter fallback on the final retry attempt.
+        # P0-1 Hybrid Router: also trip the europe-west2 15s cooldown on any Vertex 429 so
+        # the very next retry routes to locations/global instead of hitting regional 429 again.
+        if str(getattr(agent, "provider", "") or "").lower() == "vertex" and is_rate_limited:
+            try:
+                from agent.vertex_adapter import record_vertex_regional_429
+                record_vertex_regional_429()
+            except Exception:
+                pass
         _vertex_dsq_backoff_may_recover = (
             str(getattr(agent, "provider", "") or "").lower() == "vertex"
             and is_rate_limited

@@ -1860,6 +1860,18 @@ def run_conversation(
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
+    # P1-1: If the incoming user_message is a slash-skill / bundle / auto-load scaffold (which in
+    # Desktop/TUI may have been expanded before the session_id was assigned on Turn 1), seed the
+    # active task's skill_view dedup tracker so a redundant skill_view(name=...) call in this turn
+    # immediately returns the unchanged stub instead of re-injecting the full SKILL.md a second time.
+    if isinstance(user_message, str) and user_message.startswith("[IMPORTANT: The "):
+        eff_tid = task_id or getattr(agent, "session_id", None)
+        if eff_tid:
+            try:
+                from tools.skills_tool_dedup import seed_skill_view_dedup_from_messages
+                seed_skill_view_dedup_from_messages(str(eff_tid), [{"role": "user", "content": user_message}])
+            except Exception:
+                pass
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):

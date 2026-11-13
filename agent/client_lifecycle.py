@@ -449,26 +449,78 @@ class ClientLifecycleMixin:
         # No SDK retry loop: the outer loop owns retries/rotation/fallback, and SDK retries stretch a hung
         # request ~3x past our stale detector.
         request_kwargs["max_retries"] = 0
-        if self._api_kwargs_have_image_parts(api_kwargs or {}):
-            # Image requests get the route's image client headers on a request-scoped client (cache-keyed apart).
-            from agent.provider_route_hooks import route_answer
-            image_headers = route_answer("client_headers", provider=self.provider or "", scope=self,
-                                         base_url=str(request_kwargs.get("base_url", "")),
-                                         api_key=str(request_kwargs.get("api_key", "") or ""), has_images=True)
-            if image_headers:
-                request_kwargs["default_headers"] = {**(request_kwargs.get("default_headers") or {}), **image_headers}
-        cached, stale = self._checkout_request_slot(_OPENAI_SLOT, request_kwargs)
-        if cached is not None:
-            return cached
-        if stale is not None:
-            self._close_openai_client(stale, reason=f"reuse_evict:{reason}", shared=False)
-        client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
-        # Snapshot nested dicts (default_headers) so an aliased inner object can't mutate the cache key.
-        snapshot = {k: dict(v) if isinstance(v, dict) else v for k, v in request_kwargs.items()}
-        self._store_request_slot(_OPENAI_SLOT, client, snapshot)
-        return client
+        slot_held = False
+        routed_base_url = None
+        if getattr(self, "provider", None) == "vertex":
+            from agent.vertex_adapter import (
+                acquire_vertex_hybrid_region,
+                build_vertex_base_url,
+                is_vertex_global_only_model,
+                parse_vertex_base_url,
+            )
+            raw_base_url = str(request_kwargs.get("base_url") or getattr(self, "base_url", "") or "")
+            req_model = (api_kwargs or {}).get("model") or getattr(self, "model", None)
+            is_interactive = (
+                getattr(self, "_write_origin", None) != "background_review"
+                and getattr(self, "platform", None) != "cron"
+            )
+            parsed_vertex = parse_vertex_base_url(raw_base_url)
+            if parsed_vertex is not None:
+                project_id, configured_region = parsed_vertex
+                target_region, slot_held = acquire_vertex_hybrid_region(
+                    req_model,
+                    configured_region=configured_region,
+                    interactive=is_interactive,
+                )
+                routed_base_url = build_vertex_base_url(project_id, target_region)
+                request_kwargs["base_url"] = routed_base_url
+            elif is_vertex_global_only_model(req_model) and "europe-west2-aiplatform.googleapis.com" in raw_base_url:
+                routed_base_url = (
+                    raw_base_url.replace("europe-west2-aiplatform.googleapis.com", "aiplatform.googleapis.com")
+                    .replace("/locations/europe-west2/", "/locations/global/")
+                )
+                request_kwargs["base_url"] = routed_base_url
+        try:
+            if self._api_kwargs_have_image_parts(api_kwargs or {}):
+                # Image requests get the route's image client headers on a request-scoped client (cache-keyed apart).
+                from agent.provider_route_hooks import route_answer
+                image_headers = route_answer("client_headers", provider=getattr(self, "provider", "") or "", scope=self,
+                                             base_url=str(request_kwargs.get("base_url", "")),
+                                             api_key=str(request_kwargs.get("api_key", "") or ""), has_images=True)
+                if image_headers:
+                    request_kwargs["default_headers"] = {**(request_kwargs.get("default_headers") or {}), **image_headers}
+            cached, stale = self._checkout_request_slot(_OPENAI_SLOT, request_kwargs)
+            if cached is not None:
+                if slot_held or routed_base_url is not None:
+                    with suppress(Exception):
+                        cached._vertex_regional_slot_held = bool(slot_held)
+                        if routed_base_url is not None:
+                            cached._vertex_routed_base_url = routed_base_url
+                return cached
+            if stale is not None:
+                self._close_openai_client(stale, reason=f"reuse_evict:{reason}", shared=False)
+            client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
+            # Snapshot nested dicts (default_headers) so an aliased inner object can't mutate the cache key.
+            snapshot = {k: dict(v) if isinstance(v, dict) else v for k, v in request_kwargs.items()}
+            self._store_request_slot(_OPENAI_SLOT, client, snapshot)
+            if slot_held or routed_base_url is not None:
+                with suppress(Exception):
+                    client._vertex_regional_slot_held = bool(slot_held)
+                    if routed_base_url is not None:
+                        client._vertex_routed_base_url = routed_base_url
+            return client
+        except BaseException:
+            if slot_held:
+                from agent.vertex_adapter import _EUROPE_WEST2_ARGON_SEMAPHORE
+                with suppress(ValueError):
+                    _EUROPE_WEST2_ARGON_SEMAPHORE.release()
+            raise
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        if client is not None and getattr(client, "_vertex_regional_slot_held", False):
+            with suppress(Exception):
+                from agent.vertex_adapter import release_vertex_hybrid_slot
+                release_vertex_hybrid_slot(client)
         if not self._release_request_slot(_OPENAI_SLOT, client, reason):
             self._close_openai_client(client, reason=reason, shared=False)
 
@@ -477,6 +529,10 @@ class ClientLifecycleMixin:
         client, in_use = self._take_request_slot(_OPENAI_SLOT)
         if client is None:
             return
+        if getattr(client, "_vertex_regional_slot_held", False):
+            with suppress(Exception):
+                from agent.vertex_adapter import release_vertex_hybrid_slot
+                release_vertex_hybrid_slot(client)
         if in_use:
             # Checked out by a worker: close() here would release FDs from a stranger thread. Abort the
             # sockets; the worker's own finally does the real close.
@@ -485,6 +541,10 @@ class ClientLifecycleMixin:
             self._close_openai_client(client, reason=reason, shared=False)
 
     def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
+        if client is not None and getattr(client, "_vertex_regional_slot_held", False):
+            with suppress(Exception):
+                from agent.vertex_adapter import release_vertex_hybrid_slot
+                release_vertex_hybrid_slot(client)
         self._abort_request_slot_client(_OPENAI_SLOT, client, reason=reason)
 
     def _request_anthropic_client_key(self) -> tuple:

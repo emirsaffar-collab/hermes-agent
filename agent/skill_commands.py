@@ -269,11 +269,21 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         from tools.skills_tool import _skills_dir, skill_view
         from agent.skill_utils import normalize_skill_lookup_name
         normalized = normalize_skill_lookup_name(raw_identifier)
-        loaded_skill = json.loads(skill_view(normalized, task_id=task_id, preprocess=False))
+        raw_json = skill_view(normalized, task_id=task_id, preprocess=False)
+        loaded_skill = json.loads(raw_json)
     except Exception:
         return None
     if not loaded_skill.get("success"):
         return None
+    if task_id:
+        try:
+            from tools.skills_tool_dedup import dedup_skill_view
+            rendered_json = skill_view(normalized, task_id=task_id, preprocess=True)
+            rendered_payload = json.loads(rendered_json)
+            if isinstance(rendered_payload, dict) and rendered_payload.get("success"):
+                dedup_skill_view(task_id, normalized, None, rendered_payload, rendered_json)
+        except Exception:
+            pass
     skill_path = str(loaded_skill.get("path") or "")
     skill_dir = None
     # Prefer the absolute skill_dir from skill_view() (correct for external

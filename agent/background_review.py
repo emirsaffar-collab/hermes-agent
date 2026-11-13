@@ -1022,6 +1022,12 @@ def build_cache_parity_fork(
     # same-model path), so its turn-start/turn-exit log lines are otherwise
     # indistinguishable from live turns (#118693).
     review_agent._turn_origin = write_origin
+    if write_origin == "background_review":
+        # P1-2: Disable explicit prompt cache writes/controls in the short-lived review fork
+        # (avg 1.8 iterations; 0% intra-fork reuse across 4,146 turns; eliminates cache_write
+        # token surcharge while keeping inherited _cached_system_prompt for implicit prefix warmth).
+        review_agent._cache_disabled = True
+        review_agent._use_prompt_caching = False
     review_agent._memory_store = agent._memory_store
     review_agent._memory_enabled = agent._memory_enabled
     review_agent._user_profile_enabled = agent._user_profile_enabled

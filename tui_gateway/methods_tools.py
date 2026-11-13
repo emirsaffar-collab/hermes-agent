@@ -596,9 +596,10 @@ def _dispatch_bundle(rid, params, session, name, arg):
     if bundle_key is None:
         return None
     bundles = _tools_mod("agent.skill_bundles")
+    eff_task_id = (session.get("session_key", "") if session else "") or _str_arg(params, "session_id") or ""
     try:
         bundle_result = bundles.build_bundle_invocation_message(
-            bundle_key, arg, task_id=session.get("session_key", "") if session else "",
+            bundle_key, arg, task_id=eff_task_id,
             platform=_resolve_session_platform())
     except Exception as exc:
         return _err(rid, 4018, f"bundle dispatch failed: {exc}")
@@ -617,6 +618,7 @@ def _dispatch_skill(rid, params, session, name, arg):
         sc = _tools_mod("agent.skill_commands")
         cmds, key = sc.get_interactive_skill_commands(), f"/{name}".lower()
         if key in cmds:
+            eff_task_id = (session.get("session_key", "") if session else "") or _str_arg(params, "session_id") or ""
             # Stacked leading /skill tokens (up to 5, cli.py + gateway parity, #74705): the
             # first token matched above; consume any further leading skill tokens from `arg`,
             # then build one invocation that loads every skill over the remaining instruction.
@@ -624,7 +626,7 @@ def _dispatch_skill(rid, params, session, name, arg):
             if extra_keys:
                 stacked = sc.build_stacked_skill_invocation_message(
                     [key, *extra_keys], user_instruction,
-                    task_id=session.get("session_key", "") if session else "")
+                    task_id=eff_task_id)
                 if stacked:
                     msg, loaded_names, missing = stacked
                     notice = f"⚡ Loading {len(loaded_names)} stacked skills: {', '.join(loaded_names)}"
@@ -635,7 +637,7 @@ def _dispatch_skill(rid, params, session, name, arg):
                         "notice": notice, "display": _skill_scaffold_projection(msg)})
             msg = sc.build_skill_invocation_message(
                 key, user_instruction,
-                task_id=session.get("session_key", "") if session else "")
+                task_id=eff_task_id)
             if msg:  # UIs render `display`, never `message`.
                 return _ok(rid, {
                     "type": "skill", "message": msg, "name": cmds[key].get("name", name),

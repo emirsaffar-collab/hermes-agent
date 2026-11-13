@@ -4696,18 +4696,24 @@ def _build_bedrock_client(provider: str, model: Optional[str], *, raw_codex: boo
 def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[Any], Optional[str]]:
     """Google Vertex AI: Gemini via the OpenAI-compatible endpoint with an OAuth2 bearer (standard OpenAI client)."""
     try:
-        from agent.vertex_adapter import get_vertex_config, has_vertex_credentials, vertex_access_token
+        from agent.vertex_adapter import (
+            get_vertex_config,
+            has_vertex_credentials,
+            is_vertex_global_only_model,
+            vertex_access_token,
+        )
     except ImportError:
         logger.warning("resolve_provider_client: vertex requested but google-auth not installed")
         return None, None
     if not has_vertex_credentials():
         logger.debug("resolve_provider_client: vertex requested but no GCP credentials found")
         return None, None
-    token, base_url = get_vertex_config()
+    final_model = _normalize_resolved_model(model or "google/gemini-3-flash-preview", provider)
+    region_override = "global" if is_vertex_global_only_model(final_model) else None
+    token, base_url = get_vertex_config(region=region_override)
     if not token or not base_url:
         logger.warning("resolve_provider_client: vertex requested but could not mint token / resolve project")
         return None, None
-    final_model = _normalize_resolved_model(model or "google/gemini-3-flash-preview", provider)
     try:
         # Aliased import: a bare `from openai import OpenAI` would shadow the module-level lazy proxy.
         from openai import OpenAI as _VertexOpenAI
