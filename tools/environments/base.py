@@ -824,11 +824,24 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         apply the macOS ``open`` raise-ladder (no-op off Darwin) so opened files come to the front."""
         from tools.terminal_tool_macos_open import _transform_macos_open_command
         from tools.terminal_tool_sudo import _transform_sudo_command
-        return _transform_sudo_command(
-            _transform_macos_open_command(command),
-            sudo_nopasswd_check=self._sudo_nopasswd_works,
-            askpass_supported=self._sudo_askpass_supported,
-        )
+        rewritten: str = _transform_macos_open_command(command) or command
+        try:
+            cmd_out, stdin_out = _transform_sudo_command(
+                rewritten,
+                sudo_nopasswd_check=self._sudo_nopasswd_works,
+                askpass_supported=self._sudo_askpass_supported,
+            )
+            return cmd_out or rewritten, stdin_out
+        except TypeError:
+            import importlib
+            import tools.terminal_tool_sudo as _tts_mod
+            importlib.reload(_tts_mod)
+            cmd_out, stdin_out = _tts_mod._transform_sudo_command(
+                rewritten,
+                sudo_nopasswd_check=self._sudo_nopasswd_works,
+                askpass_supported=self._sudo_askpass_supported,
+            )
+            return cmd_out or rewritten, stdin_out
 
     _sudo_askpass_supported = sudo_askpass_supported_once
     _SUDO_PROBE_TIMEOUT_S = 3
