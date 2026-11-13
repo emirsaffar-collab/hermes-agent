@@ -1306,12 +1306,14 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         """The display identity both display reads give *row*, scanning rows in ``id`` order.
 
         A compaction carrier keeps its message's ``message_uid`` but not its content (the prior tail
-        wrapped around the summary), so it is a copy of the first row with that uid: shown once."""
+        wrapped around the summary), so it is a copy of the first row with that uid: shown once.
+        Likewise, a user prompt carried across compaction may have a skill-invocation prefix stripped
+        or an in-flight restate banner prepended while keeping the same ``message_uid``."""
         uid = row["message_uid"]
         if not uid:
             return key
-        if row["_compressed_summary"]:
-            return first_by_uid.get(uid, key)
+        if row["_compressed_summary"] or row["role"] == "user":
+            return first_by_uid.setdefault(uid, key)
         first_by_uid.setdefault(uid, key)
         return key
 
@@ -1373,7 +1375,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 identities[key] = copies
             first_id[key] = min(first_id.get(key, row["id"]), row["id"])
             slot = row["display_order"] if has_display_order and row["display_order"] is not None else row["id"]
-            pos = max(int(row["id"]), int(slot))
+            pos = int(slot)
             order_id[key] = pos if key not in order_id else min(order_id[key], pos)
         # Order by the logical message's FIRST row, not the chosen representative's: a protected-tail
         # copy in a newer generation has a higher id than messages emitted after the original. Demoted
@@ -1397,14 +1399,26 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         path's ``ORDER BY candidate.active DESC, candidate.id DESC``. Writes only on drift."""
         first_id: dict[bytes, int] = {}
         uid_identity: dict[str, bytes] = {}  # message_uid -> its first copy's identity (the carrier rule)
+        rewound_uid_order: dict[str, int] = {
+            str(r[0]): int(r[1])
+            for r in conn.execute(
+                "SELECT message_uid, MIN(COALESCE(display_order, id)) "
+                "FROM messages INDEXED BY idx_messages_session_id "
+                "WHERE session_id = ? AND active = 0 AND compacted = 0 "
+                "AND message_uid IS NOT NULL AND message_uid != '' "
+                "GROUP BY message_uid",
+                (session_id,),
+            ).fetchall()
+        }
         staged: list[tuple[int, bytes, Optional[int], Optional[bytes]]] = []
         orders: dict[int, int] = {}
         asst_by_tcid: dict[str, list[tuple[int, int]]] = {}
         tool_groups: dict[Any, list[tuple[int, Optional[str]]]] = {}
+        last_compacted_ua_id = 0
         last_id = 0
         while True:
             rows = conn.execute(
-                "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
+                "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, compacted, "
                 "display_kind, display_metadata, display_order, display_identity, message_uid, _compressed_summary "
                 "FROM messages INDEXED BY idx_messages_session_id "
                 "WHERE session_id = ? AND id > ? AND (active = 1 OR compacted = 1) "
@@ -1416,14 +1430,31 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 identity = self._fold_summary_carrier(
                     row, self._display_identity(self._display_dedupe_key(row)), uid_identity)
                 # A row already holding this identity keeps its stored slot (an in-place prune changes a
-                # row's content, not its place); otherwise the slot is the identity's first row.
-                kept = (row["display_order"]
-                        if row["display_identity"] == identity
-                        and (row["display_order"] is None or row["display_order"] <= last_id)
-                        else None)
+                # row's content, not its place); otherwise the slot is the identity's first row. When a
+                # non-contiguous prefix row was rewound (active=0, compacted=0) and carried across
+                # compacted user/assistant turns, restore its original pre-compaction slot so it does
+                # not jump past the compacted turns that followed it.
+                r_uid = row["message_uid"] or ""
+                orig_order = rewound_uid_order.get(r_uid) if r_uid else None
+                if orig_order is not None and orig_order < last_compacted_ua_id:
+                    kept = orig_order
+                else:
+                    kept = (row["display_order"]
+                            if row["display_identity"] == identity
+                            and (row["display_order"] is None or row["display_order"] <= last_id)
+                            else None)
                 order = first_id.setdefault(identity, last_id if kept is None else kept)
                 orders[last_id] = order
                 staged.append((last_id, identity, row["display_order"], row["display_identity"]))
+                if (
+                    row["compacted"]
+                    and not row["_compressed_summary"]
+                    and row["role"] in ("user", "assistant")
+                    and not str(self._decode_content(row["content"]) or "").startswith(
+                        ("[CONTEXT COMPACTION", "[PRIOR CONTEXT")
+                    )
+                ):
+                    last_compacted_ua_id = last_id
                 if row["role"] == "assistant" and row["tool_calls"]:
                     tcs = _parse_tool_calls(row["tool_calls"])
                     if isinstance(tcs, list):
