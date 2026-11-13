@@ -97,22 +97,32 @@ def state_db_write_lock_holders(db_path) -> list[str]:
         from hermes_state_holders import describe_holder_pid, foreign_state_db_holders
 
         candidates = foreign_state_db_holders(db_path)
-        lines = []
-        for pid, target in candidates[:6]:
+        unproven: list[str] = []
+        by_pid: dict[int, list[str]] = {}
+        for pid, target in candidates:
             if pid <= 0:
                 # pid=-1 rows are foreign_state_db_holders' *unproven* sentinels (scan
                 # failure / scan unavailable) — the target is a reason string, not a
                 # path. Never render those as "has X open": say unproven, say why.
-                lines.append(f"unproven: {target} (scan failure, not a named holder)")
+                entry = f"unproven: {target} (scan failure, not a named holder)"
+                if entry not in unproven:
+                    unproven.append(entry)
                 continue
+            name = Path(os.path.realpath(target)).name
+            names = by_pid.setdefault(pid, [])
+            if name not in names:
+                names.append(name)
+        candidate_lines = list(unproven)
+        for pid, names in by_pid.items():
             who = describe_holder_pid(pid)
-            lines.append(
-                f"{who} has {Path(os.path.realpath(target)).name} open "
+            candidate_lines.append(
+                f"{who} has {', '.join(names)} open "
                 f"(open-file candidate, not lock-proof)"
             )
-        if len(candidates) > 6:
-            lines.append(f"... and {len(candidates) - 6} more open-file candidates")
-        if not candidates:
+        lines = candidate_lines[:6]
+        if len(candidate_lines) > 6:
+            lines.append(f"... and {len(candidate_lines) - 6} more open-file candidates")
+        if not candidate_lines:
             lines.append(
                 "no foreign process holds the db open; the holder is likely THIS "
                 "process (see the 'held the lock' holder warning for the operation)"
@@ -153,5 +163,8 @@ def log_write_lock_holders(db_path, patience_s: float) -> None:
     else:
         detail = "no write-class lock held at the deadline (the holder released just before it)"
     logger.warning(
-        "state.db write lock unavailable for %.0fs (%s): %s", patience_s, Path(db_path).name, detail
+        "state.db write lock unavailable for %ss (%s): %s",
+        f"{patience_s:g}",
+        Path(db_path).name,
+        detail,
     )

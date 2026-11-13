@@ -1223,11 +1223,19 @@ def _synthetic_user_row(content: str) -> bool:
     return content.lstrip().startswith(_SYNTHETIC_USER_ROW_PREFIXES)
 
 
+_ATTACHED_CONTEXT_FOOTER_RE = re.compile(
+    r"\n*--- (?:Context Warnings|Attached Context) ---\n.*",
+    re.DOTALL,
+)
+
+
 def _typed_user_text(content: str) -> str:
     """A ``/skill``, bundle or auto-load turn as the user typed it (``/skill do X``); other text unchanged.
-    Its inline skill body is not the user's words — it is carried by a ``[SKILL_PRUNED: ...]`` marker instead."""
+    Its inline skill body and any expanded ``@file:``/``@folder:`` attachment blocks are not the user's words —
+    skills are carried by ``[SKILL_PRUNED: ...]`` markers and file paths remain in the ``@file:`` token."""
     from agent.skill_commands import describe_skill_invocation, skills_loaded_by_scaffold
-    return (describe_skill_invocation(content, separator=" ") or "") if skills_loaded_by_scaffold(content) else content
+    cleaned = _ATTACHED_CONTEXT_FOOTER_RE.sub("", content) if isinstance(content, str) else content
+    return (describe_skill_invocation(cleaned, separator=" ") or "") if skills_loaded_by_scaffold(cleaned) else cleaned
 
 
 def _build_verbatim_user_section(turns: list[dict[str, Any]]) -> str:
@@ -4390,6 +4398,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # Restore any [SKILL_PRUNED] marker the summarizer paraphrased away.
             # See #32106.
             summary = _strip_deterministic_lean_sections(summary)
+            summary = _compact_previous_summary_lists(summary)
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)

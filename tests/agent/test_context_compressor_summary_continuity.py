@@ -636,4 +636,52 @@ def test_iterative_prompt_caps_snowballing_lists_and_strips_deterministic_sectio
     assert "agent/context_compressor.py" in out
 
 
+def test_typed_user_text_and_restated_request_strip_attached_context_and_cap_fresh_summary():
+    """Expanded ``--- Attached Context ---`` and ``--- Context Warnings ---`` blocks from
+    ``@file:``/``@folder:`` references must not be re-appended verbatim on mid-turn compaction,
+    and ``_generate_summary`` must immediately cap oversized action/session-log lists on output."""
+    from agent.context_compressor import (
+        _LEAN_SESSION_LOG_HEADING,
+        _restated_request_text,
+        _typed_user_text,
+    )
+
+    expanded_at_file = (
+        "@file:/Users/emirsaffar/.hermes/attachments/Pasted content (40.0 KB)\n\n"
+        "--- Attached Context ---\n"
+        '<file path="/Users/emirsaffar/.hermes/attachments/Pasted content (40.0 KB)" lines="1-200">\n'
+        + ("2026-11-12 18:27:59 WARNING line\n" * 1200)
+        + "</file>"
+    )
+    assert _typed_user_text(expanded_at_file) == (
+        "@file:/Users/emirsaffar/.hermes/attachments/Pasted content (40.0 KB)"
+    )
+    assert _restated_request_text(expanded_at_file) == (
+        "@file:/Users/emirsaffar/.hermes/attachments/Pasted content (40.0 KB)"
+    )
+
+    compressor = _compressor(protect_first_n=1)
+    compressor.tail_mode = "lean"
+    oversized_fresh_llm = (
+        "## Goal\nInvestigate log window.\n\n"
+        "## Completed Actions\n"
+        + "\n".join(f"{i}. FRESH_ACTION_{i:03d} done" for i in range(1, 56))
+        + f"\n\n{_LEAN_SESSION_LOG_HEADING}\n"
+        + "\n".join(f"- 2026-11-12: FRESH_LOG_{i:03d}" for i in range(1, 66))
+    )
+    turns = [
+        {"role": "user", "content": expanded_at_file},
+        {"role": "assistant", "content": "Inspected log window."},
+    ]
+    with patch("agent.context_compressor.call_llm", return_value=_response(oversized_fresh_llm)):
+        out = compressor._generate_summary(turns)
+
+    assert out is not None
+    assert "1-15. [Consolidated 15 earlier completed actions" in out
+    assert "16. FRESH_ACTION_016 done" in out
+    assert "- [Consolidated 15 intermediate session-log entries" in out
+    assert "2026-11-12 18:27:59 WARNING line" not in out
+
+
+
 

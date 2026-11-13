@@ -108,6 +108,36 @@ class TestNonLinuxAttribution:
         assert "has" not in joined, f"a scan failure must never read as a named holder: {lines!r}"
         assert "candidate" not in joined.lower()
 
+    def test_duplicate_pid_sidecar_descriptors_collapse_per_pid_and_subsecond_patience_logged(
+        self, quiet_db, monkeypatch, caplog
+    ):
+        """A single process opening state.db, state.db-wal, and state.db-shm across multiple
+        connections must collapse to one candidate line per PID rather than filling all 6 slots,
+        and sub-second patience (0.5s) must log as '0.5s' rather than rounding to '0s'."""
+        from hermes_state_lockowners import log_write_lock_holders
+
+        wal_path = str(quiet_db) + "-wal"
+        shm_path = str(quiet_db) + "-shm"
+        monkeypatch.setattr(
+            hermes_state_holders,
+            "psutil",
+            _FakePsutil(
+                {
+                    4143: [str(quiet_db), wal_path, shm_path, str(quiet_db), str(quiet_db), wal_path] * 5,
+                    21820: [str(quiet_db)],
+                }
+            ),
+        )
+        lines = state_db_write_lock_holders(quiet_db)
+        assert len(lines) == 2, lines
+        assert "4143" in lines[0] and "state.db, state.db-wal, state.db-shm" in lines[0]
+        assert "21820" in lines[1]
+
+        with caplog.at_level("WARNING"):
+            log_write_lock_holders(quiet_db, 0.5)
+        assert "state.db write lock unavailable for 0.5s (state.db):" in caplog.text
+        assert "unavailable for 0s" not in caplog.text
+
 
 def test_linux_branch_semantics_unchanged(monkeypatch, tmp_path):
     """The Linux path keeps /proc/locks as its authority: on Linux the open-file
