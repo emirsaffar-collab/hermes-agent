@@ -693,7 +693,11 @@ def continue_codex_incomplete(
             logger.warning("%sCodex reasoning-only stall after %d attempts — switched to fallback", agent.log_prefix, streak)
             # The trigger may have consumed the turn budget; without a grace call the loop
             # exits before the fallback is ever asked.
-            if api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0:
+            if (
+                min(api_call_count, getattr(agent.iteration_budget, "used", api_call_count))
+                >= max(agent.max_iterations, getattr(agent.iteration_budget, "max_total", 0) or 0)
+                or agent.iteration_budget.remaining <= 0
+            ):
                 agent._budget_grace_call = True
             agent._codex_incomplete_retries = 0
             agent._codex_reasoning_only_streak = 0

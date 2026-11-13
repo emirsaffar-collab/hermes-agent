@@ -47,19 +47,20 @@ def _strip_reasoning_tags(text: str) -> str:
     """
     from cli import _REASONING_TAGS, _TOOL_CALL_TAGS
     cleaned = text
+    _nc_code = r"(?:```[\s\S]*?```|`[^`\n]+`)"
     for tag in _REASONING_TAGS:
         cleaned = re.sub(
-            rf"{CODE_FENCE_OR_SPAN}|<{tag}>.*?</{tag}>\s*",
+            rf"{CODE_FENCE_OR_SPAN}|(?<!`)<{tag}>(?!`)(?:{_nc_code}|[\s\S])*?(?<!`)</{tag}>(?!`)\s*",
             lambda m: m.group(1) or "",
             cleaned, flags=re.DOTALL | re.IGNORECASE,
         )
         cleaned = re.sub(
-            rf"{CODE_FENCE_OR_SPAN}|<{tag}>.*$",
+            rf"{CODE_FENCE_OR_SPAN}|(?<!`)<{tag}>(?!`).*$",
              lambda m: m.group(1) or "",
             cleaned, flags=re.DOTALL | re.IGNORECASE,
         )
         cleaned = re.sub(
-            rf"{CODE_FENCE_OR_SPAN}|</{tag}>\s*",
+            rf"{CODE_FENCE_OR_SPAN}|(?<!`)</{tag}>(?!`)\s*",
             lambda m: m.group(1) or "",
             cleaned, flags=re.IGNORECASE,
         )

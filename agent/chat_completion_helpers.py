@@ -2297,6 +2297,20 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
     # tool_choice="none" here: SGLang renders the prompt with tools=None in that mode and the KV
     # prefix diverges. (cache_control breakpoint decoration is not re-applied on this path.)
     summary_kwargs = agent._build_api_kwargs(api_messages)
+    # On non-streaming summary calls, keep the full Gemini/Vertex thinking budget/level
+    # but omit raw thought text from message.content (Vertex stream=False embeds thoughts
+    # directly into choices[0].message.content when include_thoughts is True).
+    _eb = summary_kwargs.get("extra_body")
+    if isinstance(_eb, dict):
+        _inner_eb = _eb.get("extra_body") if isinstance(_eb.get("extra_body"), dict) else _eb
+        _g = _inner_eb.get("google") if isinstance(_inner_eb, dict) else None
+        _tc = _g.get("thinking_config") if isinstance(_g, dict) else None
+        if isinstance(_tc, dict) and _tc.get("include_thoughts") is True:
+            import copy
+            summary_kwargs["extra_body"] = copy.deepcopy(_eb)
+            _eb_copy = summary_kwargs["extra_body"]
+            _inner_copy = _eb_copy.get("extra_body") if isinstance(_eb_copy.get("extra_body"), dict) else _eb_copy
+            _inner_copy["google"]["thinking_config"]["include_thoughts"] = False
     # The summary now carries ``tools``; on cache-planned routes the main loop scrubbed a deep
     # copy, so ``agent.tools`` may still hold bytes the provider 400s on.
     sanitize_outbound_kwargs(agent, summary_kwargs)
@@ -2346,8 +2360,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             text = attempt(retry_count)
             if not text:
                 continue
-            if "<think>" in text:
-                text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
+            if "<think>" in text or "</think>" in text:
+                from agent.agent_runtime_helpers import strip_think_blocks
+                text = strip_think_blocks(agent, text).strip()
             if text:
                 summary_call_outcome = "success"
                 append_message(messages, {"role": "assistant", "content": text})

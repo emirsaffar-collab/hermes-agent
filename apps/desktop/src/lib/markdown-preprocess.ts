@@ -17,7 +17,7 @@ const CODE_FENCE_OR_SPAN_SOURCE = '(?:```[\\s\\S]*?```|`[^`\\n]+`)'
 // Left-to-right alternation with CODE_FENCE_OR_SPAN_SOURCE preserves backticked
 // tag mentions in visible prose while still stripping code fences inside thoughts.
 const REASONING_BLOCK_RE = new RegExp(
-  `(${CODE_FENCE_OR_SPAN_SOURCE})|(?:<(${REASONING_TAGS})>[\\s\\S]*?<\\/\\2>\\s*)+`,
+  `(${CODE_FENCE_OR_SPAN_SOURCE})|(?:(?<!\`)<(${REASONING_TAGS})>(?!\`)(?:${CODE_FENCE_OR_SPAN_SOURCE}|[\\s\\S])*?(?<!\`)<\\/\\2>(?!\`)\\s*)+`,
   'gi'
 )
 // An open tag that starts its own block with no close tag yet. The block-boundary

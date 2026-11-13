@@ -40,5 +40,10 @@ describe('reasoning blocks in streamed markdown', () => {
 
     const thoughtWithCode = `${tOpen}Let me test:\n\`\`\`ts\nconst x = 1\n\`\`\`\n${tClose}Visible answer.`
     expect(preprocessMarkdown(thoughtWithCode)).toBe('Visible answer.')
+
+    const thoughtMentioningCloseTag = `${tOpen}Checking \`${tClose}\` and fenced:\n\`\`\`xml\n${tClose}\n\`\`\`\n**Synthesizing Accomplishments**\nInternal thought.\n${tClose}\n\n### Visible\nProtected \`${tOpen}x${tClose}\` in prose.`
+    expect(preprocessMarkdown(thoughtMentioningCloseTag)).toBe(
+      `### Visible\nProtected \`${tOpen}x${tClose}\` in prose.`
+    )
   })
 })

@@ -1764,7 +1764,12 @@ def _run_conversation_turn(
     if _prelude_action == "return":
         return _prelude_result
     while _prelude_action != "break" and (
-        (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call
+        (
+            min(s.api_call_count, getattr(agent.iteration_budget, "used", s.api_call_count))
+            < max(agent.max_iterations, getattr(agent.iteration_budget, "max_total", 0) or 0)
+            and agent.iteration_budget.remaining > 0
+        )
+        or agent._budget_grace_call
     ):
         if _run_phase(begin_iteration, agent, s).action == "break":
             break

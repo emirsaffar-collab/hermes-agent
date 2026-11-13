@@ -24,9 +24,10 @@ logger = logging.getLogger("agent.conversation_loop")
 # One alternation over the shared tag list so this path tracks every tag the scrubber hides
 # (the old 3-of-9 list leaked <thinking>/<思考>/... previews), case-insensitive like the scrubber.
 _THINK_TAG_ALT = "|".join(re.escape(name) for name in THINK_TAG_NAMES)
-_REASONING_TAG_RE = re.compile(rf'{CODE_FENCE_OR_SPAN}|</?(?:{_THINK_TAG_ALT})>', re.IGNORECASE)
+_CODE_FENCE_OR_SPAN_NC = r"(?:```[\s\S]*?```|`[^`\n]+`)"
+_REASONING_TAG_RE = re.compile(rf'{CODE_FENCE_OR_SPAN}|(?<!`)</?(?:{_THINK_TAG_ALT})>(?!`)', re.IGNORECASE)
 _INLINE_REASONING_RE = re.compile(
-    rf'{CODE_FENCE_OR_SPAN}|<(?:{_THINK_TAG_ALT})>(.*?)</(?:{_THINK_TAG_ALT})>',
+    rf'{CODE_FENCE_OR_SPAN}|(?<!`)<(?:{_THINK_TAG_ALT})>(?!`)((?:{_CODE_FENCE_OR_SPAN_NC}|[\s\S])*?)(?<!`)</(?:{_THINK_TAG_ALT})>(?!`)',
     re.DOTALL | re.IGNORECASE,
 )
 

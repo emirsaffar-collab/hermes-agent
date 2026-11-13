@@ -43,8 +43,13 @@ logger = logging.getLogger(__name__)
 _TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
 # Optional XML namespace prefix: some models serialize native tool calls as <ns:function_calls>.
 _NS_PREFIX = r"(?:[\w.-]+:)?"
+_CODE_FENCE_OR_SPAN_NC = r"(?:```[\s\S]*?```|`[^`\n]+`)"
 _REASONING_BLOCK_PATTERNS = tuple(
-    re.compile(rf"{CODE_FENCE_OR_SPAN}|<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE) for name in THINK_TAG_NAMES
+    re.compile(
+        rf"{CODE_FENCE_OR_SPAN}|(?<!`)<{name}>(?!`)(?:{_CODE_FENCE_OR_SPAN_NC}|[\s\S])*?(?<!`)</{name}>(?!`)",
+        re.DOTALL | re.IGNORECASE,
+    )
+    for name in THINK_TAG_NAMES
 )
 _TOOL_CALL_BLOCK_PATTERNS = tuple(
     re.compile(rf"<{_NS_PREFIX}{name}\b[^>]*>.*?</{_NS_PREFIX}{name}>", re.DOTALL | re.IGNORECASE)
@@ -61,7 +66,7 @@ _UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
     rf'{CODE_FENCE_OR_SPAN}|(?:^|\n)[ \t]*<(?:{"|".join(THINK_TAG_NAMES)})\b[^>]*>.*$', re.DOTALL | re.IGNORECASE
 )
 _ORPHAN_REASONING_TAG_PATTERN = re.compile(
-    rf'{CODE_FENCE_OR_SPAN}|</?(?:{"|".join(THINK_TAG_NAMES)})>\s*', re.IGNORECASE
+    rf'{CODE_FENCE_OR_SPAN}|(?<!`)</?(?:{"|".join(THINK_TAG_NAMES)})>(?!`)\s*', re.IGNORECASE
 )
 _STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
     rf'</(?:{_NS_PREFIX}(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function))>\s*', re.IGNORECASE
@@ -1470,7 +1475,10 @@ _TRANSIENT_TRANSPORT_ERRORS = frozenset({
     "APIConnectionError", "APITimeoutError",
 })
 _INLINE_REASONING_PATTERNS = tuple(
-    re.compile(rf"{CODE_FENCE_OR_SPAN}|<{tag}>(.*?)</{tag}>", re.DOTALL | re.IGNORECASE)
+    re.compile(
+        rf"{CODE_FENCE_OR_SPAN}|(?<!`)<{tag}>(?!`)((?:{_CODE_FENCE_OR_SPAN_NC}|[\s\S])*?)(?<!`)</{tag}>(?!`)",
+        re.DOTALL | re.IGNORECASE,
+    )
     for tag in THINK_TAG_NAMES
 )
 

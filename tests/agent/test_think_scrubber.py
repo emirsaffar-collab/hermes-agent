@@ -366,3 +366,185 @@ class TestCodeFenceAndVertexGoogleThoughtGuards:
         assert msg_obj.content == "Visible final answer."
         assert msg_obj.reasoning_content == "** Analyzing **\nInternal Vertex thought."
         assert msg_obj.extra_content == {"google": {"thought_signature": "sig-e2e-999"}}
+
+    def test_chat_summary_attempt_disables_vertex_include_thoughts_and_preserves_backticked_think_tags(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from agent.chat_completion_helpers import _chat_summary_attempt, handle_max_iterations
+        from agent.agent_runtime_helpers import strip_think_blocks
+
+        captured_kwargs = {}
+
+        class _StubAgent:
+            api_mode = "chat_completions"
+            provider = "vertex"
+            model = "google/gemini-4-argon"
+            max_iterations = 90
+            suppress_status_output = True
+            quiet_mode = True
+            _think_scrubber = None
+
+            def _build_api_kwargs(self, api_messages):
+                return {
+                    "model": self.model,
+                    "messages": api_messages,
+                    "extra_body": {
+                        "extra_body": {
+                            "google": {
+                                "thinking_config": {
+                                    "include_thoughts": True,
+                                    "thinking_level": "high",
+                                }
+                            }
+                        }
+                    },
+                }
+
+            def _interruptible_api_call(self, kwargs):
+                captured_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=(
+                                    "<think>\nChecking `</think>` handling.\n\n"
+                                    "**Synthesizing Accomplishments**\n\nInternal thought.\n</think>\n\n"
+                                    "### Summary\nProtected `<think>...</think>` in prose."
+                                )
+                            )
+                        )
+                    ]
+                )
+
+            def _get_transport(self):
+                return SimpleNamespace(
+                    normalize_response=lambda r: SimpleNamespace(
+                        content=r.choices[0].message.content,
+                        tool_calls=None,
+                    )
+                )
+
+            def _strip_think_blocks(self, text):
+                return strip_think_blocks(self, text)
+
+        agent = _StubAgent()
+        with patch("agent.chat_completion_helpers.sanitize_outbound_kwargs"), \
+             patch("agent.chat_completion_helpers._iteration_summary_api_messages", side_effect=lambda _a, m: list(m)), \
+             patch("agent.chat_completion_helpers._managed_summary_call", side_effect=lambda _a, _id, kw, fn, retry_count=0: fn(kw)):
+            msgs = [{"role": "user", "content": "go"}]
+            out = handle_max_iterations(agent, msgs, 90)
+
+        tc = captured_kwargs["extra_body"]["extra_body"]["google"]["thinking_config"]
+        assert tc["include_thoughts"] is False
+        assert tc["thinking_level"] == "high"
+        assert "**Synthesizing Accomplishments**" not in out
+        assert out == "### Summary\nProtected `<think>...</think>` in prose."
+
+    def test_finalize_turn_honors_extended_iteration_budget_and_execute_code_refund(self, monkeypatch):
+        from types import SimpleNamespace
+        from agent.iteration_budget import IterationBudget
+        from agent.turn_finalizer import finalize_turn
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+        budget = IterationBudget(90)
+        for _ in range(90):
+            assert budget.consume() is True
+        assert budget.extend_on_progress(5) is True
+        assert budget.max_total == 95
+        assert budget.remaining == 5
+
+        agent = SimpleNamespace(
+            max_iterations=90,
+            iteration_budget=budget,
+            quiet_mode=True,
+            model="google/gemini-4-argon",
+            provider="vertex",
+            base_url="",
+            session_id="sess-ext",
+            context_compressor=SimpleNamespace(last_prompt_tokens=0),
+            session_input_tokens=0,
+            session_output_tokens=0,
+            session_cache_read_tokens=0,
+            session_cache_write_tokens=0,
+            session_reasoning_tokens=0,
+            session_prompt_tokens=0,
+            session_completion_tokens=0,
+            session_total_tokens=0,
+            session_estimated_cost_usd=0,
+            session_cost_status="unknown",
+            session_cost_source="test",
+            _tool_guardrail_halt_decision=None,
+            _interrupt_message=None,
+            _response_was_previewed=False,
+            _skill_nudge_interval=0,
+            _iters_since_skill=0,
+            valid_tool_names=[],
+            _handle_max_iterations=lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("should not fire")),
+            _emit_status=lambda *_a, **_kw: None,
+            _safe_print=lambda *_a, **_kw: None,
+            _save_trajectory=lambda *_a, **_kw: None,
+            _cleanup_task_resources=lambda *_a, **_kw: None,
+            _drop_trailing_empty_response_scaffolding=lambda _m: None,
+            _persist_session=lambda *_a, **_kw: None,
+            _file_mutation_verifier_enabled=lambda: False,
+            _turn_completion_explainer_enabled=lambda: False,
+            _drain_pending_steer=lambda: None,
+            clear_interrupt=lambda: None,
+            _sync_external_memory_for_turn=lambda **_kw: None,
+        )
+        res = finalize_turn(
+            agent,
+            final_response=None,
+            api_call_count=90,
+            interrupted=False,
+            failed=False,
+            messages=[{"role": "user", "content": "task"}],
+            conversation_history=[],
+            effective_task_id="task",
+            turn_id="turn",
+            user_message="task",
+            original_user_message="task",
+            _should_review_memory=False,
+            _turn_exit_reason="unknown",
+            _pending_verification_response=None,
+        )
+        assert res["turn_exit_reason"] == "unknown"
+
+    def test_backticked_close_tag_inside_think_block_does_not_prematurely_terminate(self):
+        from types import SimpleNamespace
+        from agent.agent_runtime_helpers import extract_reasoning, strip_think_blocks
+        from agent.turn_response_intake import _reasoning_preview
+        from hermes_cli.cli_render import _strip_reasoning_tags
+
+        raw = (
+            "<think>\n"
+            "First check `</think>` handling and stray ` backtick before `</think>`.\n"
+            "```xml\n</think>\n```\n"
+            "**Synthesizing Accomplishments**\n"
+            "Internal reasoning.\n"
+            "</think>\n\n"
+            "### Final Answer\n"
+            "We protect `<think>...</think>` and `</think>` in visible prose."
+        )
+        expected_visible = "### Final Answer\nWe protect `<think>...</think>` and `</think>` in visible prose."
+
+        stub = SimpleNamespace(_think_scrubber=None)
+        assert strip_think_blocks(stub, raw).strip() == expected_visible
+        assert _strip_reasoning_tags(raw).strip() == expected_visible
+
+        extracted = extract_reasoning(None, SimpleNamespace(content=raw))
+        assert extracted is not None
+        assert "**Synthesizing Accomplishments**" in extracted
+        assert "### Final Answer" not in extracted
+
+        preview = _reasoning_preview(stub, raw)
+        assert preview is not None
+        assert "**Synthesizing Accomplishments**" in preview
+        assert "### Final Answer" not in preview
+
+        # StreamingThinkScrubber: single delta + character-by-character
+        s_single = StreamingThinkScrubber()
+        assert _drive(s_single, [raw]).strip() == expected_visible
+        s_chars = StreamingThinkScrubber()
+        assert _drive(s_chars, list(raw)).strip() == expected_visible
+

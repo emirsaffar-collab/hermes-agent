@@ -127,15 +127,17 @@ def _resolve_budget_fallback(
 ) -> tuple[Any, Any, bool, Any]:
     """Iteration-budget exhaustion. Returns ``(final_response, _turn_exit_reason,
     preserved_verification_fallback, interrupted)``."""
+    _eff_used = min(api_call_count, getattr(agent.iteration_budget, "used", api_call_count))
+    _eff_max = max(agent.max_iterations, getattr(agent.iteration_budget, "max_total", 0) or 0)
     budget_exhausted = (
-        api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
+        _eff_used >= _eff_max or agent.iteration_budget.remaining <= 0
     )
     preserved_verification_fallback = False
     if (
         final_response is None and budget_exhausted and not interrupted and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     ):
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{_eff_max})"
         if _pending_verification_response:
             # A verification gate withheld a composed answer, then the budget ran out:
             # preserve it rather than make another fallible call. The explicit pending
