@@ -468,3 +468,49 @@ class TestReinjectionBoundsAndRedaction:
         assert _skill_pruned_marker("hermes-log-debug") in out
         assert out.index(_skill_pruned_marker("hermes-log-debug")) < out.index("## Anchor Index")
 
+    def test_reloaded_skill_in_tail_strips_stale_pruned_marker_from_summary(self):
+        from agent.context_compressor_tail import with_skill_safety_rule
+
+        summary = (
+            "## Goal\nShip fix.\n\n"
+            "## Pruned Skills\n"
+            f"{_skill_pruned_marker('pdf')}\n"
+            f"{_skill_pruned_marker('docx')}\n\n"
+            "## Anchor Index (mechanically extracted, exact)\n"
+            "files: foo.py"
+        )
+        tail = _skill_view_pair("call_reloaded_pdf", "pdf", size=4000)
+        updated_summary, _, _ = with_skill_safety_rule(summary, [], tail)
+        assert _skill_pruned_marker("pdf") not in updated_summary
+        assert _skill_pruned_marker("docx") in updated_summary
+
+        # When all pruned skills are satisfied by the active tail, ## Pruned Skills is dropped cleanly.
+        tail_both = tail + _skill_view_pair("call_reloaded_docx", "docx", size=4000)
+        fully_cleared, _, _ = with_skill_safety_rule(summary, [], tail_both)
+        assert _skill_pruned_marker("pdf") not in fully_cleared
+        assert _skill_pruned_marker("docx") not in fully_cleared
+        assert "## Pruned Skills" not in fully_cleared
+
+    def test_collect_ghosted_skill_names_ignores_non_skill_tools_and_assistant_prose(self):
+        turns = [
+            {
+                "role": "assistant",
+                "content": f"Example marker in prose: {_skill_pruned_marker('fake-prose-skill')}",
+                "tool_calls": [
+                    {
+                        "id": "call_read_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path": "test.py"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_read_1",
+                "content": f"10| {_skill_pruned_marker('fake-file-skill')}",
+            },
+            *_skill_view_pair("call_real_skill", "real-loaded-skill", size=3000),
+        ]
+        assert _collect_ghosted_skill_names(turns) == ["real-loaded-skill"]
+
+

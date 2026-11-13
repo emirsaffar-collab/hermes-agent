@@ -635,6 +635,34 @@ def _configured_stale_base(agent) -> float:
     return cfg if cfg is not None else _stream_env_stale_base()[0]
 
 
+DEFAULT_STREAM_INTER_EVENT_TIMEOUT_SECONDS = 90.0
+
+
+def _resolve_stream_inter_event_timeout(agent, first_chunk_stale_timeout: float | None) -> float:
+    """Post-first-chunk inter-event stall ceiling (Phase 2): once a stream has emitted its
+    first chunk, prefill is over and prolonged silence indicates a wedged mid-stream socket.
+    Defaults to ``DEFAULT_STREAM_INTER_EVENT_TIMEOUT_SECONDS`` (90s), overridable via
+    ``HERMES_STREAM_INTER_EVENT_TIMEOUT`` or ``agent.stream_inter_event_timeout``, and
+    always capped at ``first_chunk_stale_timeout`` so an explicit shorter stale timeout wins."""
+    inter_event = DEFAULT_STREAM_INTER_EVENT_TIMEOUT_SECONDS
+    with contextlib.suppress(Exception):
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+        value = agent_cfg.get("stream_inter_event_timeout") if isinstance(agent_cfg, dict) else None
+        if isinstance(value, (int, float)) and value > 0:
+            inter_event = float(value)
+    raw_env = os.environ.get("HERMES_STREAM_INTER_EVENT_TIMEOUT", "").strip()
+    if raw_env:
+        with contextlib.suppress(ValueError):
+            parsed = float(raw_env)
+            if parsed > 0:
+                inter_event = parsed
+    if first_chunk_stale_timeout is not None and first_chunk_stale_timeout != float("inf") and first_chunk_stale_timeout > 0:
+        return min(float(first_chunk_stale_timeout), inter_event)
+    return inter_event
+
+
 def _local_stream_stale_timeout_default() -> float:
     """Local-provider stale ceiling: ``agent.local_stream_stale_timeout`` (900s) or
     HERMES_LOCAL_STREAM_STALE_TIMEOUT. Shared by the stream stale detector and the
@@ -2542,6 +2570,7 @@ class _BedrockStream:
         self.region = api_kwargs.get("__bedrock_region__", "us-east-1")
         # Same patience budget as the OpenAI/Anthropic stale detector.
         self.stale_timeout = _derive_stream_stale_timeout(agent, api_kwargs)
+        self.post_chunk_stale_timeout = _resolve_stream_inter_event_timeout(agent, self.stale_timeout)
 
     def _model(self) -> str:
         return self.api_kwargs.get("modelId", "unknown")
@@ -2670,7 +2699,12 @@ class _BedrockStream:
             t.join(timeout=0.3)
             self._raise_if_interrupted("Agent interrupted during Bedrock API call", worker=t)
             stale_elapsed = time.time() - self.last_event
-            if stale_elapsed > self.stale_timeout:
+            effective_stale = (
+                min(self.stale_timeout, self.post_chunk_stale_timeout)
+                if self.response_started and self.stale_timeout != float("inf")
+                else self.stale_timeout
+            )
+            if stale_elapsed > effective_stale:
                 self._on_stale(stale_elapsed)
                 break
         # The Bedrock callback returns a PARTIAL response on interrupt without raising
@@ -2714,6 +2748,7 @@ class _StreamingCall(StreamingWaitMonitor):
         # Shared by the socket read timeout (``_stream_timeouts``) and the stale
         # detector (``_resolve_stale_timeout``); None until resolved.
         self._stream_stale_timeout = None
+        self._stream_post_chunk_stale_timeout = None
         self.stream_attempt_lock = threading.Lock()
         self.stream_attempt_state = {"current": 0, "cancelled": set(), "discarded_chunks": 0, "discarded_bytes": 0}
         self._stale_counted_attempts: set[int] = set()  # breaker counts each attempt once
@@ -3834,9 +3869,10 @@ class _StreamingCall(StreamingWaitMonitor):
         still be unwinding SSL BIOs (FD-recycle corruption); the OpenAI primary
         is replaced lazily."""
         _est_ctx = estimate_request_context_tokens(self.api_kwargs)
+        _eff_threshold = self._effective_stale_timeout()
         logger.warning(
             "Stream stale for %.0fs (threshold %.0fs) — no chunks received. model=%s context=~%s tokens. Killing connection.",
-            elapsed, self._stream_stale_timeout, self.api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+            elapsed, _eff_threshold, self.api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
         )
         self.agent._buffer_diagnostic_status(
             f"⚠️ No response from provider for {int(elapsed)}s (model: {self.api_kwargs.get('model', 'unknown')}, "
@@ -3881,18 +3917,24 @@ class _StreamingCall(StreamingWaitMonitor):
     # ── orchestration ───────────────────────────────────────────────────
 
     def _resolve_stale_timeout(self) -> None:
-        """Set ``_stream_stale_timeout``. Local endpoints (unless the env is set) get
-        long but FINITE patience — 900s / ``agent.local_stream_stale_timeout`` /
-        HERMES_LOCAL_STREAM_STALE_TIMEOUT — an infinite one stalled sessions on a
-        crashed endpoint forever. Cloud values scale with context size and are
-        floored for known reasoning models (else BrokenPipeError from the gateway)."""
+        """Set ``_stream_stale_timeout`` (Phase 1 prefill / time-to-first-chunk) and
+        ``_stream_post_chunk_stale_timeout`` (Phase 2 post-first-chunk inter-event stall).
+        Local endpoints (unless the env is set) get long but FINITE prefill patience —
+        900s / ``agent.local_stream_stale_timeout`` / HERMES_LOCAL_STREAM_STALE_TIMEOUT.
+        Cloud values scale with context size and are floored for known reasoning models."""
         base = _configured_stale_base(self.agent)
         if base == 180.0 and self.agent.base_url and is_local_endpoint(self.agent.base_url):
             self._stream_stale_timeout = _local_stream_stale_timeout_default()
-            logger.debug("Local provider detected (%s) — stale stream timeout set to %.0fs",
-                self.agent.base_url, self._stream_stale_timeout)
+            self._stream_post_chunk_stale_timeout = _resolve_stream_inter_event_timeout(
+                self.agent, self._stream_stale_timeout
+            )
+            logger.debug("Local provider detected (%s) — stale stream timeout set to %.0fs (post-chunk %.0fs)",
+                self.agent.base_url, self._stream_stale_timeout, self._stream_post_chunk_stale_timeout)
             return
         self._stream_stale_timeout = _cloud_stale_timeout_for(self.agent, self.api_kwargs)
+        self._stream_post_chunk_stale_timeout = _resolve_stream_inter_event_timeout(
+            self.agent, self._stream_stale_timeout
+        )
 
     def _partial_stream_stub(self, error):
         """Tokens already reached the platform: a finish_reason="length" stub fires the

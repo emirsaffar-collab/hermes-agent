@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
@@ -624,42 +624,86 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         row = self._read_one("SELECT role FROM messages WHERE id = ? AND session_id = ? AND active = 1", (int(row_id), session_id))
         return row[0] if row else None
 
-    def _carry_parent_timestamps(self, conn, parent_session_id: str, messages: list[dict[str, Any]]) -> None:
-        """Adopt the durable parent row's timestamp onto carried handoff rows so the re-inserted child row keeps
-        the original's display identity (see _display_dedupe_key). Idempotent; never overwrites a timestamp the
-        dict already carries; rows with no match keep their caller-supplied/now_ts value.
+    def _carry_parent_timestamps(self, conn, parent_session_id: str, messages: list[dict[str, Any]], *,
+                                 donor_row_ids: Optional[Iterable[int]] = None) -> None:
+        """Adopt the durable parent row's timestamp and message_uid onto carried handoff rows so the re-inserted
+        child row keeps the original's display identity (see _display_dedupe_key) and durable UID. Idempotent;
+        never overwrites a timestamp or message_uid the dict already carries; rows with no match keep their
+        caller-supplied/now_ts value.
 
         Content identity = _display_dedupe_key's content key minus the timestamp (role, encoded content,
-        tool_call_id, encoded tool_calls, tool_name). Donors are the parent's ACTIVE rows, consumed first-match-wins in id
-        order so two identical-content turns cannot both grab the same parent row. Best-effort: on any error
-        the insert falls back to today's behavior (publish-time stamp) and never breaks publish.
+        tool_call_id, encoded tool_calls, tool_name). Donors are the parent's ACTIVE rows plus any explicitly
+        rewound carried-tail originals (*donor_row_ids*), consumed first-match-wins in id order so two
+        identical-content turns cannot both grab the same parent row. Best-effort: on any error the insert
+        falls back to today's behavior (publish-time stamp) and never breaks publish.
         """
         try:
-            candidates = [i for i, msg in enumerate(messages)
-                if isinstance(msg, dict) and coerce_epoch(msg.get("timestamp"), field="message timestamp") is None]
+            candidates = [
+                i for i, msg in enumerate(messages)
+                if isinstance(msg, dict) and (
+                    coerce_epoch(msg.get("timestamp"), field="message timestamp") is None
+                    or (not msg.get("message_uid") and not msg.get("_compressed_summary"))
+                )
+            ]
             if not candidates:
                 return
-            donors: dict[tuple[Any, ...], list[Any]] = {}
+            donor_ids = {
+                int(r) for r in (donor_row_ids or ())
+                if isinstance(r, int) and not isinstance(r, bool)
+            }
+            donors: dict[tuple[Any, ...], list[tuple[Any, Any]]] = {}
             uid_donors: dict[str, Any] = {}
+            row_id_donors: dict[int, tuple[Any, Any, tuple[Any, ...]]] = {}
             for row in conn.execute(
                     "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, active, message_uid "
                     "FROM messages WHERE session_id = ? ORDER BY id", (parent_session_id,)).fetchall():
+                row_id = int(row["id"]) if row["id"] is not None else None
+                row_key = (row["role"], row["content"], row["tool_call_id"], row["tool_calls"], row["tool_name"])
+                if row_id is not None and (row["active"] or row_id in donor_ids):
+                    row_id_donors[row_id] = (row["timestamp"], row["message_uid"], row_key)
                 if row["message_uid"] and row["timestamp"] is not None:
                     uid_donors.setdefault(row["message_uid"], row["timestamp"])
                 if row["active"]:
-                    donors.setdefault((row["role"], row["content"], row["tool_call_id"], row["tool_calls"],
-                        row["tool_name"]), []).append(row["timestamp"])
+                    donors.setdefault(row_key, []).append((row["timestamp"], row["message_uid"]))
             for i in candidates:
                 msg = messages[i]
+                need_ts = coerce_epoch(msg.get("timestamp"), field="message timestamp") is None
+                need_uid = not msg.get("message_uid") and not msg.get("_compressed_summary")
                 tool_calls = _parse_tool_calls(msg.get("tool_calls"))
                 key = (msg.get("role", "unknown"), self._encode_content(msg.get("content")),
                     msg.get("tool_call_id"), json.dumps(tool_calls) if tool_calls else None,
                     _scrub_surrogates(msg.get("tool_name")))
+                raw_row_id = msg.get("_row_id")
+                if isinstance(raw_row_id, int) and not isinstance(raw_row_id, bool) and raw_row_id in row_id_donors:
+                    d_ts, d_uid, d_key = row_id_donors[raw_row_id]
+                    if d_key == key:
+                        if need_ts and d_ts is not None:
+                            msg["timestamp"] = d_ts
+                            need_ts = False
+                        if need_uid and d_uid:
+                            msg["message_uid"] = d_uid
+                            need_uid = False
+                if not need_ts and not need_uid:
+                    continue
                 queue = donors.get(key)
-                if queue:
-                    msg["timestamp"] = queue.pop(0)
-                elif msg.get("message_uid") and msg["message_uid"] in uid_donors:
-                    msg["timestamp"] = uid_donors[msg["message_uid"]]
+                if need_ts:
+                    if queue:
+                        d_ts, d_uid = queue.pop(0)
+                        if d_ts is not None:
+                            msg["timestamp"] = d_ts
+                        if need_uid and d_uid:
+                            msg["message_uid"] = d_uid
+                    elif msg.get("message_uid") and msg["message_uid"] in uid_donors:
+                        msg["timestamp"] = uid_donors[msg["message_uid"]]
+                elif need_uid and queue:
+                    msg_ts = msg.get("timestamp")
+                    match_idx = next(
+                        (idx for idx, (d_ts, d_uid) in enumerate(queue) if d_ts == msg_ts and d_uid),
+                        None,
+                    )
+                    if match_idx is not None:
+                        _, d_uid = queue.pop(match_idx)
+                        msg["message_uid"] = d_uid
         except Exception:
             return  # Best-effort: a failed carry falls back to the publish-time stamp, never breaks publish.
 
@@ -1002,9 +1046,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 [session_id, *rewind_ids])
         conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
         # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
-        # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
-        # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
-        self._carry_parent_timestamps(conn, session_id, compacted_messages)
+        # durable row's timestamp and message_uid so display dedupe and client reconciliation
+        # preserve identity across compactions. Rewound tail originals donate to their carried copies.
+        self._carry_parent_timestamps(conn, session_id, compacted_messages, donor_row_ids=rewind_ids)
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
         if clone_ids:
             _ids, unseen_tool_calls = self._tail_rows_after_watermark(
@@ -1151,9 +1195,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         else:
             conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
         # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
-        # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
-        # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
-        self._carry_parent_timestamps(conn, session_id, compacted_messages)
+        # durable row's timestamp and message_uid so display dedupe and client reconciliation
+        # preserve identity across compactions. Rewound tail originals donate to their carried copies.
+        self._carry_parent_timestamps(conn, session_id, compacted_messages, donor_row_ids=rewind_ids)
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
         if clone_ids:
             self._clone_message_rows(conn, clone_ids)

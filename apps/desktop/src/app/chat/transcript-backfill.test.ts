@@ -152,6 +152,21 @@ describe('mergeOlderTranscriptPage', () => {
     expect(mergeOlderTranscriptPage(merged, fetched)).toBe(merged)
   })
 
+  it('dedupes rows across compaction row-id shifts by durable messageUid', () => {
+    const existing: ChatMessage[] = [
+      { ...chat('carried-u2', 102), messageUid: 'uid-2' },
+      { ...chat('carried-a2', 103), messageUid: 'uid-3', role: 'assistant' }
+    ]
+    const older: ChatMessage[] = [
+      { ...chat('compacted-u1', 1), messageUid: 'uid-1' },
+      { ...chat('pre-compact-u2', 2), messageUid: 'uid-2' }
+    ]
+
+    const merged = mergeOlderTranscriptPage(existing, older)
+    expect(merged.map(m => m.id)).toEqual(['compacted-u1', 'carried-u2', 'carried-a2'])
+    expect(merged.map(m => m.messageUid)).toEqual(['uid-1', 'uid-2', 'uid-3'])
+  })
+
   it('keeps reference identity when every older row is already present', () => {
     const existing = [chat('a', 1), chat('b', 2)]
     const older = [chat('a', 1)]
@@ -284,6 +299,28 @@ describe('graftRefreshedTailOntoBackfill', () => {
     const refreshed = [chat('a', 1), chat('b', 2)]
 
     expect(graftRefreshedTailOntoBackfill(refreshed, previous)).toBe(refreshed)
+  })
+
+  it('preserves backfilled history and avoids duplicating carried tail rows when compaction shifts rowId', () => {
+    const previous: ChatMessage[] = [
+      { ...chat('ancient-u1', 1), messageUid: 'uid-1' },
+      { ...chat('carried-u2', 2), messageUid: 'uid-2' },
+      { ...chat('carried-a2', 3), messageUid: 'uid-3', role: 'assistant' }
+    ]
+    const refreshedAfterCompaction: ChatMessage[] = [
+      { ...chat('summary-divider', 100), messageUid: 'uid-summary', compactionDivider: true },
+      { ...chat('carried-u2-rehydrated', 102), messageUid: 'uid-2' },
+      { ...chat('carried-a2-rehydrated', 103), messageUid: 'uid-3', role: 'assistant' }
+    ]
+
+    const grafted = graftRefreshedTailOntoBackfill(refreshedAfterCompaction, previous)
+    expect(grafted.map(m => m.id)).toEqual([
+      'ancient-u1',
+      'summary-divider',
+      'carried-u2-rehydrated',
+      'carried-a2-rehydrated'
+    ])
+    expect(grafted.map(m => m.rowId)).toEqual([1, 100, 102, 103])
   })
 })
 

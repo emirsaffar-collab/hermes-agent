@@ -1007,15 +1007,32 @@ def _collect_ghosted_skill_names(turns: list[dict[str, Any]]) -> list[str]:
     ``skill_view`` bodies, and skills a ``/skill``, bundle or auto-load turn carried inline."""
     from agent.skill_commands import skills_loaded_by_scaffold
     call_id_to_skill = skill_view_names_by_call_id(turns)
+    non_skill_call_ids: set[str] = set()
+    for msg in turns:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or ():
+            if not isinstance(tc, dict):
+                continue
+            cid = str(tc.get("id") or "")
+            fn_name = str((tc.get("function") or {}).get("name") or tc.get("name") or "")
+            if cid and fn_name and fn_name != "skill_view":
+                non_skill_call_ids.add(cid)
     names: list[str] = []
     for msg in turns:
+        role = msg.get("role")
         content = msg.get("content")
         text = _content_text_for_contains(content)
-        names += _extract_pruned_skill_names(text)
-        if msg.get("role") == "user":
+        call_id = str(msg.get("tool_call_id") or "")
+        is_summary = bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)) or SUMMARY_PREFIX in text
+        is_non_skill_tool = role == "tool" and bool(call_id) and call_id in non_skill_call_ids
+        is_plain_assistant = role == "assistant" and not is_summary
+        if not is_non_skill_tool and not is_plain_assistant:
+            names += _extract_pruned_skill_names(text)
+        if role == "user":
             names += skills_loaded_by_scaffold(text)
-        elif msg.get("role") == "tool" and not _skill_view_failed(content) and not is_demoted_stub(text):
-            names.append(call_id_to_skill.get(str(msg.get("tool_call_id") or ""), ""))
+        elif role == "tool" and not _skill_view_failed(content) and not is_demoted_stub(text):
+            names.append(call_id_to_skill.get(call_id, ""))
     return [name for name in dict.fromkeys(names) if name]
 
 
@@ -6101,6 +6118,12 @@ Write only the summary body. Do not include any preamble or prefix."""
         compressed = self._assemble_head(messages, compress_start)
         tail_messages = self._assemble_tail(messages, compress_end, scan.tail_start, scan.summary_indices)
         summary, compressed, tail_messages = with_skill_safety_rule(summary, compressed, tail_messages)
+        if self._previous_summary:
+            from agent.context_compressor_tail import _unpruned_loaded_skill_names, strip_loaded_skill_prune_markers
+
+            loaded_skills = _unpruned_loaded_skill_names([*compressed, *tail_messages])
+            if loaded_skills:
+                self._previous_summary = strip_loaded_skill_prune_markers(self._previous_summary, loaded_skills)
         summary_role, merge_into_tail, force_user_leading, first_tail_visible_idx = (
             self._summary_placement(compressed, tail_messages, compress_start)
         )

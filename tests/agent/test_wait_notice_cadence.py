@@ -73,3 +73,40 @@ def test_stream_monitor_notice_does_not_repeat_every_heartbeat():
     call._heartbeat(60)
     assert len(notices) == 3 and notices[-1] != notices[0]
     assert not any(copy in n for n in notices for copy in WARNING_COPY)
+
+
+def test_stream_monitor_phase_split_stale_timeout(monkeypatch):
+    """Phase 1 (before first_chunk_at) uses the full prefill stale budget; Phase 2 (after first chunk)
+    tightens to the inter-event timeout (default 90s, capped at Phase 1 budget)."""
+    call = h._StreamingCall.__new__(h._StreamingCall)
+    call.agent = SimpleNamespace(
+        provider="vertex",
+        model="gemini-4-argon",
+        base_url=None,
+        _stream_stale_timeout=None,
+        _stream_inter_event_timeout=None,
+    )
+    call.api_kwargs = {"model": "gemini-4-argon", "messages": [{"role": "user", "content": "x" * 600_000}]}
+    diag: dict[str, float | None] = {"first_chunk_at": None}
+    call.clients = SimpleNamespace(diag=diag)  # type: ignore[assignment]
+    call._resolve_stale_timeout()
+
+    assert (call._stream_stale_timeout or 0.0) >= 300.0
+    assert call._stream_post_chunk_stale_timeout == 90.0
+    assert call._effective_stale_timeout() == call._stream_stale_timeout
+
+    # Once first chunk arrives, effective timeout drops to 90s inter-event budget.
+    diag["first_chunk_at"] = 1001.0
+    assert call._effective_stale_timeout() == 90.0
+
+    # While probe holds _stream_stale_timeout at inf, effective timeout stays inf.
+    saved = call._stream_stale_timeout
+    call._stream_stale_timeout = float("inf")
+    assert call._effective_stale_timeout() == float("inf")
+    call._stream_stale_timeout = saved
+
+    # Env override HERMES_STREAM_INTER_EVENT_TIMEOUT is honored and capped at Phase 1 budget.
+    monkeypatch.setenv("HERMES_STREAM_INTER_EVENT_TIMEOUT", "45")
+    call._resolve_stale_timeout()
+    assert call._effective_stale_timeout() == 45.0
+

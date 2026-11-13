@@ -96,7 +96,7 @@ def demote_stale_tail_tools(
             break
         protected.add(i)
     from agent.context_compressor import _collect_protected_skill_names
-    protected_skills = _collect_protected_skill_names(messages, tail_start)
+    protected_skills = _collect_protected_skill_names(messages, min(protected, default=len(messages)))
     result = list(messages)
     demoted = 0
     skills: dict[str, str] | None = None
@@ -124,9 +124,10 @@ def demote_stale_tail_tools(
 SKILL_SAFETY_HEADING = "## Skill Safety Rule"
 SKILL_SAFETY_RULE = (
     f"{SKILL_SAFETY_HEADING}\n"
-    "A skill placeholder containing `[SKILL_PRUNED]` lost its content in context compression and is inaccessible — "
-    "reload it with skill_view(name='...') before acting on anything that depends on it. After reloading, ignore any "
-    "remaining `[SKILL_PRUNED]` markers for that same skill; they are historical artifacts of earlier compactions.\n"
+    "A skill placeholder containing `[SKILL_PRUNED]` lost its full body in context compression — "
+    "do NOT batch-reload pruned skills at the compaction boundary; reload a skill with `skill_view(name='...')` "
+    "ONLY at the exact step that actively needs its detailed procedure (at most 1-2 skills per turn, never an eager reload sweep). "
+    "After reloading, ignore any remaining `[SKILL_PRUNED]` markers for that same skill; they are historical artifacts of earlier compactions.\n"
     "Pinned Invariant Floor (always active even while a skill reload is pending):\n"
     "- Outbound (outbound-comms / google-chat-comms / humanizer): stage drafts only (never auto-send); Gmail create/update_draft = FULL REPLACE (pass BOTH body and html_body + thread_id/reply_to_message_id on replies); Celina/Ola/Hanna max 1 sentence DM / 1-2 room sentences, zero bullet lists; devs=English, business/store=Swedish.\n"
     "- Plane (plane-tickets): engineering projects (NEWWEBSHOP/ONE/ECOM/ATLAS/2IZII) = English only, raw HTML, explicit priority + label, 2IZII requires 'internal' label, never assign/flip developer colleague tickets without a 24h Google Chat heads-up.\n"
@@ -201,6 +202,89 @@ def tail_cut_progress_floor(compressor: Any, messages: list[dict[str, Any]], hea
     return floor if raised >= len(messages) or 0 <= last_user < raised else raised
 
 
+def _unpruned_loaded_skill_names(rows: list[dict[str, Any]]) -> set[str]:
+    """Return skill names (both full and leaf slug) whose unpruned body is present in *rows*."""
+    from agent.context_compressor import (
+        SKILL_PRUNED_MARKER_PREFIX,
+        _content_text_for_contains,
+        _is_summary_stub,
+        _json_dict,
+        _skill_view_failed,
+    )
+    from agent.skill_commands import skills_loaded_by_scaffold
+
+    call_map = skill_view_names_by_call_id(rows)
+    loaded: set[str] = set()
+    for msg in rows:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        text = _content_text_for_contains(content)
+        if not text:
+            continue
+        role = msg.get("role")
+        if role == "user":
+            for name in skills_loaded_by_scaffold(text):
+                if name:
+                    loaded.add(name)
+                    loaded.add(name.rsplit("/", 1)[-1])
+        elif (
+            role == "tool"
+            and SKILL_PRUNED_MARKER_PREFIX not in text
+            and not _is_summary_stub(text)
+            and not is_demoted_stub(text)
+            and not _skill_view_failed(content)
+        ):
+            name = call_map.get(str(msg.get("tool_call_id") or ""), "")
+            if not name and text.lstrip().startswith("{") and '"success": true' in text[:120]:
+                payload = _json_dict(text)
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("success") is True
+                    and not payload.get("dedup")
+                    and not payload.get("file")
+                    and isinstance(payload.get("content"), str)
+                ):
+                    name = str(payload.get("name") or "")
+            if name:
+                loaded.add(name)
+                loaded.add(name.rsplit("/", 1)[-1])
+    return loaded
+
+
+def strip_loaded_skill_prune_markers(text: str, loaded_skills: set[str]) -> str:
+    """Remove ``[SKILL_PRUNED: ...]`` lines from *text* for skills in *loaded_skills*, dropping an
+    empty ``## Pruned Skills`` section when all of its markers were satisfied by the active tail."""
+    if not text or not loaded_skills:
+        return text
+    from agent.context_compressor import (
+        SKILL_PRUNED_MARKER_PREFIX,
+        _PRUNED_SKILLS_SECTION_HEADING,
+        _extract_pruned_skill_names,
+    )
+
+    if SKILL_PRUNED_MARKER_PREFIX not in text:
+        return text
+    kept_lines: list[str] = []
+    changed = False
+    for line in text.splitlines():
+        names = _extract_pruned_skill_names(line) if SKILL_PRUNED_MARKER_PREFIX in line else []
+        if names and all(n in loaded_skills or n.rsplit("/", 1)[-1] in loaded_skills for n in names):
+            changed = True
+            continue
+        kept_lines.append(line)
+    if not changed:
+        return text
+    rebuilt = "\n".join(kept_lines)
+    # Drop an empty `## Pruned Skills` heading left behind when every marker under it was stripped.
+    rebuilt = re.sub(
+        rf"(?:^|\n\n){re.escape(_PRUNED_SKILLS_SECTION_HEADING)}\s*(?=\n## |\Z)",
+        "",
+        rebuilt,
+    )
+    return rebuilt.strip("\n")
+
+
 def with_skill_safety_rule(
     summary: str, head: list[dict[str, Any]], tail: list[dict[str, Any]],
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
@@ -216,6 +300,9 @@ def with_skill_safety_rule(
                 and SKILL_SAFETY_RULE in m["content"] else m for m in rows]
 
     head, tail = unruled(head), unruled(tail)
+    loaded_skills = _unpruned_loaded_skill_names([*head, *tail])
+    if loaded_skills:
+        summary = strip_loaded_skill_prune_markers(summary, loaded_skills)
     texts = (summary, *(_content_text_for_contains(m.get("content")) for m in (*head, *tail) if isinstance(m, dict)))
     if any(SKILL_SAFETY_RULE in text for text in texts) or not any(SKILL_PRUNED_MARKER_PREFIX in t for t in texts):
         return summary, head, tail

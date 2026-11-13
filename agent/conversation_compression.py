@@ -2312,15 +2312,38 @@ def _pruned_skill_reload_notice(compressed: list) -> str:
     Scans ``[SKILL_PRUNED: ...]`` markers in the post-compression transcript; first-seen order, deduplicated,
     capped at ``_MAX_PRUNED_SKILL_MARKERS``. Any skill whose full unpruned ``skill_view`` body appears later in
     *compressed* (reloaded in the protected tail) is excluded from the reload notice."""
-    from agent.context_compressor import _MAX_PRUNED_SKILL_MARKERS, _extract_pruned_skill_names
+    from agent.context_compressor import (
+        COMPRESSED_SUMMARY_METADATA_KEY,
+        SUMMARY_PREFIX,
+        _MAX_PRUNED_SKILL_MARKERS,
+        _extract_pruned_skill_names,
+    )
+    from agent.context_compressor_tail import _unpruned_loaded_skill_names
+    non_skill_call_ids: set[str] = set()
+    for message in compressed:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for tc in message.get("tool_calls") or ():
+            if not isinstance(tc, dict):
+                continue
+            cid = str(tc.get("id") or "")
+            fn_name = str((tc.get("function") or {}).get("name") or tc.get("name") or "")
+            if cid and fn_name and fn_name != "skill_view":
+                non_skill_call_ids.add(cid)
     names: list = []
     for message in compressed:
         if not isinstance(message, dict):
             continue
+        role = message.get("role")
         text = _message_text(message)
-        for name in _extract_pruned_skill_names(text):
-            if name not in names:
-                names.append(name)
+        call_id = str(message.get("tool_call_id") or "")
+        is_summary = bool(message.get(COMPRESSED_SUMMARY_METADATA_KEY)) or SUMMARY_PREFIX in text
+        is_non_skill_tool = role == "tool" and bool(call_id) and call_id in non_skill_call_ids
+        is_plain_assistant = role == "assistant" and not is_summary
+        if not is_non_skill_tool and not is_plain_assistant:
+            for name in _extract_pruned_skill_names(text):
+                if name not in names:
+                    names.append(name)
         if message.get("role") == "tool" and text.startswith("{") and '"success": true' in text[:80]:
             with contextlib.suppress(Exception):
                 payload = json.loads(text)
@@ -2333,23 +2356,24 @@ def _pruned_skill_reload_notice(compressed: list) -> str:
                     and payload.get("name") in names
                 ):
                     names.remove(payload["name"])
+    loaded_in_tail = _unpruned_loaded_skill_names([m for m in compressed if isinstance(m, dict)])
+    if loaded_in_tail:
+        names = [n for n in names if n not in loaded_in_tail and n.rsplit("/", 1)[-1] not in loaded_in_tail]
     del names[_MAX_PRUNED_SKILL_MARKERS:]
     if not names:
         return ""
     calls = "; ".join(f"skill_view(name='{name}')" for name in names)
     batch_note = (
         " Reload lazily on demand for the current step only (at most 2-3 skills per turn; "
-        "do not batch-reload the full list at once, or you will immediately re-trigger context compression)."
-        if len(names) > 3
-        else ""
+        "do not batch-reload the full list at once or reload skills from completed earlier tasks, "
+        "or you will immediately re-trigger context compression)."
     )
     return (
         f"{_PRUNED_SKILL_RELOAD_NOTICE_HEADER}\n"
-        "The task list above crossed the compression boundary verbatim, but "
-        "the skill instructions that governed it were pruned. Before "
-        f"executing any preserved task that depends on these skills, reload "
-        f"them first: {calls}.{batch_note} After reloading, re-check that each pending "
-        "task is still justified — findings recorded before the boundary may have invalidated it."
+        "The task list above crossed the compression boundary verbatim, while "
+        "full skill bodies from earlier turns were compacted. If the current in-progress task "
+        f"specifically requires one of these skills' detailed procedures, reload only that skill on demand: {calls}.{batch_note} "
+        "After reloading, re-check that each pending task is still justified — findings recorded before the boundary may have invalidated it."
     )
 
 
@@ -4238,7 +4262,12 @@ def compress_context(
         reinserted_reply = None if verbatim_tail else _ensure_compressed_keeps_last_assistant_reply(
             messages, compressed, session_id=agent.session_id,
         )
+        carried_reinserted: list = []
         if reinserted_reply is not None:
+            unmerged_user = reinserted_reply.pop("_unmerged_inflight_user", None)
+            carried_reinserted.append(reinserted_reply)
+            if isinstance(unmerged_user, dict):
+                carried_reinserted.append(unmerged_user)
             logger.info(
                 "Compression: engine folded away the just-delivered assistant reply; reinserted it into the "
                 "active set (session=%s).", agent.session_id or "none",
@@ -4252,10 +4281,10 @@ def compress_context(
             messages_before_compression=messages_before_compression, made_progress=_compression_made_progress,
             attempt=attempt, verbatim_tail=verbatim_tail,
             # The reinserted copy keeps the original's _row_id/timestamp (production flush stamps
-            # both); carry exactly that one row so the commit rewinds the durable original instead
-            # of archiving it compacted=1 next to a fresh twin (display would show it twice). The
+            # both); carry those rows so the commit rewinds the durable originals instead of
+            # archiving them compacted=1 next to fresh twins (display would show them twice). The
             # todo fold / user-anchor rows above keep their own class and are not carried.
-            carried_messages=[reinserted_reply] if reinserted_reply is not None else None,
+            carried_messages=carried_reinserted or None,
         )
         if commit.refused_prompt is not None:
             _restore_messages_snapshot(messages, messages_before_compression)
