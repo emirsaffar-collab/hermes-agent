@@ -528,3 +528,23 @@ def test_history_commentary_keeps_whitespace_part_before_memory_fence():
     projected = _project_for_display([row])[0]
 
     assert projected["display_commentary"] == ["Checking the inbox."]
+
+
+def test_stale_memory_context_module_self_heals_on_lazy_import():
+    """If a long-lived serve process has a pre-c6f6de65b4 agent.memory_context cached in
+    sys.modules without fence_recalled_context, visible_commentary and fence_result_reply
+    reload agent.memory_context in-place instead of crashing with ImportError."""
+    import agent.memory_context as mc_mod
+    from agent.turn_finalizer import fence_result_reply
+
+    delattr(mc_mod, "fence_recalled_context")
+    assert not hasattr(mc_mod, "fence_recalled_context")
+    assert visible_commentary("Hello\n<memory-context>\nsecret\n</memory-context>") == "Hello"
+    assert hasattr(mc_mod, "fence_recalled_context")
+
+    delattr(mc_mod, "fence_recalled_context")
+    assert not hasattr(mc_mod, "fence_recalled_context")
+    res = {"final_response": "Reply\n<memory-context>\nsecret\n</memory-context>"}
+    fence_result_reply(res)
+    assert res["final_response"] == "Reply"
+    assert hasattr(mc_mod, "fence_recalled_context")

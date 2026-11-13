@@ -590,7 +590,13 @@ def fence_result_reply(result: Any) -> None:
     ``result["messages"]`` and the stored row keep the raw text (API Runs transcripts, ``get_messages``)."""
     if not isinstance(result, dict):
         return
-    from agent.memory_context import fence_recalled_context
+    try:
+        from agent.memory_context import fence_recalled_context
+    except ImportError:
+        import importlib
+        import agent.memory_context as _mc_mod
+        importlib.reload(_mc_mod)
+        from agent.memory_context import fence_recalled_context
     # ``pre_transform_response`` is display text too: replay-gap recovery and post-stream suffix
     # painting deliver it.
     for key in ("final_response", "pre_transform_response"):
