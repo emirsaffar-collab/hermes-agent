@@ -343,6 +343,9 @@ _LOOP_CAPS: dict[str, tuple[str, str, str]] = {
 class ToolCallGuardrailController:
     """Per-turn controller for repeated failed/non-progressing tool calls."""
 
+    _auth_wall_failure_count: int = 0
+    _turn_productive_calls: int = 0
+
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
         self.reset_for_turn()
@@ -452,12 +455,14 @@ class ToolCallGuardrailController:
             same_count = self._same_tool_failure_counts[tool_name] = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._no_progress.pop(signature, None)
             if is_unrecoverable_auth_wall(result):
-                self._auth_wall_failure_count += 1
-                if self.config.hard_stop_enabled and self._auth_wall_failure_count >= self.config.auth_wall_halt_after:
+                self._auth_wall_failure_count = getattr(self, "_auth_wall_failure_count", 0) + 1
+                auth_wall_halt_after = getattr(self.config, "auth_wall_halt_after", 3)
+                auth_wall_warn_after = getattr(self.config, "auth_wall_warn_after", 2)
+                if self.config.hard_stop_enabled and self._auth_wall_failure_count >= auth_wall_halt_after:
                     return self._decide(
                         "halt", "auth_wall_failure_halt", tool_name, self._auth_wall_failure_count, signature
                     )
-                if warnings and self._auth_wall_failure_count >= self.config.auth_wall_warn_after:
+                if warnings and self._auth_wall_failure_count >= auth_wall_warn_after:
                     return self._decide(
                         "warn", "auth_wall_failure_warning", tool_name, self._auth_wall_failure_count, signature
                     )
@@ -513,7 +518,7 @@ class ToolCallGuardrailController:
             self._halt_decision is None
             and getattr(self, '_turn_productive_calls', 0) > 0
             and not self._exact_failure_counts
-            and self._auth_wall_failure_count == 0
+            and getattr(self, '_auth_wall_failure_count', 0) == 0
             and self._identical_streak_count < STALL_GUARD_IDENTICAL_CALL_THRESHOLD
             and max(self._same_tool_failure_counts.values(), default=0) < self.config.same_tool_failure_warn_after
         )

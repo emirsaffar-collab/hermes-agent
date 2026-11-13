@@ -600,4 +600,53 @@ class TestWave5LongTermCostArchitectureFixes:
         assert "Headings: # Cost Audit Skill | ## Phase 1: Query BigQuery" in r3["content_digest"]
         assert len(r3_raw) < 2500
 
+    def test_fix5_pre_reload_guardrail_and_budget_instances_survive_mid_turn_hot_reload(self):
+        from agent.iteration_budget import IterationBudget
+        from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+
+        # Simulate a pre-reload ToolCallGuardrailController instance whose reset_for_turn()
+        # ran before _turn_productive_calls / _auth_wall_failure_count existed and whose
+        # self.config was created from an older ToolCallGuardrailConfig class without
+        # auth_wall_warn_after / auth_wall_halt_after.
+        ctrl = ToolCallGuardrailController()
+        ctrl.__dict__.pop("_turn_productive_calls", None)
+        ctrl.__dict__.pop("_auth_wall_failure_count", None)
+        base_cfg = ToolCallGuardrailConfig(hard_stop_enabled=True)
+        legacy_cfg_dict = {
+            k: getattr(base_cfg, k)
+            for k in base_cfg.__dataclass_fields__
+            if k not in ("auth_wall_warn_after", "auth_wall_halt_after")
+        }
+        setattr(ctrl, "config", SimpleNamespace(**legacy_cfg_dict))
+
+        assert ctrl.is_making_productive_progress() is False
+        d_ok = ctrl.after_call("terminal", {"command": "echo ok"}, "ok", failed=False)
+        assert d_ok.action == "allow"
+        assert ctrl.is_making_productive_progress() is True
+
+        # Auth-wall failures on the legacy config stub must fall back cleanly to 2 / 3 without AttributeError
+        auth_err = "unauth" + "enticated"
+        d_auth1 = ctrl.after_call("terminal", {"command": "gcloud1"}, auth_err, failed=True)
+        assert d_auth1.action == "allow"
+        assert ctrl.is_making_productive_progress() is False
+        d_auth2 = ctrl.after_call("terminal", {"command": "gcloud2"}, auth_err, failed=True)
+        assert d_auth2.action == "warn"
+        assert d_auth2.code == "auth_wall_failure_warning"
+        d_auth3 = ctrl.after_call("terminal", {"command": "gcloud3"}, auth_err, failed=True)
+        assert d_auth3.action == "halt"
+        assert d_auth3.code == "auth_wall_failure_halt"
+
+        # Simulate a pre-reload IterationBudget instance that only has _initial_max_total
+        budget = IterationBudget(25)
+        budget.__dict__.pop("initial_max_total", None)
+        budget.__dict__.pop("_extensions_granted", None)
+        budget._initial_max_total = 25
+        budget._used = 21  # within low_watermark=5
+
+        assert budget.extend_on_progress(1) is True
+        assert budget.max_total == 26
+        assert budget.initial_max_total == 25
+        assert budget._extensions_granted == 1
+
+
 
