@@ -77,16 +77,17 @@ def test_stream_monitor_notice_does_not_repeat_every_heartbeat():
 
 def test_stream_monitor_phase_split_stale_timeout(monkeypatch):
     """Phase 1 (before first_chunk_at) uses the full prefill stale budget; Phase 2 (after first chunk)
-    tightens to the inter-event timeout (default 90s, capped at Phase 1 budget)."""
+    tightens to the inter-event timeout (default 90s for non-reasoning models, floored by
+    get_reasoning_stale_timeout_floor for cloud reasoning models like gemini-4-argon)."""
     call = h._StreamingCall.__new__(h._StreamingCall)
     call.agent = SimpleNamespace(
-        provider="vertex",
-        model="gemini-4-argon",
+        provider="openai",
+        model="gpt-4o",
         base_url=None,
         _stream_stale_timeout=None,
         _stream_inter_event_timeout=None,
     )
-    call.api_kwargs = {"model": "gemini-4-argon", "messages": [{"role": "user", "content": "x" * 600_000}]}
+    call.api_kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "x" * 600_000}]}
     diag: dict[str, float | None] = {"first_chunk_at": None}
     call.clients = SimpleNamespace(diag=diag)  # type: ignore[assignment]
     call._resolve_stale_timeout()
@@ -95,9 +96,27 @@ def test_stream_monitor_phase_split_stale_timeout(monkeypatch):
     assert call._stream_post_chunk_stale_timeout == 90.0
     assert call._effective_stale_timeout() == call._stream_stale_timeout
 
-    # Once first chunk arrives, effective timeout drops to 90s inter-event budget.
+    # Once first chunk arrives, effective timeout drops to 90s inter-event budget on non-reasoning models.
     diag["first_chunk_at"] = 1001.0
     assert call._effective_stale_timeout() == 90.0
+
+    # Cloud reasoning models (gemini-4-argon) preserve their reasoning floor (600s) in Phase 2
+    # so server-buffered tool_calls and mid-turn re-prefill hops are not killed at 90s.
+    rcall = h._StreamingCall.__new__(h._StreamingCall)
+    rcall.agent = SimpleNamespace(
+        provider="vertex",
+        model="google/gemini-4-argon",
+        base_url=None,
+        _stream_stale_timeout=None,
+        _stream_inter_event_timeout=None,
+    )
+    rcall.api_kwargs = {"model": "google/gemini-4-argon", "messages": [{"role": "user", "content": "hi"}]}
+    rdiag: dict[str, float | None] = {"first_chunk_at": 1001.0}
+    rcall.clients = SimpleNamespace(diag=rdiag)  # type: ignore[assignment]
+    rcall._resolve_stale_timeout()
+    assert rcall._stream_stale_timeout == 600.0
+    assert rcall._stream_post_chunk_stale_timeout == 600.0
+    assert rcall._effective_stale_timeout() == 600.0
 
     # While probe holds _stream_stale_timeout at inf, effective timeout stays inf.
     saved = call._stream_stale_timeout
@@ -105,8 +124,10 @@ def test_stream_monitor_phase_split_stale_timeout(monkeypatch):
     assert call._effective_stale_timeout() == float("inf")
     call._stream_stale_timeout = saved
 
-    # Env override HERMES_STREAM_INTER_EVENT_TIMEOUT is honored and capped at Phase 1 budget.
+    # Env override HERMES_STREAM_INTER_EVENT_TIMEOUT is honored on all models and capped at Phase 1 budget.
     monkeypatch.setenv("HERMES_STREAM_INTER_EVENT_TIMEOUT", "45")
     call._resolve_stale_timeout()
+    rcall._resolve_stale_timeout()
     assert call._effective_stale_timeout() == 45.0
+    assert rcall._effective_stale_timeout() == 45.0
 

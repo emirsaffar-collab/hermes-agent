@@ -638,13 +638,21 @@ def _configured_stale_base(agent) -> float:
 DEFAULT_STREAM_INTER_EVENT_TIMEOUT_SECONDS = 90.0
 
 
-def _resolve_stream_inter_event_timeout(agent, first_chunk_stale_timeout: float | None) -> float:
+def _resolve_stream_inter_event_timeout(
+    agent,
+    first_chunk_stale_timeout: float | None,
+    *,
+    api_kwargs: dict | None = None,
+    local_provider: bool = False,
+) -> float:
     """Post-first-chunk inter-event stall ceiling (Phase 2): once a stream has emitted its
     first chunk, prefill is over and prolonged silence indicates a wedged mid-stream socket.
-    Defaults to ``DEFAULT_STREAM_INTER_EVENT_TIMEOUT_SECONDS`` (90s), overridable via
-    ``HERMES_STREAM_INTER_EVENT_TIMEOUT`` or ``agent.stream_inter_event_timeout``, and
-    always capped at ``first_chunk_stale_timeout`` so an explicit shorter stale timeout wins."""
+    Defaults to ``DEFAULT_STREAM_INTER_EVENT_TIMEOUT_SECONDS`` (90s), floored for cloud
+    reasoning models (whose mid-turn re-prefill hops and server-buffered tool_calls pauses
+    occur after ``first_chunk_at``), overridable via ``HERMES_STREAM_INTER_EVENT_TIMEOUT``
+    or ``agent.stream_inter_event_timeout``, and always capped at ``first_chunk_stale_timeout``."""
     inter_event = DEFAULT_STREAM_INTER_EVENT_TIMEOUT_SECONDS
+    explicit_inter_event = False
     with contextlib.suppress(Exception):
         from hermes_cli.config import load_config_readonly
         cfg = load_config_readonly()
@@ -652,12 +660,23 @@ def _resolve_stream_inter_event_timeout(agent, first_chunk_stale_timeout: float 
         value = agent_cfg.get("stream_inter_event_timeout") if isinstance(agent_cfg, dict) else None
         if isinstance(value, (int, float)) and value > 0:
             inter_event = float(value)
+            explicit_inter_event = True
     raw_env = os.environ.get("HERMES_STREAM_INTER_EVENT_TIMEOUT", "").strip()
     if raw_env:
         with contextlib.suppress(ValueError):
             parsed = float(raw_env)
             if parsed > 0:
                 inter_event = parsed
+                explicit_inter_event = True
+    if not explicit_inter_event and not local_provider:
+        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+        kw = api_kwargs if isinstance(api_kwargs, dict) else {}
+        model_slug = kw.get("model") or kw.get("modelId") or getattr(agent, "model", "") or ""
+        floor = get_reasoning_stale_timeout_floor(model_slug)
+        if floor is None and kw.get("modelId"):
+            floor = _bedrock_reasoning_stale_floor(kw["modelId"])
+        if floor is not None:
+            inter_event = max(inter_event, floor)
     if first_chunk_stale_timeout is not None and first_chunk_stale_timeout != float("inf") and first_chunk_stale_timeout > 0:
         return min(float(first_chunk_stale_timeout), inter_event)
     return inter_event
@@ -3926,14 +3945,14 @@ class _StreamingCall(StreamingWaitMonitor):
         if base == 180.0 and self.agent.base_url and is_local_endpoint(self.agent.base_url):
             self._stream_stale_timeout = _local_stream_stale_timeout_default()
             self._stream_post_chunk_stale_timeout = _resolve_stream_inter_event_timeout(
-                self.agent, self._stream_stale_timeout
+                self.agent, self._stream_stale_timeout, local_provider=True
             )
             logger.debug("Local provider detected (%s) — stale stream timeout set to %.0fs (post-chunk %.0fs)",
                 self.agent.base_url, self._stream_stale_timeout, self._stream_post_chunk_stale_timeout)
             return
         self._stream_stale_timeout = _cloud_stale_timeout_for(self.agent, self.api_kwargs)
         self._stream_post_chunk_stale_timeout = _resolve_stream_inter_event_timeout(
-            self.agent, self._stream_stale_timeout
+            self.agent, self._stream_stale_timeout, api_kwargs=self.api_kwargs
         )
 
     def _partial_stream_stub(self, error):

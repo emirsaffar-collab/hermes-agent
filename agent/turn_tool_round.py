@@ -44,6 +44,8 @@ class ToolRoundVerdict:
     _turn_exit_reason: Any
     truncated_tool_call_retries: Any
     current_turn_user_idx: Any
+    length_continue_retries: Any = 0
+    truncated_response_parts: Any = None
     result: Optional[dict[str, Any]] = None
 
 
@@ -53,6 +55,7 @@ def run_tool_round(
     system_message: Any, active_system_prompt: Any, compression_attempts: Any,
     max_compression_attempts: Any, final_response: Any, failed: Any, _turn_exit_reason: Any,
     truncated_tool_call_retries: Any, current_turn_user_idx: Any,
+    length_continue_retries: Any = 0, truncated_response_parts: Any = None,
 ) -> ToolRoundVerdict:
     """Execute one tool round in the exact original order. Persist-before-execute is a
     durability invariant: resume must see the executed block if a destructive tool restarts
@@ -60,13 +63,19 @@ def run_tool_round(
     process-only state."""
     from agent.conversation_loop import _invalid_tool_name_error_content
 
+    if truncated_response_parts is None:
+        truncated_response_parts = []
+
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ToolRoundVerdict:
         return ToolRoundVerdict(
             action=action, messages=messages, conversation_history=conversation_history,
             active_system_prompt=active_system_prompt, compression_attempts=compression_attempts,
             final_response=final_response, failed=failed, _turn_exit_reason=_turn_exit_reason,
             truncated_tool_call_retries=truncated_tool_call_retries,
-            current_turn_user_idx=current_turn_user_idx, result=result,
+            current_turn_user_idx=current_turn_user_idx,
+            length_continue_retries=length_continue_retries,
+            truncated_response_parts=truncated_response_parts,
+            result=result,
         )
 
     if not agent.quiet_mode:
@@ -236,6 +245,8 @@ def run_tool_round(
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
     truncated_tool_call_retries = 0
+    length_continue_retries = 0
+    truncated_response_parts = []
     agent._truncated_tool_call_retries = 0
     agent._content_filter_retries = 0
     # Defer the paragraph break: _fire_stream_delta() prepends one "\n\n" when real
@@ -344,6 +355,13 @@ def stage_tool_call_message(
     # recovers any dropped-tool-call stall, so refresh that budget per stall.
     agent._post_tool_empty_retried = False
     agent._dropped_toolcall_retries = 0
+    for frag in messages:
+        if isinstance(frag, dict):
+            if frag.pop("_length_continuation_fragment", None):
+                frag.setdefault("display_kind", "hidden")
+                frag["_absorbed_continuation_fragment"] = True
+            if frag.pop("_length_continuation_nudge", None):
+                frag["_absorbed_continuation_nudge"] = True
 
     previous_msg = messages[-1] if messages else None
     current_interim_visible = agent._interim_assistant_visible_text(assistant_msg)
