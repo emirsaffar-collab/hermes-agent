@@ -2504,6 +2504,16 @@ def _anthropic_connection_error_types() -> tuple:
     return (anthropic.APIConnectionError,) if anthropic is not None else ()
 
 
+def _openai_timeout_error_types() -> tuple:
+    openai = sys.modules.get("openai")
+    return (openai.APITimeoutError,) if openai is not None else ()
+
+
+def _openai_connection_error_types() -> tuple:
+    openai = sys.modules.get("openai")
+    return (openai.APIConnectionError,) if openai is not None else ()
+
+
 def _is_sse_connection_error(exc: BaseException) -> bool:
     from openai import APIError as _APIError
     if not isinstance(exc, _APIError) or getattr(exc, "status_code", None):
@@ -2973,8 +2983,8 @@ class _StreamingCall(StreamingWaitMonitor):
         elif read == 120.0 and stale is not None and stale != float("inf") and stale > read:
             # Reasoning models pause mid-stream for minutes; the stale detector
             # tolerates that, so the raw read timeout must not fire first.
-            read = stale
-            logger.debug("Cloud reasoning stream — read timeout raised to %.0fs to match stale-stream detector", read)
+            read = stale + 15.0
+            logger.debug("Cloud reasoning stream — read timeout raised to %.0fs (stale %.0fs + 15s lead)", read, stale)
         return base, read, 30.0
 
     @staticmethod
@@ -3010,7 +3020,10 @@ class _StreamingCall(StreamingWaitMonitor):
             stream_kwargs["stream_options"] = {"include_usage": True}
         request_client = self._attempt_request_client = self.clients.set_client(
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
-        self.last_chunk_time["t"] = time.time()
+        _now = time.time()
+        self.last_chunk_time["t"] = _now
+        if getattr(self, "_mon", None) is not None:
+            self._mon.last_heartbeat = _now
         self.agent._touch_activity("waiting for provider response (streaming)")
         # #93650: as above — the streaming path carries the same bulk
         # messages/tools payload and pays the same client-side walk.
@@ -3480,7 +3493,10 @@ class _StreamingCall(StreamingWaitMonitor):
         # No message_stop -> EmptyStreamError; saw_stream_event only picks the message.
         saw_stream_event = False
         saw_message_stop = False
-        self.last_chunk_time["t"] = time.time()
+        _now = time.time()
+        self.last_chunk_time["t"] = _now
+        if getattr(self, "_mon", None) is not None:
+            self._mon.last_heartbeat = _now
         _diag = self._new_diag()
         self._writer_token = self._attempt_stream_response = None
         self._attempt_request_client = request_client
@@ -3669,12 +3685,14 @@ class _StreamingCall(StreamingWaitMonitor):
             logger.debug("Streaming worker caught %s after request cancellation — exiting without retry.", type(e).__name__)
             return False
         e = self._as_lifetime_error(e)  # a cap kill: transient, and its copy names the setting
-        _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout, StreamLifetimeExceeded))
+        _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout, StreamLifetimeExceeded,
+                                     *_openai_timeout_error_types()))
         # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader, ECONNRESET) — retry loop owns it.
-        # anthropic.APIConnectionError: the Anthropic SDK wraps connect/read drops
-        # (incl. stale-kill aborts) in its own type, not httpx's.
-        _is_conn_err = isinstance(e, (_httpx.ConnectError, _httpx.ReadError, _httpx.RemoteProtocolError, ConnectionError,
-                                      *_anthropic_connection_error_types()))
+        # anthropic/openai APIConnectionError: the SDKs wrap connect/read drops
+        # (incl. stale-kill aborts before response headers arrive) in their own type, not httpx's.
+        _is_conn_err = not _is_timeout and isinstance(
+            e, (_httpx.ConnectError, _httpx.ReadError, _httpx.RemoteProtocolError, ConnectionError,
+                *_anthropic_connection_error_types(), *_openai_connection_error_types()))
         _is_stream_parse_err = self.agent._is_provider_stream_parse_error(e)
         _is_empty_stream = isinstance(e, EmptyStreamError)
         _is_sse_conn_err = not _is_timeout and not _is_conn_err and _is_sse_connection_error(e)

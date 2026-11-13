@@ -131,3 +131,38 @@ def test_stream_monitor_phase_split_stale_timeout(monkeypatch):
     assert call._effective_stale_timeout() == 45.0
     assert rcall._effective_stale_timeout() == 45.0
 
+
+def test_open_chat_stream_syncs_monitor_heartbeat_and_read_timeout_lead(monkeypatch):
+    """_open_chat_stream syncs _mon.last_heartbeat with last_chunk_time['t'] so client-init
+    latency does not shift the first wait notice from 60s to 87s, and _stream_timeouts gives
+    the stale detector a 15s lead over the raw httpx read timeout."""
+    call = h._StreamingCall.__new__(h._StreamingCall)
+    call.agent = SimpleNamespace(
+        provider="vertex",
+        model="google/gemini-4-argon",
+        base_url="https://aiplatform.googleapis.com/v1/projects/p/locations/global/endpoints/openapi",
+        _stream_stale_timeout=None,
+        _stream_inter_event_timeout=None,
+        _stream_options_unsupported=False,
+        _create_request_openai_client=lambda **_kw: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_k: "stream"))
+        ),
+        _touch_activity=lambda _msg: None,
+    )
+    call.api_kwargs = {"model": "google/gemini-4-argon", "messages": [{"role": "user", "content": "hi"}]}
+    call.clients = SimpleNamespace(diag={"first_chunk_at": None}, set_client=lambda c: c)  # type: ignore[assignment]
+    call.last_chunk_time = {"t": 1000.0}
+    call._mon = SimpleNamespace(last_heartbeat=1000.0)
+    call._resolve_stale_timeout()
+
+    _write, read, _conn = call._stream_timeouts()
+    assert call._stream_stale_timeout == 600.0
+    assert read == 615.0
+
+    monkeypatch.setattr(h.time, "time", lambda: 1003.0)
+    monkeypatch.setattr(h, "bypass_chat_sdk_request_transform", lambda kw, _c: kw)
+    assert call._open_chat_stream({"model": "google/gemini-4-argon"}) == "stream"
+    assert call.last_chunk_time["t"] == 1003.0
+    assert call._mon.last_heartbeat == 1003.0
+
+
