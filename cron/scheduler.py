@@ -2469,27 +2469,40 @@ class _CronAgentSetup:
     fallback_notice: Optional[str] = None
 
 
+def _positive_int_or_none(val: Any) -> Optional[int]:
+    """Return ``int(val)`` when *val* is a strictly positive integer (> 0), else ``None``."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        parsed = int(val)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _resolve_cron_max_iterations(job: Any, _cfg: Any) -> int:
-    """Resolve per-job -> cron-section -> agent-section max_iterations/max_turns ceiling."""
+    """Resolve per-job -> cron-section -> agent-section max_iterations/max_turns ceiling.
+
+    Non-positive values (``<= 0``) fall through to the next tier rather than failing open to
+    ``sys.maxsize`` via ``resolve_turn_limit``.
+    """
     from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
-    _mt = None
+    candidates: list[Any] = []
     if isinstance(job, dict):
-        _mt = job.get("max_iterations")
-        if _mt is None:
-            _mt = job.get("max_turns")
-    if _mt is None and isinstance(_cfg, dict):
+        candidates.extend([job.get("max_iterations"), job.get("max_turns")])
+    if isinstance(_cfg, dict):
         _cron_sec = _cfg.get("cron")
         if isinstance(_cron_sec, dict):
-            _mt = _cron_sec.get("max_iterations")
-            if _mt is None:
-                _mt = _cron_sec.get("max_turns")
-        if _mt is None:
-            _agent_sec = _cfg.get("agent")
-            if isinstance(_agent_sec, dict):
-                _mt = _agent_sec.get("max_turns")
-        if _mt is None:
-            _mt = _cfg.get("max_turns")
-    return _resolve_turn_limit(_mt)
+            candidates.extend([_cron_sec.get("max_iterations"), _cron_sec.get("max_turns")])
+        _agent_sec = _cfg.get("agent")
+        if isinstance(_agent_sec, dict):
+            candidates.append(_agent_sec.get("max_turns"))
+        candidates.append(_cfg.get("max_turns"))
+    for cand in candidates:
+        pos = _positive_int_or_none(cand)
+        if pos is not None:
+            return pos
+    return _resolve_turn_limit(None)
 
 
 def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:

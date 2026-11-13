@@ -563,3 +563,16 @@ def test_cronjob_tool_update_clears_monitor_script(hermes_env):
     )
     assert result.get("success") is True
     assert get_job(created["job_id"]).get("monitor_script") is None
+
+
+def test_resolve_cron_max_iterations_hierarchy_and_negative_control():
+    from cron.scheduler import _resolve_cron_max_iterations
+
+    cfg = {"cron": {"max_iterations": 35}, "agent": {"max_turns": 120}}
+    assert _resolve_cron_max_iterations({"max_iterations": 25}, cfg) == 25
+    assert _resolve_cron_max_iterations({"max_turns": 20}, cfg) == 20
+    assert _resolve_cron_max_iterations({}, cfg) == 35
+    assert _resolve_cron_max_iterations({}, {"agent": {"max_turns": 120}}) == 120
+    # Negative control: non-positive (<= 0) or boolean values must fall through to the next positive ceiling, never sys.maxsize
+    assert _resolve_cron_max_iterations({"max_iterations": -5}, {"cron": {"max_iterations": 0}, "agent": {"max_turns": 120}}) == 120
+    assert _resolve_cron_max_iterations({"max_iterations": False}, cfg) == 35
