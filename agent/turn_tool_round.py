@@ -256,6 +256,13 @@ def run_tool_round(
     # calling) — cheap RPC-style calls shouldn't eat the budget.
     if {tc.function.name for tc in assistant_message.tool_calls} == {"execute_code"}:
         agent.iteration_budget.refund()
+    elif (
+        getattr(agent, "_tool_guardrails", None) is not None
+        and hasattr(agent._tool_guardrails, "is_making_productive_progress")
+        and hasattr(agent.iteration_budget, "extend_on_progress")
+        and agent._tool_guardrails.is_making_productive_progress()
+    ):
+        agent.iteration_budget.extend_on_progress(1)
 
     _ptc = compress_after_tool_results(
         agent, messages=messages, system_message=system_message, user_message=user_message,

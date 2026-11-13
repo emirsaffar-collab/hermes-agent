@@ -72,10 +72,31 @@ _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
     "exact_failure_warn_after": ("warn_after", "exact_failure"),
     "same_tool_failure_warn_after": ("warn_after", "same_tool_failure"),
     "no_progress_warn_after": ("warn_after", "idempotent_no_progress"),
+    "auth_wall_warn_after": ("warn_after", "auth_wall"),
     "exact_failure_block_after": ("hard_stop_after", "exact_failure"),
     "same_tool_failure_halt_after": ("hard_stop_after", "same_tool_failure"),
     "no_progress_block_after": ("hard_stop_after", "idempotent_no_progress"),
+    "auth_wall_halt_after": ("hard_stop_after", "auth_wall"),
 }
+
+_UNRECOVERABLE_AUTH_WALL_MARKERS = (
+    "invalid_grant",
+    "reauth_required",
+    "rapt_required",
+    "request had invalid authentication credentials",
+    "unauthenticated",
+    "http 401:",
+    "status 401",
+    "error 401",
+)
+
+
+def is_unrecoverable_auth_wall(result: str | None) -> bool:
+    """True when tool output indicates an expired/missing credential or RAPT wall that retrying cannot fix."""
+    if not isinstance(result, str) or not result:
+        return False
+    lowered = result.lower()
+    return any(marker in lowered for marker in _UNRECOVERABLE_AUTH_WALL_MARKERS)
 
 # Per-turn caps on runaway-prone tools (counters reset in reset_for_turn).
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
@@ -128,6 +149,8 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    auth_wall_warn_after: int = 2
+    auth_wall_halt_after: int = 3
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: LoopCapConfig = field(default_factory=LoopCapConfig)
@@ -286,6 +309,14 @@ _DECISION_MESSAGES: dict[str, str] = {
         "Blocked delegate_task: this turn has already spawned {count} subagents (limit {cap}). "
         "This looks like a runaway delegation loop. Finish the work with the results you have and answer the user."
     ),
+    "auth_wall_failure_warning": (
+        "{tool_name} hit an unrecoverable authentication/credential wall {count} times. "
+        "Stop retrying with tweaked flags; report the auth blocker or switch credentials."
+    ),
+    "auth_wall_failure_halt": (
+        "Stopped {tool_name}: unrecoverable authentication/credential wall ({count} consecutive failures). "
+        "Retrying without valid credentials cannot succeed; report the blocker."
+    ),
 }
 
 _IDENTICAL_CALL_NOTICE = (
@@ -342,6 +373,8 @@ class ToolCallGuardrailController:
         self._persisted_result_paths: dict[str, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._auth_wall_failure_count = 0
+        self._turn_productive_calls = 0
 
     def reset_after_compaction(self) -> None:
         """Clear read-tool no-progress and streak counters across a compaction boundary.
@@ -418,6 +451,16 @@ class ToolCallGuardrailController:
                 exact_count = self._exact_failure_counts[signature] = exact_count + 1
             same_count = self._same_tool_failure_counts[tool_name] = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._no_progress.pop(signature, None)
+            if is_unrecoverable_auth_wall(result):
+                self._auth_wall_failure_count += 1
+                if self.config.hard_stop_enabled and self._auth_wall_failure_count >= self.config.auth_wall_halt_after:
+                    return self._decide(
+                        "halt", "auth_wall_failure_halt", tool_name, self._auth_wall_failure_count, signature
+                    )
+                if warnings and self._auth_wall_failure_count >= self.config.auth_wall_warn_after:
+                    return self._decide(
+                        "warn", "auth_wall_failure_warning", tool_name, self._auth_wall_failure_count, signature
+                    )
             # same_tool_failure counts DIFFERENT args on one tool; for failure-tolerant
             # tools a run of distinct red commands is diagnosis, not a loop — warn, never halt.
             if (
@@ -443,6 +486,7 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
+        self._auth_wall_failure_count = 0
         # A successful mutation is progress for every failing signature still counted
         # this turn. Pure loops never mutate between attempts, so the replay detector keeps its teeth.
         if tool_name in PROGRESS_RESET_TOOL_NAMES or file_mutation_result_landed(tool_name, result):
@@ -450,15 +494,29 @@ class ToolCallGuardrailController:
             self._same_tool_failure_counts.clear()
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
+            self._turn_productive_calls += 1
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
         result_hash = _result_hash(result, tool_name)
         previous = self._no_progress.get(signature)
         repeat_count = previous[1] + 1 if previous is not None and previous[0] == result_hash else 1
         self._no_progress[signature] = (result_hash, repeat_count)
+        if repeat_count == 1:
+            self._turn_productive_calls += 1
         if warnings and repeat_count >= self.config.no_progress_warn_after:
             return self._decide("warn", "idempotent_no_progress_warning", tool_name, repeat_count, signature)
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
+
+    def is_making_productive_progress(self) -> bool:
+        """True when this turn has executed productive calls without active failure/stall streaks."""
+        return (
+            self._halt_decision is None
+            and self._turn_productive_calls > 0
+            and not self._exact_failure_counts
+            and self._auth_wall_failure_count == 0
+            and self._identical_streak_count < STALL_GUARD_IDENTICAL_CALL_THRESHOLD
+            and max(self._same_tool_failure_counts.values(), default=0) < self.config.same_tool_failure_warn_after
+        )
 
     def _is_idempotent(self, tool_name: str) -> bool:
         return tool_name not in self.config.mutating_tools and tool_name in self.config.idempotent_tools

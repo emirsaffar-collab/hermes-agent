@@ -58,10 +58,13 @@ GLOBAL_VERTEX_REGION = "global"
 EUROPE_WEST2_VERTEX_REGION = "europe-west2"
 EUROPE_WEST2_ARGON_MAX_CONCURRENCY = 5
 EUROPE_WEST2_COOLDOWN_SECONDS = 15.0
+EUROPE_WEST2_STICKY_WAIT_SECONDS = 3.0
 
 _EUROPE_WEST2_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
 _EUROPE_WEST2_STATE_LOCK = threading.Lock()
 _europe_west2_cooldown_until: float = 0.0
+_session_region_affinity: dict[str, str] = {}
+_SESSION_AFFINITY_CAP = 512
 _VERTEX_BASE_URL_RE = re.compile(
     r"^https://(?:[a-z0-9-]+-)?aiplatform\.googleapis\.com/v1(?:beta1)?/projects/([^/]+)/locations/([^/]+)/endpoints/openapi/?$"
 )
@@ -117,11 +120,31 @@ def vertex_regional_cooldown_remaining() -> float:
 
 
 def reset_vertex_hybrid_router_state() -> None:
-    """Reset cooldown and semaphore state (used by unit tests)."""
+    """Reset cooldown, session affinity, and semaphore state (used by unit tests)."""
     global _europe_west2_cooldown_until, _EUROPE_WEST2_ARGON_SEMAPHORE
     with _EUROPE_WEST2_STATE_LOCK:
         _europe_west2_cooldown_until = 0.0
         _EUROPE_WEST2_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
+        _session_region_affinity.clear()
+
+
+def get_session_vertex_region_affinity(session_id: Optional[str]) -> Optional[str]:
+    """Return the sticky Vertex region recorded for *session_id*, if any."""
+    if not session_id:
+        return None
+    with _EUROPE_WEST2_STATE_LOCK:
+        return _session_region_affinity.get(str(session_id))
+
+
+def _record_session_vertex_region_affinity(session_id: Optional[str], region: str) -> None:
+    if not session_id:
+        return
+    sid = str(session_id)
+    with _EUROPE_WEST2_STATE_LOCK:
+        _session_region_affinity.pop(sid, None)
+        _session_region_affinity[sid] = region
+        while len(_session_region_affinity) > _SESSION_AFFINITY_CAP:
+            del _session_region_affinity[next(iter(_session_region_affinity))]
 
 
 def acquire_vertex_hybrid_region(
@@ -129,15 +152,18 @@ def acquire_vertex_hybrid_region(
     *,
     configured_region: Optional[str] = None,
     interactive: bool = True,
+    session_id: Optional[str] = None,
+    sticky_wait_seconds: Optional[float] = None,
 ) -> tuple[str, bool]:
     """Select the Vertex region for a single request and optionally acquire a regional slot.
 
     Returns ``(region, slot_acquired)``:
     - ``gemini-3.8-flash`` / ``gemini-3*`` -> always ``("global", False)`` (HTTP 404 on europe-west2).
     - ``gemini-4-argon`` when ``interactive=True`` and configured region is ``global`` or
-      ``europe-west2`` -> tries non-blocking checkout of ``_EUROPE_WEST2_ARGON_SEMAPHORE`` (max 5)
-      when not in a 429 cooldown window; returns ``("europe-west2", True)`` on success, or falls
-      back to ``("global", False)`` on slot saturation (6th+ concurrent call) or active cooldown.
+      ``europe-west2`` -> tries checkout of ``_EUROPE_WEST2_ARGON_SEMAPHORE`` (max 5)
+      when not in a 429 cooldown window. When *session_id* is already pinned to ``europe-west2``,
+      waits up to ``sticky_wait_seconds`` (default 3.0s) for a regional slot before spilling to
+      ``global`` so sub-second concurrency spikes do not wipe the session's regional KV-cache.
     - All other models/regions -> ``(configured_region or "global", False)``.
     """
     reg = (configured_region or DEFAULT_REGION).strip() or DEFAULT_REGION
@@ -149,7 +175,18 @@ def acquire_vertex_hybrid_region(
         and reg in (GLOBAL_VERTEX_REGION, EUROPE_WEST2_VERTEX_REGION)
     ):
         if vertex_regional_cooldown_remaining() <= 0.0:
-            if _EUROPE_WEST2_ARGON_SEMAPHORE.acquire(blocking=False):
+            pinned_region = get_session_vertex_region_affinity(session_id)
+            wait_s = (
+                EUROPE_WEST2_STICKY_WAIT_SECONDS
+                if sticky_wait_seconds is None
+                else max(0.0, float(sticky_wait_seconds))
+            )
+            if pinned_region == EUROPE_WEST2_VERTEX_REGION and wait_s > 0.0:
+                acquired = _EUROPE_WEST2_ARGON_SEMAPHORE.acquire(blocking=True, timeout=wait_s)
+            else:
+                acquired = _EUROPE_WEST2_ARGON_SEMAPHORE.acquire(blocking=False)
+            if acquired:
+                _record_session_vertex_region_affinity(session_id, EUROPE_WEST2_VERTEX_REGION)
                 return (EUROPE_WEST2_VERTEX_REGION, True)
         return (GLOBAL_VERTEX_REGION, False)
     return (reg, False)
@@ -157,7 +194,7 @@ def acquire_vertex_hybrid_region(
 
 def release_vertex_hybrid_slot(client: Any) -> bool:
     """Idempotently release a europe-west2 concurrency slot held on *client*."""
-    if client is None or not getattr(client, "_vertex_regional_slot_held", False):
+    if client is None or getattr(client, "_vertex_regional_slot_held", False) is not True:
         return False
     try:
         client._vertex_regional_slot_held = False

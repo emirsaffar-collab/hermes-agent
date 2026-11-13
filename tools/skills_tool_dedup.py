@@ -12,14 +12,60 @@ import json
 import threading
 
 _skill_view_tracker: dict[str, dict[tuple, str]] = globals().get("_skill_view_tracker") or {}
+_skill_view_epoch_history: dict[str, dict[tuple, tuple[str, int, str]]] = (
+    globals().get("_skill_view_epoch_history") or {}
+)
 _skill_view_tracker_lock = globals().get("_skill_view_tracker_lock") or threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
+_SKILL_VIEW_CROSS_EPOCH_FULL_LOAD_LIMIT = 2
 
 _SKILL_VIEW_DEDUP_MESSAGE = (
     "Skill content unchanged since it was loaded earlier in this "
     "conversation — refer to the earlier skill_view result; it is still "
     "current and complete. (Re-issued after context compression, this "
     "returns the full content again.)")
+
+
+def _build_cross_epoch_skill_digest(payload: dict, resolved: str, file_path: str, epoch_loads: int) -> str:
+    """Build a compact (~1.5 KB) structural digest of a skill after it has already been
+    loaded in full at least ``_SKILL_VIEW_CROSS_EPOCH_FULL_LOAD_LIMIT`` times across compaction epochs."""
+    raw_content = str(payload.get("content") or "")
+    headings: list[str] = []
+    key_lines: list[str] = []
+    for line in raw_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            headings.append(stripped[:120])
+        elif any(tok in stripped for tok in ("`", "python", "pytest", "gcloud", "roq", "SKILL.md", "references/")) and len(key_lines) < 12:
+            key_lines.append(stripped[:140])
+    summary_lines = []
+    if headings:
+        summary_lines.append("Headings: " + " | ".join(headings[:20]))
+    if key_lines:
+        summary_lines.append("Key commands/anchors:\n" + "\n".join(f"- {kl}" for kl in key_lines))
+    else:
+        summary_lines.append(raw_content[:1200])
+    digest_body = "\n\n".join(summary_lines)[:1600]
+    return json.dumps(
+        {
+            "success": True,
+            "status": "cross_epoch_digest",
+            "name": resolved,
+            "file": file_path or "SKILL.md",
+            "dedup": True,
+            "content_returned": False,
+            "epoch_load_count": epoch_loads,
+            "linked_files": payload.get("linked_files") or {},
+            "description": payload.get("description") or "",
+            "content_digest": digest_body,
+            "message": (
+                f"Skill '{resolved}' ({file_path or 'SKILL.md'}) is unchanged and has already been loaded "
+                f"in full {epoch_loads - 1} times across compaction epochs in this session. Returning "
+                "compact structural digest to preserve context window and KV-cache."
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 
 def dedup_skill_view(task_id, name, file_path, payload: dict, result: str) -> str | None:
@@ -30,20 +76,35 @@ def dedup_skill_view(task_id, name, file_path, payload: dict, result: str) -> st
     if (not task_id or payload.get("setup_needed")
             or payload.get("readiness_status") == "setup_needed"):
         return None
+    tid = str(task_id)
     resolved = str(payload.get("name") or name)
     key = (resolved, file_path or "")
     digest = hashlib.sha256(result.encode("utf-8")).hexdigest()
     with _skill_view_tracker_lock:
-        cache = _skill_view_tracker.setdefault(str(task_id), {})
+        cache = _skill_view_tracker.setdefault(tid, {})
         if cache.get(key) == digest:
             return json.dumps({
                 "success": True, "status": "unchanged", "name": resolved,
                 "file": file_path or "SKILL.md", "dedup": True, "content_returned": False,
                 "message": _SKILL_VIEW_DEDUP_MESSAGE}, ensure_ascii=False)
+        epoch_map = _skill_view_epoch_history.setdefault(tid, {})
+        prev_epoch = epoch_map.get(key)
+        if prev_epoch is not None and prev_epoch[0] == digest:
+            full_loads = prev_epoch[1] + 1
+        else:
+            full_loads = 1
         cache.pop(key, None)  # re-insert at the end: FIFO eviction keeps the recently served
         cache[key] = digest
         while len(cache) > _SKILL_VIEW_DEDUP_CAP:  # FIFO eviction
             del cache[next(iter(cache))]
+        if full_loads > _SKILL_VIEW_CROSS_EPOCH_FULL_LOAD_LIMIT:
+            compact_json = _build_cross_epoch_skill_digest(payload, resolved, file_path or "", full_loads)
+            epoch_map[key] = (digest, full_loads, compact_json)
+            return compact_json
+        epoch_map.pop(key, None)
+        epoch_map[key] = (digest, full_loads, "")
+        while len(epoch_map) > _SKILL_VIEW_DEDUP_CAP:
+            del epoch_map[next(iter(epoch_map))]
     return None
 
 
@@ -148,6 +209,7 @@ def reset_skill_view_dedup(
     with _skill_view_tracker_lock:
         if task_id is None:
             _skill_view_tracker.clear()
+            _skill_view_epoch_history.clear()
         else:
             _skill_view_tracker.pop(str(task_id), None)
     if task_id is not None and surviving_messages:

@@ -400,3 +400,204 @@ class TestPostCompactionLoopGuardP02:
         with pytest.raises(AttributeError, match="_last_post_compaction_prompt_tokens"):
             cc._effective_compression_threshold()
 
+
+class TestWave5LongTermCostArchitectureFixes:
+    """Tests for Wave 5 fixes:
+    - Fix 1: Unrecoverable auth-wall halt on failure-tolerant tools & progress-sensing IterationBudget extension
+    - Fix 2: System-prompt byte-identity preservation across _assemble_head & 12 KB execute_code stdout spill
+    - Fix 3: Session-sticky europe-west2 affinity with bounded wait & non-evicting _OPENAI_GLOBAL_FALLBACK_SLOT
+    - Fix 4: Cross-epoch skill_view structural digest on 3rd+ full load across compactions
+    """
+
+    def test_fix1_auth_wall_halts_terminal_on_third_failure_and_progress_extends_budget(self):
+        from agent.iteration_budget import IterationBudget
+        from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+
+        ctrl = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+        ctrl.reset_for_turn()
+
+        # Distinct terminal commands failing with RAPT/invalid_grant auth walls:
+        d1 = ctrl.after_call("terminal", {"command": "bq query --q1"}, '{"exit_code": 1, "error": "invalid_grant: reauth_required"}')
+        assert d1.action == "allow"
+        assert ctrl.is_making_productive_progress() is False
+
+        d2 = ctrl.after_call("terminal", {"command": "bq query --q2"}, '{"exit_code": 1, "error": "invalid_grant: rapt_required"}')
+        assert d2.action == "warn"
+        assert d2.code == "auth_wall_failure_warning"
+
+        d3 = ctrl.after_call("terminal", {"command": "bq query --q3"}, '{"exit_code": 1, "error": "HTTP 401: Request had invalid authentication credentials"}')
+        assert d3.action == "halt"
+        assert d3.code == "auth_wall_failure_halt"
+
+        # Productive progress on a normal turn extends a low-remaining real budget (initial >= 20),
+        # while a small test budget (initial < 20) or non-progress turn does NOT extend.
+        ctrl.reset_for_turn()
+        ok = ctrl.after_call("read_file", {"path": "/tmp/a.py"}, '{"content": "x = 1\\n"}')
+        assert ok.action == "allow"
+        assert ctrl.is_making_productive_progress() is True
+
+        budget = IterationBudget(35)
+        for _ in range(31):
+            assert budget.consume() is True
+        assert budget.remaining == 4
+        assert budget.extend_on_progress(1) is True
+        assert budget.max_total == 36
+        assert budget.remaining == 5
+
+        small_budget = IterationBudget(5)
+        for _ in range(4):
+            assert small_budget.consume() is True
+        assert small_budget.extend_on_progress(1) is False
+        assert small_budget.max_total == 5
+
+    def test_fix2_assemble_head_preserves_system_prompt_byte_identity_and_12kb_spill(self, monkeypatch):
+        from tools.code_execution_tool import _effective_max_stdout_bytes, _truncate_stdout_text
+
+        cc = ContextCompressor(model="google/gemini-4-argon", quiet_mode=True)
+        sys_text = "You are Hermes Agent.\n" + ("A" * 4096)
+        msgs = [
+            {"role": "system", "content": sys_text},
+            {"role": "user", "content": "hello"},
+        ]
+        head = cc._assemble_head(msgs, 1)
+        assert len(head) == 1
+        assert head[0]["content"] == sys_text
+        assert cc._COMPRESSION_NOTE not in head[0]["content"]
+
+        # When code_execution.max_stdout_bytes is configured to 12288, _truncate_stdout_text caps at 12288 bytes
+        monkeypatch.setattr("tools.code_execution_tool._load_config", lambda: {"max_stdout_bytes": 12288})
+        assert _effective_max_stdout_bytes() == 12288
+        big_out = "0123456789abcdef" * 2000  # 32,000 bytes
+        truncated, meta = _truncate_stdout_text(big_out)
+        assert len(truncated) > 12288
+        assert meta["stdout_truncated"] is True
+        assert meta["stdout_bytes_captured"] == 12288
+        assert meta["stdout_bytes_total"] == 32000
+
+    def test_fix3_sticky_europe_west2_waits_for_slot_and_global_fallback_preserves_regional_client(self):
+        import threading
+        from agent.client_lifecycle import ClientLifecycleMixin, _OPENAI_GLOBAL_FALLBACK_SLOT, _OPENAI_SLOT
+        from agent.vertex_adapter import get_session_vertex_region_affinity
+
+        # Session 'sess-sticky-1' acquires slot #1 on europe-west2
+        r1, acq1 = acquire_vertex_hybrid_region(
+            "google/gemini-4-argon",
+            configured_region="global",
+            interactive=True,
+            session_id="sess-sticky-1",
+        )
+        assert (r1, acq1) == (EUROPE_WEST2_VERTEX_REGION, True)
+        assert get_session_vertex_region_affinity("sess-sticky-1") == EUROPE_WEST2_VERTEX_REGION
+        c1 = SimpleNamespace(_vertex_regional_slot_held=True)
+
+        # Fill the remaining 4 slots
+        other_clients = []
+        for _ in range(EUROPE_WEST2_ARGON_MAX_CONCURRENCY - 1):
+            r, acq = acquire_vertex_hybrid_region("google/gemini-4-argon", configured_region="global", interactive=True)
+            assert (r, acq) == (EUROPE_WEST2_VERTEX_REGION, True)
+            other_clients.append(SimpleNamespace(_vertex_regional_slot_held=True))
+
+        # Release c1's slot from Turn 1, then saturate all 5 slots briefly for 40ms
+        assert release_vertex_hybrid_slot(c1) is True
+        temp_slot_r, temp_slot_acq = acquire_vertex_hybrid_region("google/gemini-4-argon", configured_region="global", interactive=True)
+        assert (temp_slot_r, temp_slot_acq) == (EUROPE_WEST2_VERTEX_REGION, True)
+        temp_client = SimpleNamespace(_vertex_regional_slot_held=True)
+
+        timer = threading.Timer(0.04, lambda: release_vertex_hybrid_slot(temp_client))
+        timer.start()
+        try:
+            # Turn 2 of 'sess-sticky-1' waits up to sticky_wait_seconds and stays on europe-west2!
+            r2, acq2 = acquire_vertex_hybrid_region(
+                "google/gemini-4-argon",
+                configured_region="global",
+                interactive=True,
+                session_id="sess-sticky-1",
+                sticky_wait_seconds=0.5,
+            )
+            assert (r2, acq2) == (EUROPE_WEST2_VERTEX_REGION, True)
+            c2 = SimpleNamespace(_vertex_regional_slot_held=True)
+        finally:
+            timer.cancel()
+
+        assert release_vertex_hybrid_slot(c2) is True
+        for oc in other_clients:
+            assert release_vertex_hybrid_slot(oc) is True
+
+        # Verify _OPENAI_GLOBAL_FALLBACK_SLOT prevents evicting a warm europe-west2 client in _OPENAI_SLOT
+        class _FallbackDummy(ClientLifecycleMixin):
+            def __init__(self):
+                self.provider = "vertex"
+                self.model = "google/gemini-3.8-flash"
+                self.api_key = "ya29.tok"
+                self.base_url = "https://europe-west2-aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/europe-west2/endpoints/openapi"
+                self._client_kwargs = {"api_key": self.api_key, "base_url": self.base_url}
+                self._openai_client_mutex = threading.RLock()
+                self.client = SimpleNamespace(
+                    api_key="ya29.tok",
+                    _client=SimpleNamespace(is_closed=False),
+                )
+                self.regional_client = SimpleNamespace(
+                    api_key="ya29.tok",
+                    _client=SimpleNamespace(is_closed=False),
+                )
+                slot = self._request_slot(_OPENAI_SLOT)
+                slot["client"] = self.regional_client
+                slot["key"] = {"api_key": "ya29.tok", "base_url": self.base_url, "max_retries": 0}
+
+            @staticmethod
+            def _api_kwargs_have_image_parts(api_kwargs):
+                return False
+
+            def _create_openai_client(self, kw, *, reason, shared=False):
+                return SimpleNamespace(api_key=kw.get("api_key"), base_url=kw.get("base_url"), _client=SimpleNamespace(is_closed=False))
+
+            def _close_openai_client(self, client, *, reason, shared=False):
+                if client is not None:
+                    client._closed_reason = reason
+
+        dummy = _FallbackDummy()
+        global_client = dummy._create_request_openai_client(api_kwargs={"model": "google/gemini-3.8-flash"}, reason="test_flash")
+        assert getattr(global_client, "_request_slot_name", None) == _OPENAI_GLOBAL_FALLBACK_SLOT
+        # Regional client in _OPENAI_SLOT was NOT evicted or closed!
+        assert dummy._request_slot(_OPENAI_SLOT)["client"] is dummy.regional_client
+        assert not hasattr(dummy.regional_client, "_closed_reason")
+        dummy._close_request_openai_client(global_client, reason="request_complete")
+        assert dummy._request_slot(_OPENAI_GLOBAL_FALLBACK_SLOT)["client"] is global_client
+
+    def test_fix4_cross_epoch_skill_digest_serves_compact_summary_on_third_epoch_load(self, tmp_path, monkeypatch):
+        from tools.skills_tool import _skill_view_with_bump
+
+        body = (
+            "# Cost Audit Skill\n"
+            "## Phase 1: Query BigQuery\n"
+            "Run `bq query --use_legacy_sql=false` to inspect SKUs.\n"
+            + ("Detailed documentation line.\n" * 600)
+        )
+        _setup_skill(tmp_path, monkeypatch, "cost-audit-test", body=body)
+        tid = "sess-epoch-digest-test"
+
+        # Epoch 1: Full load #1
+        r1 = json.loads(_skill_view_with_bump({"name": "cost-audit-test"}, task_id=tid))
+        assert r1["success"] is True
+        assert "dedup" not in r1
+        assert len(r1["content"]) > 10_000
+
+        # Compaction #1 prunes the skill; Epoch 2 reload #2 still returns full content (parity with rc01/rc02)
+        reset_skill_view_dedup(tid, surviving_messages=[])
+        r2 = json.loads(_skill_view_with_bump({"name": "cost-audit-test"}, task_id=tid))
+        assert r2["success"] is True
+        assert "dedup" not in r2
+        assert len(r2["content"]) > 10_000
+
+        # Compaction #2 prunes the skill again; Epoch 3 reload #3 returns compact cross_epoch_digest (<2.5 KB)
+        reset_skill_view_dedup(tid, surviving_messages=[])
+        r3_raw = _skill_view_with_bump({"name": "cost-audit-test"}, task_id=tid)
+        r3 = json.loads(r3_raw)
+        assert r3["success"] is True
+        assert r3["dedup"] is True
+        assert r3["status"] == "cross_epoch_digest"
+        assert r3["epoch_load_count"] == 3
+        assert "Headings: # Cost Audit Skill | ## Phase 1: Query BigQuery" in r3["content_digest"]
+        assert len(r3_raw) < 2500
+
+
