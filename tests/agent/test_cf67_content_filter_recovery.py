@@ -768,3 +768,116 @@ def test_cf78_steer_note_summarizes_cache_decorated_list_tool_blocks_and_strips_
     assert "[hermes note: Previous response generation was interrupted" in sync_block["text"]
     assert sync_block["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
+
+def test_cf89_thought_signature_commentary_and_reasoning_leak_two_way_polarity(monkeypatch, caplog):
+    """#CF-89 two-way polarity:
+    1. _inject_content_filter_steer_note replaces encrypted tc['extra_content']['google']['thought_signature']
+       with 'skip_thought_signature_validator' on idx==0 (and pops extra_content on idx>0), clears assistant
+       tool-call commentary starting with '**' or containing memory-patching/hot-reload markers, and summarizes
+       or-credit-clamp / recycle-desktop-backends tool payloads, while leaving normal assistant text untouched.
+    2. handle_content_policy_refusal never leaks internal reasoning into user-facing error_detail / final_response
+       when response.content is empty, while still recording reasoning in agent.log and preserving explicit
+       content / stop_details explanations.
+    """
+    import agent.turn_truncation as tt
+
+    api_messages = [
+        {"role": "user", "content": "merge PR #128"},
+        {
+            "role": "assistant",
+            "content": "**Fixing the hot-reload bug**\n\nInspecting _ensure_msl_fork_hook_disarmed in or-credit-clamp.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"/Users/test/.hermes/plugins/or-credit-clamp/__init__.py"}',
+                        "thought_signature": "ENC_SIG_FN_1",
+                    },
+                    "extra_content": {"google": {"thought_signature": "ENC_SIG_BLOB_1"}},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"normal.py"}',
+                    },
+                    "extra_content": {"google": {"thought_signature": "ENC_SIG_BLOB_2"}},
+                },
+            ],
+            "extra_content": {"google": {"thought_signature": "ENC_MSG_BLOB"}},
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "def _ensure_msl_fork_hook_disarmed(): ctypes.CDLL('libSystem.B.dylib')",
+        },
+        {
+            "role": "assistant",
+            "content": "Plain assistant reply with no tool calls and no markers.",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_2",
+            "content": "normal file output",
+        },
+    ]
+
+    tt._inject_content_filter_steer_note(api_messages)
+
+    # Positive polarity: assistant tool-call commentary cleared, thought_signature replaced with skip sentinel on idx==0, popped on idx==1
+    asst_tc = api_messages[1]
+    assert asst_tc["content"] == ""
+    assert "extra_content" not in asst_tc
+    assert "or-credit-clamp" not in asst_tc["tool_calls"][0]["function"]["arguments"]
+    assert "thought_signature" not in asst_tc["tool_calls"][0]["function"]
+    assert asst_tc["tool_calls"][0]["extra_content"] == {
+        "google": {"thought_signature": "skip_thought_signature_validator"}
+    }
+    assert "extra_content" not in asst_tc["tool_calls"][1]
+    assert asst_tc["tool_calls"][1]["function"]["arguments"] == '{"path":"normal.py"}'
+    assert "libSystem.B.dylib" not in api_messages[2]["content"]
+    assert "summarized after upstream content_filter" in api_messages[2]["content"]
+
+    # Negative polarity: plain assistant reply without markers or tool calls is preserved
+    assert api_messages[3]["content"] == "Plain assistant reply with no tool calls and no markers."
+    assert api_messages[4]["content"].startswith("normal file output")
+
+    # Refusal text polarity: empty content + non-empty reasoning must NOT leak reasoning into user error_detail
+    agent = _make_mock_agent(has_fallback=False)
+    agent._extract_reasoning.return_value = "**Executing Hot Reload** I'm moving directly to merging PR #128."
+    resp_reasoning_only = SimpleNamespace(
+        content="",
+        reasoning="**Executing Hot Reload** I'm moving directly to merging PR #128.",
+        provider_data={},
+    )
+    monkeypatch.setattr(tt, "normalize_response_for_agent", lambda ag, r: r)
+    with caplog.at_level("WARNING"):
+        verdict = handle_content_policy_refusal(
+            agent=agent,
+            response=resp_reasoning_only,
+            _retry=TurnRetryState(),
+            thinking_spinner=None,
+            messages=[{"role": "user", "content": "merge"}],
+            api_messages=[{"role": "user", "content": "merge"}],
+            api_kwargs={},
+            active_system_prompt="sys",
+            conversation_history=[],
+            api_call_count=1,
+            effective_task_id="t1",
+            turn_id="turn1",
+            api_request_id="req1",
+            api_start_time=0.0,
+            retry_count=0,
+            max_retries=0,
+        )
+    assert verdict.action == "return"
+    assert verdict.result is not None
+    assert "**Executing Hot Reload**" not in verdict.result["error"]
+    assert verdict.result["error"] == "content_policy_blocked: model declined (content_filter)"
+    assert "**Executing Hot Reload**" not in verdict.result["final_response"]
+    assert "**Executing Hot Reload**" in caplog.text
+
+

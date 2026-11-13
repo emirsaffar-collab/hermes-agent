@@ -709,3 +709,69 @@ def test_or_credit_clamp_topological_sort_handles_pkg_and_relative_imports(tmp_p
     finally:
         for mname in created:
             sys.modules.pop(mname, None)
+
+
+def test_relay_shared_metrics_idempotent_register_and_reload_rebind_two_way_polarity(monkeypatch):
+    """#CF-89 two-way polarity:
+    1. _Runtime.__init__ deregisters and re-registers cleanly when native Relay.subscribers.register
+       raises RuntimeError('... subscriber already exists'), and still re-raises unrelated RuntimeErrors.
+    2. _get_runtime rebinds a pre-reload _Runtime instance across class redefinition without re-running
+       _Runtime.__init__.
+    """
+    from typing import Any
+    import hermes_cli.observability.relay_shared_metrics as rsm
+
+    calls = []
+
+    class _FakeSubscribers:
+        def __init__(self, fail_mode: str):
+            self.fail_mode = fail_mode
+            self.calls = 0
+
+        def register(self, name, sub):
+            self.calls += 1
+            calls.append(("register", name, self.calls))
+            if self.fail_mode == "already_exists_once" and self.calls == 1:
+                raise RuntimeError(f"already exists: {name} subscriber already exists")
+            if self.fail_mode == "other_error":
+                raise RuntimeError("fatal relay failure")
+
+        def deregister(self, name):
+            calls.append(("deregister", name, self.calls))
+
+    class _FakeHost:
+        runtime_id = "rt_test_cf89"
+        relay = type("_R", (), {"subscribers": _FakeSubscribers("already_exists_once")})()
+
+        def retain_managed_execution(self, name):
+            calls.append(("retain", name))
+
+        def release_managed_execution(self, name):
+            calls.append(("release", name))
+
+    monkeypatch.setattr(rsm.atexit, "register", lambda fn: None)
+    fake_host: Any = _FakeHost()
+    # Positive polarity: 'already exists' triggers deregister + second register without raising
+    rt = rsm._Runtime(host=fake_host)
+    assert rt._registered is True
+    assert [c[0] for c in calls] == ["register", "deregister", "register", "retain"]
+
+    # Negative polarity: unrelated RuntimeError still raises
+    class _BadHost(_FakeHost):
+        relay = type("_R", (), {"subscribers": _FakeSubscribers("other_error")})()
+
+    bad_host: Any = _BadHost()
+    with pytest.raises(RuntimeError, match="fatal relay failure"):
+        rsm._Runtime(host=bad_host)
+
+    # Class-identity rebind across reload: pre-reload _Runtime subclass/copy in _RUNTIMES is rebound in-place
+    OldRuntime = type("_Runtime", (), {})
+    old_inst: Any = OldRuntime()
+    old_inst.host = fake_host
+    old_inst._active = True
+    monkeypatch.setattr(rsm.relay_runtime, "current_profile_key", lambda: "prof_cf89")
+    monkeypatch.setitem(rsm._RUNTIMES, "prof_cf89", old_inst)
+    got = rsm._get_runtime(retry_failed=True, host=fake_host)
+    assert got is old_inst
+    assert isinstance(got, rsm._Runtime)
+

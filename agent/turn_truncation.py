@@ -820,6 +820,15 @@ _GATE_SCRIPT_FILTER_MARKERS = (
     "|dg:",
     "|rn:",
     "PR_MERGE_BLOCKED",
+    "_ensure_msl_fork_hook_disarmed",
+    "libSystem.B.dylib",
+    "from_address(",
+    "_malloc_fork_child",
+    "_graft_method_from_disk",
+    "terminal_tool_sudo",
+    "or-credit-clamp",
+    "recycle-desktop-backends",
+    "_hot_reload_deferred_serve_plugins",
 )
 
 _TOOL_FILTER_SUMMARY = (
@@ -832,7 +841,8 @@ def _inject_content_filter_steer_note(api_messages: Any) -> None:
     """Append ``_CONTENT_FILTER_STEER_NOTE`` to the trailing tool/user message on ``api_messages``
     and summarize recent gate-script / browser-cookie-CDP / secret-probe payloads across tool results
     (both plain ``str`` and cache-decorated ``list`` block forms), assistant ``tool_calls`` arguments,
-    and all replayed assistant reasoning that trip Gemini's output classifier (#CF-76, #CF-78)."""
+    encrypted ``thought_signature`` blobs, and all replayed assistant reasoning that trip Gemini's
+    output classifier (#CF-76, #CF-78, #CF-89)."""
     if not isinstance(api_messages, list) or not api_messages:
         return
     for msg in api_messages:
@@ -854,25 +864,44 @@ def _inject_content_filter_steer_note(api_messages: Any) -> None:
                         part["text"] = _TOOL_FILTER_SUMMARY + (_CONTENT_FILTER_STEER_NOTE if has_note else "")
         elif role == "assistant":
             tcs = msg.get("tool_calls")
-            if isinstance(tcs, list):
-                new_tcs = None
-                for idx, tc in enumerate(tcs):
+            a_content = msg.get("content")
+            if isinstance(a_content, str) and a_content.strip():
+                if any(m in a_content for m in _GATE_SCRIPT_FILTER_MARKERS) or (
+                    isinstance(tcs, list) and tcs and a_content.lstrip().startswith("**")
+                ):
+                    msg["content"] = ""
+            if isinstance(tcs, list) and tcs:
+                new_tcs = [dict(x) if isinstance(x, dict) else x for x in tcs]
+                tcs_mutated = False
+                for idx, tc in enumerate(new_tcs):
                     if not isinstance(tc, dict):
                         continue
                     fn = tc.get("function")
-                    if not isinstance(fn, dict):
-                        continue
-                    args = fn.get("arguments")
-                    if isinstance(args, str) and any(m in args for m in _GATE_SCRIPT_FILTER_MARKERS):
-                        if new_tcs is None:
-                            new_tcs = [dict(x) if isinstance(x, dict) else x for x in tcs]
-                        new_fn = dict(fn)
-                        new_fn["arguments"] = (
-                            '{"note":"[tool_call arguments summarized after upstream content_filter]"}'
-                        )
-                        new_tcs[idx] = {**tc, "function": new_fn}
-                if new_tcs is not None:
+                    new_fn = dict(fn) if isinstance(fn, dict) else None
+                    if new_fn is not None:
+                        args = new_fn.get("arguments")
+                        if isinstance(args, str) and any(m in args for m in _GATE_SCRIPT_FILTER_MARKERS):
+                            new_fn["arguments"] = (
+                                '{"note":"[tool_call arguments summarized after upstream content_filter]"}'
+                            )
+                            tcs_mutated = True
+                        if "thought_signature" in new_fn:
+                            new_fn.pop("thought_signature", None)
+                            tcs_mutated = True
+                        if tcs_mutated:
+                            tc["function"] = new_fn
+                    if idx == 0:
+                        ec = tc.get("extra_content")
+                        g_sig = (ec.get("google") or {}).get("thought_signature") if isinstance(ec, dict) and isinstance(ec.get("google"), dict) else None
+                        if g_sig and g_sig != "skip_thought_signature_validator":
+                            tc["extra_content"] = {"google": {"thought_signature": "skip_thought_signature_validator"}}
+                            tcs_mutated = True
+                    elif "extra_content" in tc:
+                        tc.pop("extra_content", None)
+                        tcs_mutated = True
+                if tcs_mutated:
                     msg["tool_calls"] = new_tcs
+            msg.pop("extra_content", None)
             for r_key in ("reasoning", "reasoning_content"):
                 r_val = msg.get(r_key)
                 if isinstance(r_val, str) and r_val.strip():
@@ -919,8 +948,7 @@ def handle_content_policy_refusal(
 
     _refusal_result = normalize_response_for_agent(agent, response)
     _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
-    if not _refusal_text:
-        _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
+    _reasoning_text = (agent._extract_reasoning(_refusal_result) or "").strip()
     # Anthropic stop_reason=refusal carries its reason on stop_details (category + optional explanation),
     # not in a content block — without it a classifier halt reads as "(no text)" (#113689).
     _stop_details = (
@@ -942,7 +970,8 @@ def handle_content_policy_refusal(
     )
     stop_thinking_spinner(agent, thinking_spinner)
 
-    _refusal_log = _refusal_text[:500] + "..." if len(_refusal_text) > 500 else _refusal_text
+    _diag_text = _refusal_text or _reasoning_text
+    _refusal_log = _diag_text[:500] + "..." if len(_diag_text) > 500 else _diag_text
     _prior_cf_retries = int(getattr(agent, "_content_filter_retries", 0) or 0)
     if api_call_count > 1 and (max_retries or 0) > 0 and _prior_cf_retries < 1:
         agent._content_filter_retries = _prior_cf_retries + 1

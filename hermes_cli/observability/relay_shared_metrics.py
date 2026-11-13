@@ -265,7 +265,13 @@ class _Runtime:
         self.subscriber = SharedMetricsSubscriber(
             SharedMetricsStore(), get_version_info().base_version, runtime_id=self.host.runtime_id
         )
-        self.relay.subscribers.register(self._subscriber_name, self.subscriber)
+        try:
+            self.relay.subscribers.register(self._subscriber_name, self.subscriber)
+        except RuntimeError as exc:
+            if "already exists" not in str(exc):
+                raise
+            self.relay.subscribers.deregister(self._subscriber_name)
+            self.relay.subscribers.register(self._subscriber_name, self.subscriber)
         self.host.retain_managed_execution(self._subscriber_name)
         self._registered = True
         atexit.register(self.shutdown)
@@ -1648,8 +1654,11 @@ def _get_runtime(
     profile_key = relay_runtime.current_profile_key()
     with _RUNTIME_LOCK:
         runtime = _RUNTIMES.get(profile_key)
+        if runtime is not None and not isinstance(runtime, _Runtime) and getattr(type(runtime), "__name__", "") == "_Runtime":
+            with contextlib.suppress(Exception):
+                runtime.__class__ = _Runtime
         if isinstance(runtime, _Runtime):
-            if host is None or runtime.host is host:
+            if host is None or runtime.host is host or getattr(runtime.host, "runtime_id", None) == getattr(host, "runtime_id", None):
                 return runtime
             runtime.deactivate()
         elif runtime is _RUNTIME_FAILED and not retry_failed:
