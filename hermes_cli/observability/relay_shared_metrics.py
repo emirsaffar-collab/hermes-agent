@@ -985,6 +985,9 @@ class _Runtime:
                 output=fields, metadata=self._event_metadata(),
             )
             if popped is False:
+                defer = getattr(self.host, "defer_scope_output", None)
+                if callable(defer) and task.handle is not None:
+                    defer(task.handle, fields)
                 logger.debug("Left shared-metrics task scope %s under a concurrent turn's scope; session close drains it", task_id)
         finally:
             session.tasks.pop(task_id, None)
