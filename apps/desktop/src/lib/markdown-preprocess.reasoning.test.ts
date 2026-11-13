@@ -27,4 +27,18 @@ describe('reasoning blocks in streamed markdown', () => {
       'O texto acima explica o formato do bloco &lt;thinking&gt; sem nunca fechá-lo'
     )
   })
+
+  it('preserves inline-code and fenced-code mentions of reasoning tags while stripping code inside real thought blocks', () => {
+    const tOpen = '<' + 'think>'
+    const tClose = '</' + 'think>'
+    const inlineMention = `The model wraps thoughts in \`${tOpen}\` and closes with \`${tClose}\` before replying.`
+    expect(preprocessMarkdown(inlineMention)).toBe(inlineMention)
+
+    const fencedMention = ['Example:', '```xml', tOpen, 'sample', tClose, '```', 'Done.'].join('\n')
+    expect(preprocessMarkdown(fencedMention)).toContain(tOpen)
+    expect(preprocessMarkdown(fencedMention)).toContain('Done.')
+
+    const thoughtWithCode = `${tOpen}Let me test:\n\`\`\`ts\nconst x = 1\n\`\`\`\n${tClose}Visible answer.`
+    expect(preprocessMarkdown(thoughtWithCode)).toBe('Visible answer.')
+  })
 })

@@ -25,7 +25,7 @@ from agent.cache_bounds import publish_lru
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.route_verdicts import ROUTE_VERDICT_FIELDS, reset_route_verdicts, reset_route_verdicts_if_moved
-from agent.think_scrubber import THINK_TAG_NAMES
+from agent.think_scrubber import CODE_FENCE_OR_SPAN, THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
     STATUS_EXHAUSTED, _parse_absolute_timestamp, credential_pool_entry_serves_endpoint,
@@ -44,7 +44,7 @@ _TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call
 # Optional XML namespace prefix: some models serialize native tool calls as <ns:function_calls>.
 _NS_PREFIX = r"(?:[\w.-]+:)?"
 _REASONING_BLOCK_PATTERNS = tuple(
-    re.compile(rf"<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE) for name in THINK_TAG_NAMES
+    re.compile(rf"{CODE_FENCE_OR_SPAN}|<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE) for name in THINK_TAG_NAMES
 )
 _TOOL_CALL_BLOCK_PATTERNS = tuple(
     re.compile(rf"<{_NS_PREFIX}{name}\b[^>]*>.*?</{_NS_PREFIX}{name}>", re.DOTALL | re.IGNORECASE)
@@ -58,10 +58,10 @@ _NAMED_FUNCTION_BLOCK_PATTERN = re.compile(
     r'(?:(?:(?!</function>).)*)</function>', re.DOTALL | re.IGNORECASE,
 )
 _UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
-    rf'(?:^|\n)[ \t]*<(?:{"|".join(THINK_TAG_NAMES)})\b[^>]*>.*$', re.DOTALL | re.IGNORECASE
+    rf'{CODE_FENCE_OR_SPAN}|(?:^|\n)[ \t]*<(?:{"|".join(THINK_TAG_NAMES)})\b[^>]*>.*$', re.DOTALL | re.IGNORECASE
 )
 _ORPHAN_REASONING_TAG_PATTERN = re.compile(
-    rf'</?(?:{"|".join(THINK_TAG_NAMES)})>\s*', re.IGNORECASE
+    rf'{CODE_FENCE_OR_SPAN}|</?(?:{"|".join(THINK_TAG_NAMES)})>\s*', re.IGNORECASE
 )
 _STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
     rf'</(?:{_NS_PREFIX}(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function))>\s*', re.IGNORECASE
@@ -861,7 +861,7 @@ def strip_think_blocks(agent, content: str) -> str:
     open models emit; ``<function>`` is boundary- and ``name=``-gated so prose mentions survive."""
     content = _flatten_content_text(content) if content else ""
     for pattern in _THINK_STRIP_PATTERNS if content else ():
-        content = pattern.sub('', content)
+        content = pattern.sub(lambda m: m.group(1) if m.lastindex and m.group(1) is not None else '', content)
     return content
 
 
@@ -1470,7 +1470,7 @@ _TRANSIENT_TRANSPORT_ERRORS = frozenset({
     "APIConnectionError", "APITimeoutError",
 })
 _INLINE_REASONING_PATTERNS = tuple(
-    re.compile(rf"<{tag}>(.*?)</{tag}>", re.DOTALL | re.IGNORECASE)
+    re.compile(rf"{CODE_FENCE_OR_SPAN}|<{tag}>(.*?)</{tag}>", re.DOTALL | re.IGNORECASE)
     for tag in THINK_TAG_NAMES
 )
 
@@ -1506,8 +1506,9 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
                 _add(flatten_message_text(block.get("thinking") or block.get("text") or "", sep="").strip())
     if not parts and isinstance(content, str) and content:
         for pattern in _INLINE_REASONING_PATTERNS:
-            for block in pattern.findall(content):
-                _add(block.strip())
+            for code_span, block in pattern.findall(content):
+                if not code_span and block and block.strip():
+                    _add(block.strip())
     return "\n\n".join(parts) if parts else None
 
 

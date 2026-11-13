@@ -79,6 +79,7 @@ class Say:
     completion_tokens: int = 20
     chunk_chars: int = 16
     expire_tokens_after: bool = False  # the ~1h boundary passes right after this response
+    thought: str | None = None
 
 
 @dataclass
@@ -90,6 +91,7 @@ class Call:
     signed: bool = True
     prompt_tokens: int | None = None
     expire_tokens_after: bool = False
+    thought: str | None = None
 
 
 @dataclass
@@ -641,9 +643,15 @@ def _handler_for(fake: FakeVertex) -> type[BaseHTTPRequestHandler]:
             self.close_connection = True
 
         def _deltas(self, resp: Say | Call, record: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+            thought_deltas: list[dict[str, Any]] = (
+                [{"content": resp.thought, "extra_content": {"google": {"thought": True}}}]
+                if getattr(resp, "thought", None)
+                else []
+            )
             if isinstance(resp, Say):
                 size = max(1, resp.chunk_chars)
-                return [{"content": resp.text[i:i + size]} for i in range(0, len(resp.text), size)] or [{"content": ""}], "stop"
+                text_deltas = [{"content": resp.text[i:i + size]} for i in range(0, len(resp.text), size)] or [{"content": ""}]
+                return thought_deltas + text_deltas, "stop"
             tool_calls = []
             for pos, (name, args) in enumerate(resp.calls):
                 call_id, sig = fake.next_ids()
@@ -657,7 +665,9 @@ def _handler_for(fake: FakeVertex) -> type[BaseHTTPRequestHandler]:
             record["tool_calls"] = tool_calls
             with fake._lock:
                 fake.signature_by_call.update({tc["id"]: _first_signature(tc) for tc in tool_calls})
-            deltas: list[dict[str, Any]] = [{"content": resp.text}] if resp.text else []
+            deltas: list[dict[str, Any]] = list(thought_deltas)
+            if resp.text:
+                deltas.append({"content": resp.text})
             deltas.append({"tool_calls": tool_calls})
             return deltas, "tool_calls"
 

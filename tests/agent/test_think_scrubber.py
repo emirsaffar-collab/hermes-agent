@@ -218,3 +218,151 @@ class TestNamespacedReasoningTags:
 
         out = strip_think_blocks(None, "a <mm:think>hidden</mm:think> b. Report.</mm:think>Fixed.\n<mm:think>open")
         assert out == "a  b. Report.Fixed."
+
+
+class TestCodeFenceAndVertexGoogleThoughtGuards:
+    """Sceptic hardening for backticked tag mentions in visible prose and Vertex extra_content.google.thought."""
+
+    def test_code_span_and_fence_mentions_preserved_across_all_strippers(self) -> None:
+        from types import SimpleNamespace
+        from agent.agent_runtime_helpers import extract_reasoning, strip_think_blocks
+        from agent.turn_response_intake import _reasoning_preview
+        from cli import _strip_reasoning_tags
+
+        t_open = "<" + "think>"
+        t_close = "</" + "think>"
+
+        # 1. Inline code mentions of open + close tags must NOT truncate visible prose between them
+        prose_inline = f"The model wraps thoughts in `{t_open}` and closes with `{t_close}`, keeping all middle text."
+        assert strip_think_blocks(None, prose_inline) == prose_inline
+        assert _strip_reasoning_tags(prose_inline) == prose_inline
+        assert extract_reasoning(None, SimpleNamespace(content=prose_inline)) is None
+        assert _reasoning_preview(None, prose_inline) == ""
+
+        # 2. Fenced code block containing tags in visible prose must survive intact
+        prose_fenced = f"Example:\n```xml\n{t_open}\ninternal\n{t_close}\n```\nVisible tail."
+        assert strip_think_blocks(None, prose_fenced) == prose_fenced
+        assert _strip_reasoning_tags(prose_fenced) == prose_fenced
+        assert extract_reasoning(None, SimpleNamespace(content=prose_fenced)) is None
+
+        # 3. Real thought block containing a fenced code block MUST be stripped from visible text and extracted as reasoning
+        real_thought_with_code = f"{t_open}\nLet me check:\n```python\nx = 1\n```\n{t_close}\nVisible answer."
+        assert strip_think_blocks(None, real_thought_with_code).strip() == "Visible answer."
+        assert _strip_reasoning_tags(real_thought_with_code).strip() == "Visible answer."
+        extracted = extract_reasoning(None, SimpleNamespace(content=real_thought_with_code))
+        assert extracted is not None and "x = 1" in extracted
+
+        # 4. Single unbalanced backtick on an earlier line must NOT shield a real thought block on a later line
+        unbalanced = f"Here is a stray ` backtick.\n{t_open}secret thought{t_close}\nVisible tail."
+        assert strip_think_blocks(None, unbalanced) == "Here is a stray ` backtick.\n\nVisible tail."
+
+    def test_vertex_google_thought_routing_and_signature_preservation(self) -> None:
+        from types import SimpleNamespace
+        from agent.chat_completion_helpers_relay import RelayChatAccumulator
+        from agent.reasoning_carriers import StreamCarriers, is_google_thought
+
+        thought_delta = SimpleNamespace(
+            content="** Analyzing request **\nChecking files.",
+            extra_content={"google": {"thought": True, "thought_signature": "sig-vertex-123"}},
+        )
+        visible_delta = SimpleNamespace(
+            content="Final visible reply.",
+            extra_content={"google": {"thought_signature": "sig-vertex-456"}},
+        )
+
+        assert is_google_thought(thought_delta) is True
+        assert is_google_thought(visible_delta) is False
+
+        carriers = StreamCarriers()
+        r_text = thought_delta.content if is_google_thought(thought_delta) else None
+        r_text = carriers.feed(thought_delta, r_text)
+        assert r_text == "** Analyzing request **\nChecking files."
+        assert carriers.signature == "sig-vertex-123"
+
+        # RelayChatAccumulator (dict chunks) routes google.thought content to reasoning_content, not content
+        acc = RelayChatAccumulator()
+        acc.observe({
+            "model": "google/gemini-4-argon",
+            "choices": [{
+                "delta": {
+                    "role": "assistant",
+                    "content": "Internal Vertex thought",
+                    "extra_content": {"google": {"thought": True}},
+                },
+            }],
+        })
+        acc.observe({
+            "model": "google/gemini-4-argon",
+            "choices": [{
+                "delta": {"content": "Visible answer"},
+                "finish_reason": "stop",
+            }],
+        })
+        finalized = acc.finalize()
+        msg = finalized["choices"][0]["message"]
+        assert msg["content"] == "Visible answer"
+        assert msg["reasoning_content"] == "Internal Vertex thought"
+
+        # End-to-end _interruptible_streaming_api_call consumer test
+        from typing import Any
+        from unittest.mock import MagicMock, patch
+        from run_agent import AIAgent
+
+        agent: Any = AIAgent(
+            api_key="test-key",
+            base_url="https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi",
+            model="google/gemini-4-argon",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        emitted_text: list[str] = []
+        emitted_reasoning: list[str] = []
+        agent.stream_delta_callback = lambda t: emitted_text.append(t)
+
+        def _make_chunk(content, extra_content=None, finish_reason=None):
+            return SimpleNamespace(
+                id="chatcmpl-vertex-1",
+                choices=[
+                    SimpleNamespace(
+                        index=0,
+                        delta=SimpleNamespace(
+                            role="assistant",
+                            content=content,
+                            tool_calls=None,
+                            reasoning_content=None,
+                            reasoning=None,
+                            extra_content=extra_content,
+                        ),
+                        finish_reason=finish_reason,
+                    )
+                ],
+                model="google/gemini-4-argon",
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            )
+
+        class _StreamStandIn:
+            response = None
+            def __iter__(self):
+                yield _make_chunk(
+                    "** Analyzing **\nInternal Vertex thought.",
+                    extra_content={"google": {"thought": True, "thought_signature": "sig-e2e-999"}},
+                )
+                yield _make_chunk("Visible final answer.", finish_reason="stop")
+            def close(self):
+                pass
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _StreamStandIn()
+        with patch.object(agent, "_create_request_openai_client", return_value=mock_client), \
+             patch.object(agent, "_close_request_openai_client"), \
+             patch.object(agent, "_fire_reasoning_delta", side_effect=lambda r: emitted_reasoning.append(r)):
+            response = agent._interruptible_streaming_api_call({})
+
+        assert "".join(emitted_text) == "Visible final answer."
+        assert "".join(emitted_reasoning) == "** Analyzing **\nInternal Vertex thought."
+        msg_obj = response.choices[0].message
+        assert msg_obj.content == "Visible final answer."
+        assert msg_obj.reasoning_content == "** Analyzing **\nInternal Vertex thought."
+        assert msg_obj.extra_content == {"google": {"thought_signature": "sig-e2e-999"}}

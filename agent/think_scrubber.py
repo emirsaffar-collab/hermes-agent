@@ -13,7 +13,18 @@ from __future__ import annotations
 import re
 from typing import Tuple
 
-__all__ = ["THINK_CLOSE_TAGS", "THINK_OPEN_TAGS", "THINK_TAG_NAMES", "StreamingThinkScrubber"]
+__all__ = [
+    "CODE_FENCE_OR_SPAN",
+    "THINK_CLOSE_TAGS",
+    "THINK_OPEN_TAGS",
+    "THINK_TAG_NAMES",
+    "StreamingThinkScrubber",
+]
+
+# Left-to-right regex alternation branch matching fenced code blocks or single-line inline code spans
+# so post-stream regex strippers/extractors never treat backtick-quoted tag mentions in visible prose
+# as real reasoning delimiters while still stripping code blocks nested INSIDE outer reasoning blocks.
+CODE_FENCE_OR_SPAN: str = r"(```[\s\S]*?```|`[^`\n]+`)"
 
 # The one list of model reasoning tag names. Every surface that hides reasoning (this scrubber,
 # the CLI stream filter, the gateway stream filter, the final-response regex stripper) binds to
