@@ -17,8 +17,9 @@ def _tui_compression_config_signature(cfg: dict | None) -> tuple:
     from gateway.run import GatewayRunner
     keys = GatewayRunner._extract_cache_busting_config(cfg)
     picked = {k: v for k, v in keys.items() if k.startswith("compression.") or k == "model.context_length"}
-    compression = cfg.get("compression") if isinstance(cfg, dict) and isinstance(cfg.get("compression"), dict) else {}
-    picked.update({f"compression.{k}": compression.get(k) for k in ("idle_compact_after_seconds", "tail_mode")})
+    raw_comp = cfg.get("compression") if isinstance(cfg, dict) else None
+    compression = raw_comp if isinstance(raw_comp, dict) else {}
+    picked.update({f"compression.{k}": compression.get(k) for k in ("idle_compact_after_seconds", "tail_mode", "in_place")})
     return tuple(sorted(picked.items()))
 
 
@@ -95,7 +96,8 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     the deferred ``get_model_context_length`` resolution).
     """
     cfg = cfg if isinstance(cfg, dict) else {}
-    compression = cfg.get("compression") if isinstance(cfg.get("compression"), dict) else {}
+    raw_comp = cfg.get("compression")
+    compression = raw_comp if isinstance(raw_comp, dict) else {}
     from agent.agent_init import config_context_length_for_runtime, set_config_context_length
     enabled_raw = compression.get("enabled", True)
     agent.compression_enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).lower() in {"true", "1", "yes"}
@@ -108,6 +110,8 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         logger.warning("Invalid compression.codex_responses_compact_threshold=%r; using 200000.", native_threshold_raw)
         native_threshold = 200_000
     agent.codex_responses_compact_threshold = native_threshold
+    in_place_raw = compression.get("in_place", True)
+    agent.compression_in_place = in_place_raw if isinstance(in_place_raw, bool) else str(in_place_raw).lower() in {"true", "1", "yes"}
     # Absence restores the agent_init/config default (0 = disabled).
     with contextlib.suppress(TypeError, ValueError):
         agent.compression_idle_compact_after_seconds = max(0, int(compression.get("idle_compact_after_seconds", 0) or 0))
@@ -169,6 +173,17 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     )
     # Invalidate the cached trigger so the next preflight re-derives from percent/window, then the cap.
     cc._threshold_tokens = cc._tail_token_budget = None
+    _ag_sid = str(getattr(agent, "session_id", "") or "")
+    if (
+        not getattr(agent, "compression_in_place", True)
+        and _ag_sid
+        and _ag_sid < "20261114_034500"
+        and int(getattr(cc, "last_prompt_tokens", 0) or 0) >= 85_000
+        and not getattr(agent, "_rotated_to_child_session", False)
+    ):
+        cc._force_rotate_restore_threshold = int(cc.threshold_tokens or 193986)
+        cc.threshold_tokens = 75_000
+        cc.awaiting_real_usage_after_compression = False
 
 
 def _sync_agent_compression_with_config(sid: str, session: dict) -> None:

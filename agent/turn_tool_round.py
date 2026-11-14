@@ -267,6 +267,13 @@ def run_tool_round(
         except Exception as _prog_exc:
             logger.debug("iteration_budget extend_on_progress check failed: %s", _prog_exc)
 
+    _cc_tr = getattr(agent, "context_compressor", None)
+    if (
+        int(getattr(_cc_tr, "_force_rotate_restore_threshold", 0) or 0) > 0
+        and not getattr(agent, "_rotated_to_child_session", False)
+    ):
+        compression_attempts = 0
+    _pre_ptc_sid = getattr(agent, "session_id", None)
     _ptc = compress_after_tool_results(
         agent, messages=messages, system_message=system_message, user_message=user_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,
@@ -278,7 +285,7 @@ def run_tool_round(
     messages = _ptc.messages
     active_system_prompt = _ptc.active_system_prompt
     conversation_history = _ptc.conversation_history
-    compression_attempts = _ptc.compression_attempts
+    compression_attempts = 0 if getattr(agent, "session_id", None) != _pre_ptc_sid else _ptc.compression_attempts
     final_response = _ptc.final_response
     _turn_exit_reason = _ptc.turn_exit_reason
     current_turn_user_idx = _ptc.current_turn_user_idx

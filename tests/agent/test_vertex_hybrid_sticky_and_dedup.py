@@ -105,3 +105,31 @@ def test_seed_file_dedup_from_messages_seeds_surviving_reads(tmp_path):
     ftrt.reset_file_dedup(tid, surviving_messages=messages)
     _, _, stub_eligible = ftrt._dedup_lookup(tid, dedup_key)
     assert stub_eligible is True
+
+
+def test_post_compaction_sentinel_preserves_europe_west2_affinity_and_clears_global():
+    vertex_adapter.reset_vertex_hybrid_router_state()
+    vertex_adapter._record_session_vertex_region_affinity("child_ew2", "europe-west2")
+    region, slot = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="child_ew2",
+        last_prompt_tokens=-1,
+    )
+    assert region == "europe-west2"
+    assert slot is True
+    vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
+
+    vertex_adapter._record_session_vertex_region_affinity("stuck_global", "global")
+    region_g, slot_g = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="stuck_global",
+        last_prompt_tokens=-1,
+    )
+    assert region_g == "europe-west2"
+    assert slot_g is True
+    vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
+

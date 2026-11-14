@@ -214,11 +214,13 @@ def acquire_vertex_hybrid_region(
     if is_vertex_global_only_model(model):
         return (GLOBAL_VERTEX_REGION, False)
     prompt_tok = int(last_prompt_tokens or 0)
-    if prompt_tok == -1:
-        reset_vertex_sticky_region(session_id)
-        prompt_tok = 0
     raw_sid = str(session_id or "")
     pinned_region = get_session_vertex_region_affinity(session_id)
+    if prompt_tok == -1:
+        if pinned_region == GLOBAL_VERTEX_REGION:
+            reset_vertex_sticky_region(session_id)
+            pinned_region = None
+        prompt_tok = 0
     is_bg_review_for_ew2_parent = (
         pinned_region == EUROPE_WEST2_VERTEX_REGION
         and (bool(raw_sid) or ":bg-review:" in raw_sid)

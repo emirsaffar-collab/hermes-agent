@@ -3379,6 +3379,19 @@ def _publish_rotated_compaction(
         if isinstance(_handoff_message, dict):
             _handoff_message[_DB_PERSISTED_MARKER] = True
     agent.session_id = new_session_id
+    agent._rotated_to_child_session = True
+    _cc_rot = getattr(agent, "context_compressor", None)
+    if _cc_rot is not None and int(getattr(_cc_rot, "_force_rotate_restore_threshold", 0) or 0) > 0:
+        _cc_rot.threshold_tokens = int(_cc_rot._force_rotate_restore_threshold)
+        _cc_rot._force_rotate_restore_threshold = 0
+    with contextlib.suppress(Exception):
+        from agent.vertex_adapter import (
+            EUROPE_WEST2_VERTEX_REGION,
+            _record_session_vertex_region_affinity,
+            reset_vertex_sticky_region,
+        )
+        reset_vertex_sticky_region(old_session_id)
+        _record_session_vertex_region_affinity(new_session_id, EUROPE_WEST2_VERTEX_REGION)
     agent._db_flush_scan_prefix = None
     _rebind_session_context(agent.session_id)
     agent._session_db_created = True

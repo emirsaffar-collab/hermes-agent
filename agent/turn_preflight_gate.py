@@ -62,6 +62,12 @@ def run_preflight_gate(
     # them. Mirror the turn-prologue guard chain: defer on noisy estimate, skip in
     # failure cooldown, then should_compress().
     _compressor = agent.context_compressor
+    if (
+        int(getattr(_compressor, "_force_rotate_restore_threshold", 0) or 0) > 0
+        and not getattr(agent, "_rotated_to_child_session", False)
+    ):
+        v.compression_attempts = 0
+        v._preflight_compression_blocked = False
     _preflight_threshold = int(getattr(_compressor, "threshold_tokens", 0) or 0)
     _provider_overflow_preflight = _provider_overflow_recovery_pending and (
         _preflight_threshold <= 0 or request_pressure_tokens >= _preflight_threshold
@@ -88,7 +94,8 @@ def run_preflight_gate(
             f"{_last_preflight_pressure:,}",
             f"{request_pressure_tokens:,}",
         )
-    return run_preflight_compression(
+    _pre_gate_sid = getattr(agent, "session_id", None)
+    _res = run_preflight_compression(
         agent, v, compressor=_compressor, request_pressure_tokens=request_pressure_tokens,
         provider_overflow_preflight=_provider_overflow_preflight,
         # An anchored figure is real usage + delta: never deferred. Only a whole-context rough
@@ -100,3 +107,6 @@ def run_preflight_gate(
         user_message=user_message, max_compression_attempts=max_compression_attempts,
         effective_task_id=effective_task_id,
     )
+    if getattr(agent, "session_id", None) != _pre_gate_sid:
+        _res.compression_attempts = 0
+    return _res
