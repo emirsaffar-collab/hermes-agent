@@ -45,8 +45,8 @@ def _compressor(**kw: Any) -> ContextCompressor:
         return ContextCompressor(**defaults)
 
 
-def _history(n_pairs: int = 8, big: int = 9_000) -> List[Dict[str, Any]]:
-    msgs: List[Dict[str, Any]] = [{"role": "system", "content": "sys"}]
+def _history(n_pairs: int = 8, big: int = 9_000) -> list[dict[str, Any]]:
+    msgs: list[dict[str, Any]] = [{"role": "system", "content": "sys"}]
     for i in range(n_pairs):
         cid = f"call_{i}"
         msgs.append({
@@ -77,7 +77,7 @@ def _over_threshold_warnings(caplog) -> list:
 def test_lockout_warning_fires_once_per_dedup_key(caplog) -> None:
     """The chat warning rides the log's own dedup key: once per distinct state,
     never once per tool iteration."""
-    emitted: List[str] = []
+    emitted: list[str] = []
     c = _compressor(
         proactive_prune_min_reclaim_tokens=10_000_000,
         reclaim_lockout_warning_callback=emitted.append,
@@ -100,7 +100,7 @@ def test_lockout_warning_fires_once_per_dedup_key(caplog) -> None:
 def test_lockout_warning_refires_after_rearm_reset() -> None:
     """A rearm boundary (compaction / session reset / model recalibration)
     releases the dedup key — an identical later lockout warns in chat again."""
-    emitted: List[str] = []
+    emitted: list[str] = []
     c = _compressor(
         proactive_prune_min_reclaim_tokens=10_000_000,
         reclaim_lockout_warning_callback=emitted.append,
@@ -119,7 +119,7 @@ def test_lockout_warning_refires_after_rearm_reset() -> None:
 
 def test_lockout_warning_suppressed_under_threshold(caplog) -> None:
     """Ordinary hysteresis below the threshold stays quiet on the chat rail too."""
-    emitted: List[str] = []
+    emitted: list[str] = []
     c = _compressor(
         proactive_prune_min_reclaim_tokens=10_000_000,
         reclaim_lockout_warning_callback=emitted.append,
@@ -184,7 +184,7 @@ def test_lockout_warning_passes_gateway_chat_filter(platform) -> None:
     import gateway.run as gateway_run
     from gateway.run import _prepare_gateway_status_message
 
-    with patch.object(gateway_run, "_load_gateway_config", lambda: {}):
+    with patch.object(gateway_run, "_load_gateway_config", dict):
         assert (
             _prepare_gateway_status_message(platform, "warn", RECLAMATION_LOCKOUT_WARNING)
             == RECLAMATION_LOCKOUT_WARNING
@@ -234,4 +234,32 @@ def test_pre_compaction_opportunistic_prune_suppresses_lockout_warning(caplog) -
     assert out2 is msgs
     assert emitted == [RECLAMATION_LOCKOUT_WARNING]
     assert len(_over_threshold_warnings(caplog)) == 1
+
+
+def test_over_threshold_pre_compaction_prune_uses_tail_token_budget() -> None:
+    """When oversized tool results sit inside `protect_last_n` (e.g. last 20 messages)
+    and push the request over `threshold_tokens`, default sub-threshold prune
+    (`warn_on_noop=True`) protects them by message count, whereas pre-compaction
+    opportunistic prune (`warn_on_noop=False`) falls back to `tail_token_budget`
+    so Phase-1 pruning reclaims them without calling the LLM summarizer."""
+    c = _compressor(
+        protect_last_n=20,
+        proactive_prune_min_reclaim_tokens=4_096,
+    )
+    c.tail_token_budget = 2_000
+    # 8 tool pairs = 17 messages total (<= protect_last_n=20, > _MAX_TAIL_MESSAGE_FLOOR=8),
+    # with 30k-char tool payloads in pairs 0..2.
+    msgs = _history(n_pairs=8, big=30_000)
+    billed = c.threshold_tokens + 5_000
+
+    # Ordinary count-protected prune (`warn_on_noop=True`) declines (`prune:tail_only`).
+    out_default, n_default = c.prune_tool_results_only(msgs, current_tokens=billed, warn_on_noop=True)
+    assert (out_default, n_default) == (msgs, 0)
+
+    # Pre-compaction opportunistic prune (`warn_on_noop=False`) falls back to
+    # `tail_token_budget` and prunes the oversized tool outputs deterministically.
+    out_pre, n_pre = c.prune_tool_results_only(msgs, current_tokens=billed, warn_on_noop=False)
+    assert n_pre >= 3
+    assert out_pre is not msgs
+
 

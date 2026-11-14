@@ -63,11 +63,22 @@ class ProactivePruneMixin:
         """
         if not self.would_proactively_prune(current_tokens):
             return messages, 0
-        if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
+        _cc_ = _cc()
+        _over_threshold_pre_compaction = (
+            not warn_on_noop
+            and self._billed_basis_over_threshold(current_tokens)
+            and int(getattr(self, "tail_token_budget", 0) or 0) > 0
+        )
+        _min_tail_count = (
+            min(self.protect_last_n, _cc_._MAX_TAIL_MESSAGE_FLOOR)
+            if _over_threshold_pre_compaction
+            else self.protect_last_n
+        )
+        if len(messages) <= _min_tail_count + self._protect_head_size(messages) + 1:
             if warn_on_noop:
                 self._warn_reclamation_no_op("prune:tail_only", current_tokens)
             return messages, 0
-        _estimate_msg_budget_tokens = _cc()._estimate_msg_budget_tokens
+        _estimate_msg_budget_tokens = _cc_._estimate_msg_budget_tokens
         before = sum(_estimate_msg_budget_tokens(m) for m in messages)
         # Under-threshold runway skip is ordinary hysteresis (silent); above it the lockout is the bug.
         if before < self._proactive_prune_rearm_tokens and not self._billed_basis_over_threshold(current_tokens):
@@ -83,15 +94,33 @@ class ProactivePruneMixin:
             messages, protect_tail_count=self.protect_last_n, protect_tail_tokens=None, min_prune_chars=self.proactive_prune_min_result_chars,
         )
         from agent.context_compressor_tail import with_pruned_row_skill_safety_rule
-        pruned_msgs = with_pruned_row_skill_safety_rule(messages, pruned_msgs)
+        if pruned_count:
+            pruned_msgs = with_pruned_row_skill_safety_rule(messages, pruned_msgs)
+            after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
+            reclaimed = max(0, before - after)
+        else:
+            after = before
+            reclaimed = 0
+        if (
+            _over_threshold_pre_compaction
+            and (not pruned_count or reclaimed < self.proactive_prune_min_reclaim_tokens)
+        ):
+            pruned_msgs, pruned_count = self._prune_old_tool_results(
+                messages,
+                protect_tail_count=self.protect_last_n,
+                protect_tail_tokens=int(self.tail_token_budget),
+                min_prune_chars=self.proactive_prune_min_result_chars,
+            )
+            if pruned_count:
+                pruned_msgs = with_pruned_row_skill_safety_rule(messages, pruned_msgs)
+                after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
+                reclaimed = max(0, before - after)
         if not pruned_count:
             # No-op contract: return the INPUT object so callers can gate on `result is not input`.
             if warn_on_noop:
                 self._warn_reclamation_no_op("prune:nothing_eligible", current_tokens)
             return messages, 0
         # Prompt-cache hysteresis: commit only when the reclaim is meaningful.
-        after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
-        reclaimed = max(0, before - after)
         if reclaimed < self.proactive_prune_min_reclaim_tokens:
             if warn_on_noop:
                 self._warn_reclamation_no_op("prune:reclaim_below_minimum", current_tokens, before=before)

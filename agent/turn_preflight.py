@@ -90,9 +90,10 @@ def run_preflight_compression(
     closed (llama.cpp may silently truncate)."""
     from agent.conversation_loop import (
         _COMPRESSION_TIMEOUT_FINAL_RESPONSE, _HANDOFF_SKIP_FINAL_RESPONSE,
-        _compression_deferred_result, _maybe_grow_local_window, _provider_overflow_exhausted_result,
-        _should_skip_model_call_for_reference_handoff,
+        _compression_deferred_result, _maybe_grow_local_window, _midturn_request_pressure_tokens,
+        _provider_overflow_exhausted_result, _should_skip_model_call_for_reference_handoff,
     )
+    from agent.model_metadata import estimate_request_tokens_rough
 
     def _done(action: str, result: Optional[dict[str, Any]] = None) -> PreflightGateVerdict:
         v.action, v.result = action, result
@@ -133,6 +134,32 @@ def run_preflight_compression(
             _apply_grown_window(agent, compressor, _grown_window)
             v.api_call_count = _refund_api_call(agent, v.api_call_count)
             return _done("continue")
+        _proactive_cfg = getattr(compressor, "proactive_prune_tokens", 0)
+        if (
+            isinstance(_proactive_cfg, int)
+            and not isinstance(_proactive_cfg, bool)
+            and _proactive_cfg > 0
+            and request_pressure_tokens >= _proactive_cfg
+        ):
+            _pre_pruned = _proactive_tool_result_prune(
+                agent, compressor, v.messages, request_pressure_tokens, warn_on_noop=False
+            )
+            if _pre_pruned is not v.messages:
+                v.messages = _pre_pruned
+                v.conversation_history = conversation_history_after_compression(
+                    agent, v.messages, v.conversation_history
+                )
+                _reset_retry_state_after_compaction(agent)
+                _reset_read_dedup_caches(
+                    effective_task_id, session_id=agent.session_id or "", surviving_messages=v.messages
+                )
+                request_pressure_tokens = _midturn_request_pressure_tokens(
+                    agent, v.messages, v.active_system_prompt or "",
+                    estimate_request_tokens_rough(v.messages, tools=agent.tools or None),
+                )
+                if not compressor.should_compress(request_pressure_tokens):
+                    v.api_call_count = _refund_api_call(agent, v.api_call_count)
+                    return _done("continue")
         if moa_prepared_request is not None:
             v.pending_moa_prepared_request = moa_prepared_request
         v.compression_attempts += 1
@@ -341,6 +368,7 @@ def compress_after_tool_results(
         and isinstance(_proactive_cfg, int)
         and not isinstance(_proactive_cfg, bool)
         and _proactive_cfg > 0
+        and _real_tokens >= _proactive_cfg
         and not bool(getattr(_compressor, "awaiting_real_usage_after_compression", False))
         and _compressor.should_compress(_real_tokens)
     ):

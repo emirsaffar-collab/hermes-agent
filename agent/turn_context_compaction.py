@@ -369,6 +369,31 @@ def _preflight_compression(
         if _grown:
             _apply_grown_window(agent, _compressor, _grown)
             _should_compress_now = _compressor.should_compress(_preflight_tokens)
+    _proactive_cfg = getattr(_compressor, "proactive_prune_tokens", 0)
+    if (
+        _should_compress_now
+        and isinstance(_proactive_cfg, int)
+        and not isinstance(_proactive_cfg, bool)
+        and _proactive_cfg > 0
+        and _preflight_tokens >= _proactive_cfg
+        and not bool(getattr(_compressor, "awaiting_real_usage_after_compression", False))
+    ):
+        from agent.turn_preflight import _proactive_tool_result_prune
+
+        _pre_pruned = _proactive_tool_result_prune(
+            agent, _compressor, out.messages, _preflight_tokens, warn_on_noop=False
+        )
+        if _pre_pruned is not out.messages:
+            out.messages = _pre_pruned
+            out.compressed = True
+            out.conversation_history = conversation_history_after_compression(
+                agent, out.messages, out.conversation_history
+            )
+            _reset_retry_state_after_compaction(agent)
+            _preflight_tokens = _tc._preflight_request_tokens(
+                agent, out.messages, out.active_system_prompt or ""
+            )
+            _should_compress_now = _compressor.should_compress(_preflight_tokens)
     if _should_compress_now:
         _run_preflight_passes(
             agent, out, _compressor, _preflight_tokens, system_message, effective_task_id
