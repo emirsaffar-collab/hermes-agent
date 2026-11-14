@@ -51,6 +51,7 @@ _TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id
 # (home, event, matcher, command) wired in this process: matcher in the key (one script may register
 # per-tool under one event), home so multiplexed-gateway profiles can register identical triples.
 _registered: set[tuple[str, str, Optional[str], str]] = set()
+_logged_registrations: set[tuple[str, str, Optional[str], str]] = set()
 _registered_lock = threading.Lock()
 # Non-POSIX fallback for allowlist read-modify-write; separate from _registered_lock so an allowlist
 # write never waits on (or nests inside) a registry update.
@@ -235,6 +236,7 @@ def sync_from_config(load_cfg: Callable[[], dict[str, Any]]) -> None:
             keep = {_key(home_key, spec) for spec in wanted}
             stale = {k for k in _registered if k[0] == home_key and k not in keep}
             _registered.difference_update(stale)
+            _logged_registrations.difference_update(stale)
             for event in {k[1] for k in stale}:
                 # Replaced, never edited in place: a concurrent invoke_hook keeps iterating the old list.
                 manager._hooks[event] = [cb for cb in manager._hooks.get(event, [])
@@ -306,8 +308,10 @@ def _wire(manager: Any, home_key: str, specs: list[ShellHookSpec]) -> list[Shell
         manager._hooks.setdefault(spec.event, []).append(callback)
         _registered.add(key)
         registered.append(spec)
-        logger.info("shell hook registered: %s -> %s (matcher=%s, timeout=%ds, fail_closed=%s)",
-                    spec.event, spec.command, spec.matcher, spec.timeout, spec.fail_closed)
+        log_fn = logger.debug if key in _logged_registrations else logger.info
+        _logged_registrations.add(key)
+        log_fn("shell hook registered: %s -> %s (matcher=%s, timeout=%ds, fail_closed=%s)",
+               spec.event, spec.command, spec.matcher, spec.timeout, spec.fail_closed)
     return registered
 
 
@@ -363,6 +367,7 @@ def reset_for_tests() -> None:
     global _process_accept
     with _registered_lock:
         _registered.clear()
+        _logged_registrations.clear()
     _launch_consent.clear()
     _skip_logged.clear()
     _process_accept = False
