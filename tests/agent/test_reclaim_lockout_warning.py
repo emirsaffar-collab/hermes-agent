@@ -198,3 +198,40 @@ def test_lockout_warning_never_matches_noisy_status_regex() -> None:
     import gateway.run as gateway_run
 
     assert not gateway_run._TELEGRAM_NOISY_STATUS_RE.search(RECLAMATION_LOCKOUT_WARNING)
+
+
+def test_pre_compaction_opportunistic_prune_suppresses_lockout_warning(caplog) -> None:
+    """When full LLM compaction is eligible and about to run right after the
+    opportunistic pre-compaction prune (`warn_on_noop=False`), a no-op prune
+    over threshold must NOT emit a false `Context lockout` warning or poison
+    the dedup key before `agent._compress_context` runs."""
+    from types import SimpleNamespace
+    from agent.turn_preflight import _proactive_tool_result_prune
+
+    emitted: list[str] = []
+    c = _compressor(
+        proactive_prune_min_reclaim_tokens=10_000_000,
+        reclaim_lockout_warning_callback=emitted.append,
+    )
+    msgs = _history()
+    billed = c.threshold_tokens + 5_000
+    agent = SimpleNamespace(compression_checkpoint_required=False, session_id="s1")
+
+    with caplog.at_level(logging.WARNING, logger="agent.context_compressor"):
+        out = _proactive_tool_result_prune(
+            agent, c, msgs, billed, warn_on_noop=False
+        )
+    assert out is msgs
+    assert emitted == []
+    assert not _over_threshold_warnings(caplog)
+
+    # Because the dedup key was not poisoned by the suppressed pre-compaction
+    # check, a later genuinely blocked turn (`warn_on_noop=True`) still warns.
+    with caplog.at_level(logging.WARNING, logger="agent.context_compressor"):
+        out2 = _proactive_tool_result_prune(
+            agent, c, msgs, billed, warn_on_noop=True
+        )
+    assert out2 is msgs
+    assert emitted == [RECLAMATION_LOCKOUT_WARNING]
+    assert len(_over_threshold_warnings(caplog)) == 1
+

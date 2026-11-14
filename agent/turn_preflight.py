@@ -337,13 +337,16 @@ def compress_after_tool_results(
     _proactive_cfg = getattr(_compressor, "proactive_prune_tokens", 0)
     if (
         agent.compression_enabled
+        and compression_attempts < max_compression_attempts
         and isinstance(_proactive_cfg, int)
         and not isinstance(_proactive_cfg, bool)
         and _proactive_cfg > 0
         and not bool(getattr(_compressor, "awaiting_real_usage_after_compression", False))
         and _compressor.should_compress(_real_tokens)
     ):
-        _pre_pruned = _proactive_tool_result_prune(agent, _compressor, messages, _real_tokens)
+        _pre_pruned = _proactive_tool_result_prune(
+            agent, _compressor, messages, _real_tokens, warn_on_noop=False
+        )
         if _pre_pruned is not messages:
             messages = _pre_pruned
             _reset_read_dedup_caches(
@@ -444,10 +447,22 @@ def compress_after_tool_results(
     return _verdict(False)
 
 
-def _proactive_tool_result_prune(agent: Any, compressor: Any, messages: list, current_tokens: int) -> list:
+def _proactive_tool_result_prune(
+    agent: Any,
+    compressor: Any,
+    messages: list,
+    current_tokens: int,
+    *,
+    warn_on_noop: bool = True,
+) -> list:
     """Proactive tool-result prune (deterministic, no LLM, keeps tail): the pruned list when one
     committed, else the same ``messages`` object. No-op unless proactive_prune_tokens is exceeded;
     commits only past proactive_prune_min_reclaim_tokens so cache breaks stay episodic.
+
+    When ``warn_on_noop=False`` (opportunistic pre-compaction prune when full LLM compaction is
+    eligible and will immediately run if this cheap prune declines), over-threshold reclamation
+    lockout warnings are suppressed so a normal compaction turn never emits a false
+    ``Context lockout: this conversation can't be compressed`` warning right before compressing.
 
     Withheld while compression.checkpoint_required is armed: the prune rewrites the durable
     transcript between compactions, so no checkpoint precedes it. Gating here, not in the
@@ -462,14 +477,35 @@ def _proactive_tool_result_prune(agent: Any, compressor: Any, messages: list, cu
         if _prune_would_have_run(compressor, current_tokens):
             _record_checkpoint_gate_suppression(agent, "the proactive tool-result prune")
         return messages
-    prune = getattr(compressor, "prune_tool_results_only", None)
+    prune: Any = getattr(compressor, "prune_tool_results_only", None)
     if not callable(prune):
         return messages
+    _had_own_warn = False
+    _orig_warn = None
+    _shadowed_warn = False
+    if not warn_on_noop:
+        try:
+            _had_own_warn = "_warn_reclamation_no_op" in getattr(compressor, "__dict__", {})
+            _orig_warn = getattr(compressor, "_warn_reclamation_no_op", None)
+            compressor._warn_reclamation_no_op = lambda *a, **kw: None
+            _shadowed_warn = True
+        except Exception:
+            _shadowed_warn = False
     try:
-        pruned_msgs, pruned_n = prune(messages, current_tokens=current_tokens)
+        _prune_res: Any = prune(messages, current_tokens=current_tokens)
+        pruned_msgs, pruned_n = _prune_res
     except Exception:
         logger.debug("proactive tool-result prune failed; skipping", exc_info=True)
         return messages
+    finally:
+        if _shadowed_warn:
+            try:
+                if _had_own_warn:
+                    compressor._warn_reclamation_no_op = _orig_warn
+                else:
+                    delattr(compressor, "_warn_reclamation_no_op")
+            except Exception:
+                pass
     # Standard no-op caller contract: only commit when the engine returned a NEW list object
     # with a non-zero count. Do NOT rebuild conversation_history: rows already carry
     # _DB_PERSISTED_MARKER, and on a stale in-place flag the helper could seed unpersisted rows.
