@@ -782,12 +782,20 @@ def _unstage_refused_images(session) -> int:
 
 def _lock_in_submit_turn(
     rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind):
-    """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
-    cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
+    """Under ``history_lock``: refuse watch-child races / malformed truncation / lost ownership, apply
+    the cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``; ``err`` is the
+    ownership refusal itself (a str) when an idle-released lease cannot be re-claimed."""
     fields = {}
     with _session_turn_admission(session) as admitted:
         if not admitted:
             return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
+        # The ownership check above ran before this lock: the idle reaper (which releases under it) may have
+        # freed the lease since, and another surface claimed and extended the transcript. Re-claim here,
+        # before the cut and the turn's writes; a refusal (an ActiveSessionRefusal str) writes nothing.
+        try:
+            _require_transcript_owner(session)
+        except SessionNotOwned as exc:
+            return exc.refusal, fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(
@@ -804,12 +812,40 @@ def _lock_in_submit_turn(
             if err is not None:
                 return err, {}
         session["running"] = True
+        session.pop("_notif_turn_claim", None)  # a stale dispatcher claim never releases this turn
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         if hosted_task is not None:
             session["_hosted_room_task"] = dict(hosted_task)
         _start_inflight_turn(session, text, display_kind=display_kind)
     return None, fields
+
+
+def _claim_submit_turn(
+    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
+    internal_hosted_submit):
+    """``_lock_in_submit_turn``, with an ownership refusal answered like the precheck's (outside history_lock:
+    the ledger-owner forward and image unstaging take it)."""
+    err, fields = _lock_in_submit_turn(
+        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
+    if isinstance(err, str):  # the idle reaper released the lease after the precheck; nothing was written
+        if getattr(err, "reason", None) == "SESSION_NOT_OWNED" and not internal_hosted_submit:
+            import types as _types
+            from tui_gateway.sibling_serve_forward import (
+                SIBLING_LEASE_RECLAIMED, try_submit_to_sibling_serve_owner,
+            )
+            sibling_resp = try_submit_to_sibling_serve_owner(
+                _types.SimpleNamespace(**globals()), rid, sid, session, text, params, display_kind,
+            )
+            if sibling_resp is SIBLING_LEASE_RECLAIMED:
+                err, fields = _lock_in_submit_turn(
+                    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
+                if not isinstance(err, str):
+                    return err, fields
+            elif sibling_resp is not None:
+                return sibling_resp, {}
+        return _slot_refusal(rid, sid, session, text, params, err, internal_hosted_submit), {}
+    return err, fields
 
 
 # Per-turn client surfaces that carry a model-bound note (session_notifications._hud_surface_note);
@@ -872,6 +908,7 @@ def _(rid, params: dict) -> dict:
                 _types.SimpleNamespace(**globals()), rid, sid, session, text, params, display_kind,
             )
             if sibling_resp is not None and sibling_resp is not SIBLING_LEASE_RECLAIMED:
+                session["client_surface"] = prev_client_surface
                 return sibling_resp
             if sibling_resp is SIBLING_LEASE_RECLAIMED:
                 limit_message = None
@@ -880,12 +917,6 @@ def _(rid, params: dict) -> dict:
             # Refused HERE — before the busy queue, db row and agent build — so a refusal
             # leaves the session untouched.  The reason travels as machine-readable data.
             return _slot_refusal(rid, sid, session, text, params, limit_message, internal_hosted_submit)
-    # Live-voice delegations carry the recent spoken transcript for the MODEL INPUT only (the persisted
-    # user row stays the words the user said); anything else clears it.
-    voice_context = params.get("voice_context")
-    session["voice_live_context"] = (
-        voice_context[:6000] if session["client_surface"] == "voice-live" and isinstance(voice_context, str) else "")
-    session["voice_turn"] = params.get("voice_turn") is True
     has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)
     is_mobile_turn = (
         session.get("client_surface") == "mobile"
@@ -900,12 +931,14 @@ def _(rid, params: dict) -> dict:
             text = _expand_skill_invocation_for_replay(text, str(session.get("session_key") or ""))
     turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
     if internal_hosted_submit and turn_isolation:
+        session["client_surface"] = prev_client_surface
         return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
     # Re-bind to the current transport: streaming must stay on the active websocket even
     # if a disconnect/fallback moved the session to stdio. Through _rebind_live_transport so a
     # socket that already closed cannot cancel the orphan reap without coming back (#116464).
     with _session_resume_lock:
         if (refusal := _reattach_refusal(rid, sid, session)) is not None:
+            session["client_surface"] = prev_client_surface
             return refusal
         if (t := current_transport()) is not None:
             _rebind_live_transport(sid, session, t)
@@ -919,6 +952,7 @@ def _(rid, params: dict) -> dict:
             if not session.get("running"):
                 break
             if internal_hosted_submit:
+                session["client_surface"] = prev_client_surface
                 return _err(rid, 4091, "hosted room member session is busy")
             busy_transport = t or session.get("transport")
         if has_truncation:
@@ -928,6 +962,7 @@ def _(rid, params: dict) -> dict:
             # Signal busy so the caller's own interrupt-then-retry loop (already
             # built for exactly this race — see desktop's `runRewindSubmit`) waits
             # for `running` to clear and resubmits with the truncation intact.
+            session["client_surface"] = prev_client_surface
             return _err(rid, 4009, "session busy")
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
@@ -938,10 +973,18 @@ def _(rid, params: dict) -> dict:
     requested_rebind_ids = (
         {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
         if isinstance(raw_rebind_ids, list) else None)
-    err, survivor_fields = _lock_in_submit_turn(
-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
+    err, survivor_fields = _claim_submit_turn(
+        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
+        internal_hosted_submit)
     if err is not None:
+        session["client_surface"] = prev_client_surface
         return err
+    # Live-voice delegations carry the recent spoken transcript for the MODEL INPUT only (the persisted
+    # user row stays the words the user said); anything else clears it.
+    voice_context = params.get("voice_context")
+    session["voice_live_context"] = (
+        voice_context[:6000] if session["client_surface"] == "voice-live" and isinstance(voice_context, str) else "")
+    session["voice_turn"] = params.get("voice_turn") is True
     if turn_isolation:
         if turn_author:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
