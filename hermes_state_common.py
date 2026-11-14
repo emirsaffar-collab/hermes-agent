@@ -957,6 +957,18 @@ CREATE INDEX IF NOT EXISTS idx_worker_executions_kind_status
     ON worker_executions(kind, status, owner_epoch);
 CREATE INDEX IF NOT EXISTS idx_worker_executions_status_epoch
     ON worker_executions(status, owner_epoch);
+CREATE INDEX IF NOT EXISTS idx_state_meta_local_policy_lineage
+    ON state_meta(key)
+    WHERE json_valid(value) AND json_array_length(value, '$.lineage') > 1;
+CREATE INDEX IF NOT EXISTS idx_sessions_end_reason
+    ON sessions(end_reason, id)
+    WHERE end_reason IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sessions_pinned_started
+    ON sessions(started_at DESC)
+    WHERE pinned = 1;
+CREATE INDEX IF NOT EXISTS idx_sessions_unarchived_source_started
+    ON sessions(source, started_at DESC)
+    WHERE archived = 0 AND hidden = 0;
 """
 
 
