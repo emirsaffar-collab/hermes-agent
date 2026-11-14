@@ -1061,7 +1061,11 @@ class SessionDB(
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
     def _execute_write(
-        self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        patience_s: Optional[float] = None,
+        *,
+        quiet_lock_timeout: bool = False,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
@@ -1173,10 +1177,11 @@ class SessionDB(
                         # Say what actually happened, not disk/permission damage. The holder goes to
                         # the log, not the message: classify_persistence_error() buckets by phrase and
                         # a holder's argv (a worktree named fix-corrupt-db) would flip the bucket.
-                        log_write_lock_holders(self.db_path, patience_s)
+                        if not quiet_lock_timeout:
+                            log_write_lock_holders(self.db_path, patience_s)
                         raise sqlite3.OperationalError(
                             f"database is locked (another Hermes process held the "
-                            f"state.db write lock for over {patience_s:.0f}s — "
+                            f"state.db write lock for over {patience_s:g}s — "
                             "likely a long maintenance operation such as VACUUM, "
                             "a large WAL checkpoint, or an older pre-update "
                             "process; the database itself is healthy)"
@@ -1209,12 +1214,18 @@ class SessionDB(
                 raise
 
     def _write_sql(
-        self, sql: str, params: Any = (), *, many: bool = False, patience_s: Optional[float] = None,
+        self,
+        sql: str,
+        params: Any = (),
+        *,
+        many: bool = False,
+        patience_s: Optional[float] = None,
+        quiet_lock_timeout: bool = False,
     ) -> None:
         """Run one INSERT/UPDATE/DELETE through ``_execute_write``."""
         def _do(conn):
             (conn.executemany if many else conn.execute)(sql, params)
-        self._execute_write(_do, patience_s=patience_s)
+        self._execute_write(_do, patience_s=patience_s, quiet_lock_timeout=quiet_lock_timeout)
 
     def _write_rowcount(self, sql: str, params: Any = (), *, patience_s: Optional[float] = None) -> int:
         """Run one UPDATE/DELETE through ``_execute_write``; return rows changed

@@ -126,7 +126,7 @@ def _answers_open_request(req: Any) -> bool:
 # set to genuinely high-frequency, display-only events — anything a client must see promptly
 # (tool/approval/status/completion) is non-streaming and flushes the buffer ahead of itself, so
 # ordering is preserved. _TOKEN_COALESCE_S: max buffer wait (~30 fps; imperceptible).
-_STREAMING_EVENT_TYPES = frozenset({"message.delta", "reasoning.delta", "thinking.delta"})
+_STREAMING_EVENT_TYPES = frozenset({"message.delta", "reasoning.delta", "thinking.delta", "tool.generating"})
 _TOKEN_COALESCE_S = 0.033
 
 # starlette stays optional at import time; fall back to a generic sentinel.

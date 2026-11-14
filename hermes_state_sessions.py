@@ -652,6 +652,7 @@ class SessionSessionsMixin:
                 normalize_activity_provenance(provenance).value, session_id, when,
             ),
             patience_s=self._ACTIVITY_WRITE_PATIENCE_S,
+            quiet_lock_timeout=True,
         )
 
     # Observation-only write: never let it ride the full routine write-patience budget (#76354 review S1).
@@ -681,7 +682,9 @@ class SessionSessionsMixin:
             return
         self._write_sql(
             "UPDATE sessions SET last_activity_description = ?, last_activity_provenance = ? WHERE id = ?",
-            ("", ActivityProvenance.UNKNOWN.value, session_id), patience_s=self._ACTIVITY_WRITE_PATIENCE_S,
+            ("", ActivityProvenance.UNKNOWN.value, session_id),
+            patience_s=self._ACTIVITY_WRITE_PATIENCE_S,
+            quiet_lock_timeout=True,
         )
 
     def update_session_meta(
