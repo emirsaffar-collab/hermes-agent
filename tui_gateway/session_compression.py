@@ -110,7 +110,8 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         logger.warning("Invalid compression.codex_responses_compact_threshold=%r; using 200000.", native_threshold_raw)
         native_threshold = 200_000
     agent.codex_responses_compact_threshold = native_threshold
-    in_place_raw = compression.get("in_place", True)
+    _was_in_place = bool(getattr(agent, "compression_in_place", False))
+    in_place_raw = compression.get("in_place", False)
     agent.compression_in_place = in_place_raw if isinstance(in_place_raw, bool) else str(in_place_raw).lower() in {"true", "1", "yes"}
     # Absence restores the agent_init/config default (0 = disabled).
     with contextlib.suppress(TypeError, ValueError):
@@ -174,10 +175,11 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     # Invalidate the cached trigger so the next preflight re-derives from percent/window, then the cap.
     cc._threshold_tokens = cc._tail_token_budget = None
     _ag_sid = str(getattr(agent, "session_id", "") or "")
+    _had_in_place_compaction = _was_in_place or int(getattr(cc, "compression_count", 0) or 0) > 0
     if (
-        not getattr(agent, "compression_in_place", True)
+        not getattr(agent, "compression_in_place", False)
         and _ag_sid
-        and _ag_sid < "20261114_034500"
+        and _had_in_place_compaction
         and int(getattr(cc, "last_prompt_tokens", 0) or 0) >= 85_000
         and not getattr(agent, "_rotated_to_child_session", False)
     ):

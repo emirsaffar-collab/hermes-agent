@@ -331,7 +331,7 @@ def test_apply_live_compression_config_is_self_contained():
 def test_live_in_place_false_applies_and_arms_rotation_for_bloated_legacy_session(monkeypatch):
     session, compressor = _session_with_compressor()
     agent = session["agent"]
-    agent.session_id = "20261114_010000_legacy"
+    agent.session_id = "20291231_235959_future"
     agent.compression_in_place = True
     compressor.last_prompt_tokens = 120_000
 
@@ -351,7 +351,7 @@ def test_live_in_place_false_applies_and_arms_rotation_for_bloated_legacy_sessio
             },
         },
     )
-    server._sync_agent_compression_with_config("20261114_010000_legacy", session)  # type: ignore[attr-defined]
+    server._sync_agent_compression_with_config("20291231_235959_future", session)  # type: ignore[attr-defined]
     assert agent.compression_in_place is False
     assert compressor.proactive_prune_tokens == 0
     assert compressor.threshold_tokens == 75_000
