@@ -428,6 +428,11 @@ def begin_iteration(
                 or getattr(agent, "_memory_write_origin", None) == "background_review"
                 or getattr(agent, "_turn_origin", None) == "background_review"
             )
+            else "subagent"
+            if (
+                getattr(agent, "platform", None) == "subagent"
+                or int(getattr(agent, "_delegate_depth", 0) or 0) > 0
+            )
             else session_source_for(getattr(agent, "platform", None))
         )
         _tg_ctrl = getattr(agent, "_tool_guardrails", None)
