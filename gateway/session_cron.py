@@ -273,7 +273,40 @@ def _run_identified(run_job, job, execution_id, **kwargs):
         exit_cron_execution(token)
 
 
+_LAST_CRON_MOD_MTIMES: dict[str, float] = {}
+
+
+def _ensure_fresh_cron_modules() -> None:
+    import importlib
+    import sys
+
+    for mod_name in (
+        "agent.realtime_spend_breaker",
+        "agent.turn_failure_copy",
+        "agent.turn_finalizer",
+        "agent.turn_iteration_prep",
+        "cron.scheduler",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        mod_file = getattr(mod, "__file__", None)
+        if not mod_file:
+            continue
+        try:
+            mtime = os.path.getmtime(mod_file)
+            prev = _LAST_CRON_MOD_MTIMES.get(mod_name)
+            if prev is None:
+                _LAST_CRON_MOD_MTIMES[mod_name] = mtime
+            elif mtime > prev:
+                importlib.reload(mod)
+                _LAST_CRON_MOD_MTIMES[mod_name] = mtime
+        except Exception:
+            pass
+
+
 async def execute(authority, ref, row, policy):
+    _ensure_fresh_cron_modules()
     from cron.scheduler import run_job
     from gateway.run import _profile_runtime_scope
     data = json.loads(policy.request_json)

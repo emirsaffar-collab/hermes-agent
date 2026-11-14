@@ -441,6 +441,7 @@ def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_v
             not _is_empty_terminal
             and not preserved_verification_fallback
             and not str(_turn_exit_reason).startswith("text_response")
+            and not str(_turn_exit_reason).startswith("realtime_spend_breaker:")
             and _turn_exit_reason != "fallback_prior_turn_content"
             and len(_stripped) <= 24
             and _stripped[-1:] not in _SENTENCE_END
@@ -709,6 +710,17 @@ def finalize_turn(
     _exit_failure = None if interrupted else exit_reason_failure(_turn_exit_reason)
     if _exit_failure is not None and _exit_failure.fails_turn:
         failed = True
+
+    if (
+        str(_turn_exit_reason or "").startswith("realtime_spend_breaker:")
+        and not final_response
+        and (
+            (getattr(agent, "platform", "") or "").lower() == "cron"
+            or getattr(agent, "_write_origin", None) == "background_review"
+            or str(getattr(agent, "session_id", "")).startswith("cron_")
+        )
+    ):
+        final_response = "[SILENT]"
 
     # Sibling producers (``turn_recovery``, ``codex_runtime``) return ``completed=False`` for an
     # interrupted turn; the gateway stream gate and the API run status rely on that contract.

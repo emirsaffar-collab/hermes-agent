@@ -2667,6 +2667,11 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
+        try:
+            agent.cron_job_id = str(job_id or "")
+            agent.cron_job_name = str(job_name or "")
+        except Exception:
+            pass
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(

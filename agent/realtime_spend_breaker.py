@@ -66,12 +66,24 @@ TIER3_DAILY_HARD_CAP_EUR = 195.00
 
 _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "chat-247",
+    "chat247-",
+    "nw-chat-",
+    "newintra-",
+    "medius-",
+    "lager-",
+    "2izii-",
+    "post-deploy-verify-",
     "evelina-",
+    "emir-morning-routine",
     "alert-triage",
+    "alerts-digest",
     "pos-sentinel",
     "secret-403",
     "incident-",
     "estate-doctor",
+    "svea-",
+    "cart-",
+    "store-support-",
 )
 
 _LAST_STATUS_WRITE_TS: float = 0.0
@@ -200,9 +212,20 @@ def compute_call_net_eur(
 
 
 def is_tier0_critical_cron(job_name: str | None, session_id: str | None = None) -> bool:
-    for candidate in (job_name or "", session_id or ""):
+    ctx_name = ""
+    if not job_name:
+        try:
+            from cron.execution_identity import current_cron_execution
+            ctx = current_cron_execution()
+            if isinstance(ctx, dict):
+                ctx_name = str(ctx.get("job_name") or "")
+            elif ctx is not None:
+                ctx_name = str(getattr(ctx, "job_name", "") or "")
+        except Exception:
+            pass
+    for candidate in (job_name or "", ctx_name, session_id or ""):
         low = candidate.strip().lower()
-        if any(low.startswith(p) or p in low for p in _TIER0_CRITICAL_PREFIXES):
+        if low and any(low.startswith(p) or p in low for p in _TIER0_CRITICAL_PREFIXES):
             return True
     return False
 
