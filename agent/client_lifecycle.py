@@ -138,11 +138,17 @@ class ClientLifecycleMixin:
                      release_computer_use, forget_file_state):
             _quietly(step)
 
-    def _client_log_context(self) -> str:
+    def _client_log_context(self, client: Any = None, *, base_url: Optional[str] = None) -> str:
         thread = threading.current_thread()
+        effective_base = (
+            base_url
+            or (getattr(client, "_vertex_routed_base_url", None) if client is not None else None)
+            or getattr(self, "_last_routed_base_url", None)
+            or getattr(self, "base_url", "unknown")
+        )
         return (
             f"thread={thread.name}:{thread.ident} provider={getattr(self, 'provider', 'unknown')} "
-            f"base_url={getattr(self, 'base_url', 'unknown')} model={getattr(self, 'model', 'unknown')}"
+            f"base_url={effective_base} model={getattr(self, 'model', 'unknown')}"
         )
 
     def _anthropic_log_context(self) -> str:
@@ -497,12 +503,14 @@ class ClientLifecycleMixin:
                 )
                 routed_base_url = build_vertex_base_url(project_id, target_region)
                 request_kwargs["base_url"] = routed_base_url
+                self._last_routed_base_url = routed_base_url
             elif is_vertex_global_only_model(req_model) and "europe-west2-aiplatform.googleapis.com" in raw_base_url:
                 routed_base_url = (
                     raw_base_url.replace("europe-west2-aiplatform.googleapis.com", "aiplatform.googleapis.com")
                     .replace("/locations/europe-west2/", "/locations/global/")
                 )
                 request_kwargs["base_url"] = routed_base_url
+                self._last_routed_base_url = routed_base_url
         target_slot = _OPENAI_SLOT
         if (
             getattr(self, "provider", None) == "vertex"

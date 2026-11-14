@@ -131,8 +131,11 @@ def _budget_for_agent(agent) -> BudgetConfig:
     context length isn't resolvable.
     """
     try:
-        ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx) if ctx else None)
+        cc = getattr(agent, "context_compressor", None)
+        ctx = getattr(cc, "context_length", None)
+        thresh = getattr(cc, "threshold_tokens", None)
+        eff_ctx = min(int(ctx), int(thresh)) if (ctx and thresh and int(thresh) > 0) else (int(ctx) if ctx else None)
+        return budget_for_context_window(eff_ctx)
     except Exception:
         return DEFAULT_BUDGET
 
