@@ -209,7 +209,7 @@ def _local_conversations(conn):
     of every derived (Bot Chat, A2A) conversation. Queries only idx_state_meta_local_policy_special
     (default 1-segment receipts already resolve to ``(sid,)`` via ``conversations.get(sid, (sid,))``).
     Malformed receipts name nothing."""
-    from hermes_state_local import NONDEFAULT_POLICY_WHERE
+    from hermes_state_common import NONDEFAULT_POLICY_WHERE
     members, derived = {}, set()
     for (raw,) in conn.execute(f'SELECT value FROM state_meta WHERE {NONDEFAULT_POLICY_WHERE}'):
         try:
