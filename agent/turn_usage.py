@@ -215,6 +215,8 @@ def record_response_usage(
     # because none of the three were on this line.
     if canonical_usage.cache_write_tokens:
         _cache_pct += f" write={canonical_usage.cache_write_tokens}"
+    if canonical_usage.reasoning_tokens:
+        _cache_pct += f" reasoning={canonical_usage.reasoning_tokens}"
     _rid = getattr(response, "id", None)
     _ident = f" id={_rid}" if isinstance(_rid, str) and _rid else ""
     _upstream = getattr(response, "provider", None)

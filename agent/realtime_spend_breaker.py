@@ -35,13 +35,19 @@ _STOCKHOLM_TZ = ZoneInfo("Europe/Stockholm")
 
 # Vertex AI net EUR rates per 1M tokens on uop-atlas (after -50% promotional credit)
 # USD list -> -50% promo -> EUR at 0.8981 EUR/USD (verified against BigQuery billing_export 202611)
-VERTEX_ARGON_UNCACHED_IN_EUR_PER_M = 1.7962
-VERTEX_ARGON_CACHED_IN_EUR_PER_M = 0.0898
-VERTEX_ARGON_OUT_EUR_PER_M = 8.9810
+# Global SKUs: 3BAE-62B7-C9B9 (in), 3B3E-7322-E883 (cache), 1E84-F91D-8B95 (out)
+VERTEX_ARGON_UNCACHED_IN_EUR_PER_M = 1.796200
+VERTEX_ARGON_CACHED_IN_EUR_PER_M = 0.089810
+VERTEX_ARGON_OUT_EUR_PER_M = 8.981000
 
-VERTEX_FLASH_UNCACHED_IN_EUR_PER_M = 0.2245
-VERTEX_FLASH_CACHED_IN_EUR_PER_M = 0.02245
-VERTEX_FLASH_OUT_EUR_PER_M = 1.3470
+# Regional europe-west2 SKUs (A891-E7A5-FDA5, F61C-57E6-DBE0, EA0E-13A1-6B07) carry 1.10x multiplier
+VERTEX_EU_WEST2_REGIONAL_MULTIPLIER = 1.10
+_EU_WEST2_MACRO_CLUSTERS: frozenset[str] = frozenset({"0L8P", "9_oP", "6-wP", "6_gP"})
+
+# Global Flash SKUs: 2A35-AC68-14D6 (in), 8658-6939-8BEC (cache), 90FD-DC5F-DC55 (out)
+VERTEX_FLASH_UNCACHED_IN_EUR_PER_M = 0.673573
+VERTEX_FLASH_CACHED_IN_EUR_PER_M = 0.067357
+VERTEX_FLASH_OUT_EUR_PER_M = 3.367844
 
 USD_TO_EUR = 0.92
 
@@ -177,17 +183,20 @@ def compute_call_net_eur(
     cache_read_tokens: int,
     output_tokens: int,
     estimated_cost_usd: float | None = None,
+    cluster_id: str | None = None,
 ) -> float:
     prov = (provider or "").lower()
     mod = (model or "").lower()
     uncached = max(0, int(uncached_input_tokens or 0))
     cached = max(0, int(cache_read_tokens or 0))
     out = max(0, int(output_tokens or 0))
-    cliff_mult = 2.0 if int(prompt_tokens or 0) > 200_000 else 1.0
+    cid = str(cluster_id or "")
+    macro = cid[2:6] if len(cid) >= 6 else ""
+    reg_mult = VERTEX_EU_WEST2_REGIONAL_MULTIPLIER if macro in _EU_WEST2_MACRO_CLUSTERS else 1.0
 
     if "argon" in mod and (prov in ("vertex", "", "google") or estimated_cost_usd is None):
         return round(
-            cliff_mult
+            reg_mult
             * (
                 uncached * VERTEX_ARGON_UNCACHED_IN_EUR_PER_M
                 + cached * VERTEX_ARGON_CACHED_IN_EUR_PER_M
@@ -271,6 +280,7 @@ def record_realtime_llm_call(
         cache_read_tokens=cached,
         output_tokens=out,
         estimated_cost_usd=estimated_cost_usd,
+        cluster_id=cluster_id,
     )
     req_key = request_id or f"{session_id}:{now:.6f}:{prompt}:{out}"
 
@@ -297,11 +307,17 @@ def record_realtime_llm_call(
             with con:
                 con.execute(
                     """
-                    INSERT OR IGNORE INTO llm_call_ledger (
+                    INSERT INTO llm_call_ledger (
                         ts, day_cet, session_id, source, job_name, provider, model,
                         prompt_tokens, uncached_in, cached_in, out_tokens, net_eur,
                         cluster_id, cache_reset, request_id
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(request_id) DO UPDATE SET
+                        session_id = CASE WHEN llm_call_ledger.source = 'log_tail' AND excluded.source != 'log_tail' THEN excluded.session_id ELSE llm_call_ledger.session_id END,
+                        source = CASE WHEN llm_call_ledger.source = 'log_tail' AND excluded.source != 'log_tail' THEN excluded.source ELSE llm_call_ledger.source END,
+                        job_name = CASE WHEN llm_call_ledger.job_name = '' AND excluded.job_name != '' THEN excluded.job_name ELSE llm_call_ledger.job_name END,
+                        out_tokens = MAX(llm_call_ledger.out_tokens, excluded.out_tokens),
+                        net_eur = MAX(llm_call_ledger.net_eur, excluded.net_eur)
                     """,
                     (
                         now,
@@ -376,6 +392,16 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
             cday, eurday, eurday_non_int, uday, caday, crday = cur.fetchone()
 
             cur.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(net_eur), 0.0),
+                       COALESCE(SUM(uncached_in), 0), COALESCE(SUM(cached_in), 0)
+                FROM llm_call_ledger WHERE day_cet = ?
+                """,
+                (day_cet,),
+            )
+            cday_all, eurday_all, uday_all, caday_all = cur.fetchone()
+
+            cur.execute(
                 "SELECT COUNT(*) FROM quarantined_sessions WHERE expires_at > ?",
                 (ts_now,),
             )
@@ -397,6 +423,9 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
             "cache_resets_1h": 0,
             "calls_today": 0,
             "net_eur_today": 0.0,
+            "calls_today_all": 0,
+            "net_eur_today_all": 0.0,
+            "cache_hit_pct_today_all": 100.0,
             "net_eur_today_non_interactive": 0.0,
             "cache_hit_pct_today": 100.0,
             "cache_resets_today": 0,
@@ -407,6 +436,7 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
     hit15 = round(100.0 * ca15 / max(1, u15 + ca15), 2) if (u15 + ca15) > 0 else 100.0
     hit1h = round(100.0 * ca1h / max(1, u1h + ca1h), 2) if (u1h + ca1h) > 0 else 100.0
     hitday = round(100.0 * caday / max(1, uday + caday), 2) if (uday + caday) > 0 else 100.0
+    hitday_all = round(100.0 * caday_all / max(1, uday_all + caday_all), 2) if (uday_all + caday_all) > 0 else 100.0
 
     return {
         "ts": ts_now,
@@ -421,6 +451,9 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
         "cache_resets_1h": int(cr1h or 0),
         "calls_today": int(cday or 0),
         "net_eur_today": round(float(eurday or 0.0), 4),
+        "calls_today_all": int(cday_all or 0),
+        "net_eur_today_all": round(float(eurday_all or 0.0), 4),
+        "cache_hit_pct_today_all": hitday_all,
         "net_eur_today_non_interactive": round(float(eurday_non_int or 0.0), 4),
         "cache_hit_pct_today": hitday,
         "cache_resets_today": int(crday or 0),
