@@ -257,9 +257,70 @@ def test_over_threshold_pre_compaction_prune_uses_tail_token_budget() -> None:
     assert (out_default, n_default) == (msgs, 0)
 
     # Pre-compaction opportunistic prune (`warn_on_noop=False`) falls back to
-    # `tail_token_budget` and prunes the oversized tool outputs deterministically.
-    out_pre, n_pre = c.prune_tool_results_only(msgs, current_tokens=billed, warn_on_noop=False)
-    assert n_pre >= 3
+    # `tail_token_budget` and prunes the oversized tool outputs deterministically,
+    # including when invoked via `_proactive_tool_result_prune(..., warn_on_noop=False)`.
+    from types import SimpleNamespace
+    from agent.turn_preflight import _proactive_tool_result_prune
+
+    agent = SimpleNamespace(compression_checkpoint_required=False, session_id="s-tail")
+    out_via_preflight = _proactive_tool_result_prune(
+        agent, c, msgs, billed, warn_on_noop=False
+    )
+    assert out_via_preflight is not msgs
+
+
+def test_over_threshold_pre_compaction_prune_lowers_min_chars_to_compaction_floor() -> None:
+    """After earlier sub-threshold prunes have already demoted >4000-char tool results,
+    crossing `threshold_tokens` with medium tool results (500..4000 chars) must fall back
+    to `_PRUNE_MIN_CHARS` (500) during `_over_threshold_pre_compaction` so Phase-1
+    pruning reclaims them before calling full LLM compaction."""
+    from types import SimpleNamespace
+    from agent.turn_preflight import _proactive_tool_result_prune
+
+    c = _compressor(
+        protect_last_n=12,
+        proactive_prune_min_result_chars=4_000,
+        proactive_prune_min_reclaim_tokens=4_096,
+    )
+    c.tail_token_budget = 2_000
+    # 16 tool pairs with 2,500-char payloads (< 4,000 proactive floor, >= 500 compaction floor)
+    msgs: list[dict] = [{"role": "user", "content": "start"}]
+    for i in range(16):
+        cid = f"c_{i}"
+        msgs.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": cid,
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            }
+        )
+        msgs.append(
+            {
+                "role": "tool",
+                "tool_call_id": cid,
+                "content": (f"line_{i} " * 360)[:2500],
+            }
+        )
+    billed = c.threshold_tokens + 2_500
+    # Ordinary sub-threshold prune (`warn_on_noop=True`) ignores <4000-char payloads.
+    out_default, n_default = c.prune_tool_results_only(
+        msgs, current_tokens=billed, warn_on_noop=True
+    )
+    assert (out_default, n_default) == (msgs, 0)
+
+    # Pre-compaction prune (`warn_on_noop=False`) lowers `min_prune_chars` to 500
+    # and reclaims the medium tool results deterministically.
+    agent = SimpleNamespace(compression_checkpoint_required=False, session_id="s-med")
+    out_pre = _proactive_tool_result_prune(
+        agent, c, msgs, billed, warn_on_noop=False
+    )
     assert out_pre is not msgs
+
 
 

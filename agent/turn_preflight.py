@@ -520,7 +520,12 @@ def _proactive_tool_result_prune(
         except Exception:
             _shadowed_warn = False
     try:
-        _prune_res: Any = prune(messages, current_tokens=current_tokens)
+        try:
+            _prune_res: Any = prune(
+                messages, current_tokens=current_tokens, warn_on_noop=warn_on_noop
+            )
+        except TypeError:
+            _prune_res = prune(messages, current_tokens=current_tokens)
         pruned_msgs, pruned_n = _prune_res
     except Exception:
         logger.debug("proactive tool-result prune failed; skipping", exc_info=True)

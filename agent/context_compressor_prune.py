@@ -101,15 +101,23 @@ class ProactivePruneMixin:
         else:
             after = before
             reclaimed = 0
-        if (
-            _over_threshold_pre_compaction
-            and (not pruned_count or reclaimed < self.proactive_prune_min_reclaim_tokens)
-        ):
+        _needs_deeper_pre_compaction_prune = (
+            not pruned_count
+            or reclaimed < self.proactive_prune_min_reclaim_tokens
+            or (
+                current_tokens is not None
+                and self.threshold_tokens > 0
+                and (current_tokens - reclaimed) >= self.threshold_tokens
+            )
+        )
+        if _over_threshold_pre_compaction and _needs_deeper_pre_compaction_prune:
             pruned_msgs, pruned_count = self._prune_old_tool_results(
                 messages,
                 protect_tail_count=self.protect_last_n,
                 protect_tail_tokens=int(self.tail_token_budget),
-                min_prune_chars=self.proactive_prune_min_result_chars,
+                min_prune_chars=min(
+                    self.proactive_prune_min_result_chars, _cc_._PRUNE_MIN_CHARS
+                ),
             )
             if pruned_count:
                 pruned_msgs = with_pruned_row_skill_safety_rule(messages, pruned_msgs)
