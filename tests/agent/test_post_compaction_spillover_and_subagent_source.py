@@ -134,13 +134,13 @@ def test_subagent_under_desktop_session_env_classifies_as_subagent_and_trips_bre
     )
     assert rt_src == "subagent"
 
-    for i in range(6):
+    for i in range(12):
         rsb.record_realtime_llm_call(
             session_id="subagent_runaway_1",
             source=rt_src,
             provider="vertex",
             model="google/gemini-4-argon",
-            prompt_tokens=210_000,
+            prompt_tokens=200_000,
             uncached_input_tokens=210_000,
             cache_read_tokens=0,
             output_tokens=0,
