@@ -13,6 +13,7 @@ class _DummyAgent(ClientLifecycleMixin):
         self.provider = "vertex"
         self.model = "google/gemini-4-argon"
         self.base_url = "https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi"
+        self._last_routed_base_url: str | None = None
 
 
 def test_client_log_context_prefers_routed_base_url() -> None:
