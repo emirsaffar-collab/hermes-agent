@@ -2627,9 +2627,21 @@ def run_job(
     if owner_execution is not None and owner_execution[2:] != (job['id'], execution_id):
         owner_execution = None
     if not job.get("no_agent") and owner_execution is None:
-        from cron.scheduler_authority import run_canonical_job
-        return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
-                                 execution_id=execution_id)
+        from cron.scheduler_authority import journal_path, run_canonical_job
+        res = run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
+                                execution_id=execution_id)
+        if not res[0] and "not_found" in str(res[3]):
+            from cron.jobs import get_job
+            fresh_job = get_job(job.get("id", "")) or job
+            if fresh_job.get("no_agent"):
+                req_id = execution_id or job.get("execution_id")
+                if req_id:
+                    journal_path(job["id"], req_id).unlink(missing_ok=True)
+                job.update(fresh_job)
+            else:
+                return res
+        else:
+            return res
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
