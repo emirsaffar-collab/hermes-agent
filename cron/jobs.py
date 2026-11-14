@@ -550,6 +550,12 @@ def _normalize_job_record(job: dict[str, Any]) -> dict[str, Any]:
         )
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
+    if not (
+        _coerce_job_text(normalized.get("owner")).strip()
+        or _coerce_job_text(normalized.get("business_owner")).strip()
+        or _coerce_job_text(normalized.get("sponsor")).strip()
+    ):
+        normalized["owner"] = (os.environ.get("HERMES_CRON_OWNER") or "emir").strip()
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
     # Derived from the scheduler-honoured ``enabled`` flag so a half-paused record cannot render
     # "paused" while still firing. See effective_job_state().

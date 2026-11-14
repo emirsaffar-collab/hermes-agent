@@ -2037,3 +2037,25 @@ class TestEnsureCronDirWidened:
         j_explicit = create_job(prompt="check health", schedule="every 1h", owner="ops-team")
         assert j_explicit["owner"] == "ops-team"
 
+    def test_normalize_job_record_backfills_missing_owner_and_tool_defaults_skill(self, tmp_cron_dir):
+        """R6 SPM hygiene: legacy/un-recycled records get owner backfilled on normalize,
+        and cronjob_manage(action='create') defaults LLM jobs without skills to ['always-verify']."""
+        from cron.jobs import _normalize_job_record
+        from tools import cronjob_tools
+        import json
+
+        raw = {"id": "legacy1", "name": "legacy", "prompt": "run check", "schedule": {"kind": "interval", "minutes": 60}}
+        norm = _normalize_job_record(raw)
+        assert norm["owner"] == "emir"
+
+        sponsored = {"id": "legacy2", "name": "sponsored", "prompt": "run check", "sponsor": "sec-team"}
+        norm_sp = _normalize_job_record(sponsored)
+        assert norm_sp.get("sponsor") == "sec-team"
+        assert "owner" not in norm_sp
+
+        res = json.loads(cronjob_tools.cronjob(action="create", prompt="soak verify", schedule="every 1h", name="soak-verify"))
+        assert res["success"] is True
+        assert res["skills"] == ["always-verify"]
+        assert res["skill"] == "always-verify"
+
+
