@@ -436,6 +436,32 @@ class TestWave5LongTermCostArchitectureFixes:
         assert ok.action == "allow"
         assert ctrl.is_making_productive_progress() is True
 
+        # A one-off non-repeated tool failure (e.g. a probe with a typo or red pytest run)
+        # marks that step non-productive, but once the agent runs a succeeding tool call
+        # with fixed args (without re-running the broken command string), progress recovers
+        # instead of staying permanently poisoned by _exact_failure_counts.
+        one_off_fail = ctrl.after_call(
+            "terminal", {"command": "sqlite3 db 'SELECT * FROM wrong_table'"}, '{"exit_code": 1, "error": "no such table"}'
+        )
+        assert one_off_fail.action == "allow"
+        assert ctrl.is_making_productive_progress() is False
+        fixed_ok = ctrl.after_call(
+            "terminal", {"command": "sqlite3 db 'SELECT * FROM active_leases'"}, '{"exit_code": 0, "output": "ok"}', failed=False
+        )
+        assert fixed_ok.action == "allow"
+        assert ctrl.is_making_productive_progress() is True
+
+        # Conversely, an unrecovered repeated exact failure (count >= exact_failure_warn_after)
+        # blocks progress until either that tool succeeds or a file mutation lands.
+        ctrl.after_call("terminal", {"command": "bad_cmd"}, '{"exit_code": 1, "error": "fail"}')
+        rep_warn = ctrl.after_call("terminal", {"command": "bad_cmd"}, '{"exit_code": 1, "error": "fail"}')
+        assert rep_warn.code == "repeated_exact_failure_warning"
+        assert ctrl.is_making_productive_progress() is False
+        ctrl.after_call("read_file", {"path": "/tmp/other.py"}, '{"content": "y = 2\\n"}')
+        assert ctrl.is_making_productive_progress() is False
+        ctrl.after_call("patch", {"path": "/tmp/other.py"}, '{"success": true}', failed=False)
+        assert ctrl.is_making_productive_progress() is True
+
         budget = IterationBudget(35)
         for _ in range(31):
             assert budget.consume() is True
@@ -617,7 +643,7 @@ class TestWave5LongTermCostArchitectureFixes:
             for k in base_cfg.__dataclass_fields__
             if k not in ("auth_wall_warn_after", "auth_wall_halt_after")
         }
-        setattr(ctrl, "config", SimpleNamespace(**legacy_cfg_dict))
+        setattr(ctrl, "config", SimpleNamespace(**legacy_cfg_dict))  # noqa: B010
 
         assert ctrl.is_making_productive_progress() is False
         d_ok = ctrl.after_call("terminal", {"command": "echo ok"}, "ok", failed=False)
@@ -660,7 +686,7 @@ class TestWave5LongTermCostArchitectureFixes:
             def after_call(self, *args, **kwargs):
                 raise AttributeError("simulated hot-reload attribute gap")
 
-        setattr(agent, "_tool_guardrails", _BrokenGuardrails())
+        setattr(agent, "_tool_guardrails", _BrokenGuardrails())  # noqa: B010
         out = agent._append_guardrail_observation(
             "write_file",
             {"path": "/tmp/example.txt"},

@@ -345,6 +345,7 @@ class ToolCallGuardrailController:
 
     _auth_wall_failure_count: int = 0
     _turn_productive_calls: int = 0
+    _consecutive_failure_count: int = 0
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
@@ -378,6 +379,7 @@ class ToolCallGuardrailController:
         self._turn_subagent_count = 0
         self._auth_wall_failure_count = 0
         self._turn_productive_calls = 0
+        self._consecutive_failure_count = 0
 
     def reset_after_compaction(self) -> None:
         """Clear read-tool no-progress and streak counters across a compaction boundary.
@@ -440,6 +442,7 @@ class ToolCallGuardrailController:
         warnings = self.config.warnings_enabled
 
         if failed:
+            self._consecutive_failure_count = getattr(self, "_consecutive_failure_count", 0) + 1
             # An identical failing call is only a REPLAY if nothing landed in between;
             # a mutation since the last identical failure restarts the exact-args streak.
             if self._progress_since_failure.pop(signature, False):
@@ -492,6 +495,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
         self._auth_wall_failure_count = 0
+        self._consecutive_failure_count = 0
         # A successful mutation is progress for every failing signature still counted
         # this turn. Pure loops never mutate between attempts, so the replay detector keeps its teeth.
         if tool_name in PROGRESS_RESET_TOOL_NAMES or file_mutation_result_landed(tool_name, result):
@@ -514,13 +518,22 @@ class ToolCallGuardrailController:
 
     def is_making_productive_progress(self) -> bool:
         """True when this turn has executed productive calls without active failure/stall streaks."""
+        exact_warn = getattr(self.config, "exact_failure_warn_after", 2)
+        same_warn = getattr(self.config, "same_tool_failure_warn_after", 3)
+        active_exact_streak = any(
+            count >= exact_warn
+            and sig.tool_name in self._same_tool_failure_counts
+            and not self._progress_since_failure.get(sig)
+            for sig, count in self._exact_failure_counts.items()
+        )
         return (
             self._halt_decision is None
             and getattr(self, '_turn_productive_calls', 0) > 0
-            and not self._exact_failure_counts
+            and getattr(self, '_consecutive_failure_count', 0) == 0
+            and not active_exact_streak
             and getattr(self, '_auth_wall_failure_count', 0) == 0
             and self._identical_streak_count < STALL_GUARD_IDENTICAL_CALL_THRESHOLD
-            and max(self._same_tool_failure_counts.values(), default=0) < self.config.same_tool_failure_warn_after
+            and max(self._same_tool_failure_counts.values(), default=0) < same_warn
         )
 
     def _is_idempotent(self, tool_name: str) -> bool:

@@ -1308,12 +1308,37 @@ def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
 
 
 
+def _disable_vertex_include_thoughts_for_nonstream(api_kwargs: dict) -> dict:
+    """Return a shallow-copied ``api_kwargs`` with ``thinking_config.include_thoughts = False``
+    when present so Vertex OpenAPI ``stream=False`` calls keep full thinking budget/level
+    without embedding untagged thoughts into ``choices[0].message.content``."""
+    if not isinstance(api_kwargs, dict):
+        return api_kwargs
+    _eb = api_kwargs.get("extra_body")
+    if not isinstance(_eb, dict):
+        return api_kwargs
+    _inner_eb = _eb.get("extra_body") if isinstance(_eb.get("extra_body"), dict) else _eb
+    _g = _inner_eb.get("google") if isinstance(_inner_eb, dict) else None
+    _tc = _g.get("thinking_config") if isinstance(_g, dict) else None
+    if isinstance(_tc, dict) and _tc.get("include_thoughts") is True:
+        import copy
+        patched = dict(api_kwargs)
+        patched["extra_body"] = copy.deepcopy(_eb)
+        _eb_copy = patched["extra_body"]
+        _inner_copy = _eb_copy.get("extra_body") if isinstance(_eb_copy.get("extra_body"), dict) else _eb_copy
+        if isinstance(_inner_copy, dict):
+            _inner_copy["google"]["thinking_config"]["include_thoughts"] = False
+        return patched
+    return api_kwargs
+
+
 def interruptible_api_call(agent, api_kwargs: dict):
     """Run the API call on a worker thread so the caller can detect interrupts
     without waiting for the full HTTP round-trip. Each worker gets its own
     per-request client (interrupts close only that one); a stale-call detector
     kills the connection and raises so the main retry loop can back off / rotate
     credentials / fall back."""
+    api_kwargs = _disable_vertex_include_thoughts_for_nonstream(api_kwargs)
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
