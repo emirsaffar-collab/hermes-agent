@@ -1509,6 +1509,13 @@ def load_jobs() -> list[dict[str, Any]]:
             except (TypeError, ValueError, OverflowError):
                 rep["completed"] = 0
             repair = repair or "invalid repeat.completed normalized"
+        if not (
+            _coerce_job_text(job.get("owner")).strip()
+            or _coerce_job_text(job.get("business_owner")).strip()
+            or _coerce_job_text(job.get("sponsor")).strip()
+        ):
+            job["owner"] = (os.environ.get("HERMES_CRON_OWNER") or "emir").strip()
+            repair = repair or "missing owner backfilled"
     # Persist even an empty result, or an all-junk store repeats the repair on every tick.
     if repair:
         if not getattr(_jobs_lock_state, "depth", 0):
@@ -1620,6 +1627,14 @@ def _unlink_quiet(path: Optional[str]) -> None:
 
 def _stage_jobs_payload(jobs_file: Path, jobs: list[dict[str, Any]]) -> str:
     """Serialize the store payload to a fsynced temp file beside the resolved *jobs_file*; return its path."""
+    _default_owner = (os.environ.get("HERMES_CRON_OWNER") or "emir").strip()
+    for _j in jobs:
+        if isinstance(_j, dict) and not (
+            _coerce_job_text(_j.get("owner")).strip()
+            or _coerce_job_text(_j.get("business_owner")).strip()
+            or _coerce_job_text(_j.get("sponsor")).strip()
+        ):
+            _j["owner"] = _default_owner
     fd, tmp_path = mkstemp_beside(jobs_file, suffix=".tmp", prefix=".jobs_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

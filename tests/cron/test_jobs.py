@@ -2058,4 +2058,34 @@ class TestEnsureCronDirWidened:
         assert res["skills"] == ["always-verify"]
         assert res["skill"] == "always-verify"
 
+    def test_load_and_save_jobs_persist_backfilled_owner_on_disk(self, tmp_cron_dir):
+        """R6 SPM persistence: load_jobs auto-repairs ownerless disk records and save_jobs
+        never serializes an unowned record, while preserving business_owner/sponsor."""
+        import json
+        from cron import jobs as jobs_mod
+
+        jobs_file = jobs_mod._current_cron_store().jobs_file
+        jobs_file.parent.mkdir(parents=True, exist_ok=True)
+        jobs_file.write_text(
+            json.dumps({
+                "jobs": [
+                    {"id": "unowned-disk", "name": "unowned", "prompt": "p", "schedule": {"kind": "interval", "minutes": 60}},
+                    {"id": "biz-owned", "name": "biz", "prompt": "p", "business_owner": "celina", "schedule": {"kind": "interval", "minutes": 60}},
+                ]
+            }),
+            encoding="utf-8",
+        )
+        loaded = load_jobs()
+        assert loaded[0]["owner"] == "emir"
+        assert "owner" not in loaded[1] and loaded[1]["business_owner"] == "celina"
+
+        on_disk = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+        assert on_disk[0]["owner"] == "emir"
+        assert "owner" not in on_disk[1] and on_disk[1]["business_owner"] == "celina"
+
+        save_jobs([{"id": "raw-save", "name": "raw", "prompt": "p"}])
+        saved_disk = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+        assert saved_disk[0]["owner"] == "emir"
+
+
 
