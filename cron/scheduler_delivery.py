@@ -15,7 +15,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from gateway.inbound_reply_context import record_cron_delivery, recording_cron_delivery
 
@@ -2000,14 +2000,48 @@ def _deliver_result(
     return "; ".join(delivery_errors) if delivery_errors else None
 
 
-# Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
-# populated before ``scheduler`` re-exports from it.
-from cron import scheduler as _sched
+# Late-bound origin namespace (see module docstring). Resolved lazily via _LazyMod
+# so concurrent imports of cron.scheduler and cron.scheduler_delivery never form a
+# Python 3.14 _ModuleLock cycle while LOAD_GLOBAL inside functions remains direct.
 from cron.scheduler_delivery_room import (
     ROOM_PLATFORM, deliver_to_room, parse_room_deliver_token, resolve_room_target)
-from cron import scheduler_delivery_origin as _origin
 from cron.scheduler_delivery_media import _send_media_via_adapter
-from cron import scheduler_preflight as _preflight
-from cron import scheduler_script as _script
 from cron.scheduler_delivery_standalone import (
     _queue_for_live_reconnect, _standalone_send)
+
+if TYPE_CHECKING:
+    from cron import scheduler as _sched
+    from cron import scheduler_delivery_origin as _origin
+    from cron import scheduler_preflight as _preflight
+    from cron import scheduler_script as _script
+else:
+    class _LazyMod:
+        __slots__ = ("_n",)
+
+        def __init__(self, n: str) -> None:
+            object.__setattr__(self, "_n", n)
+
+        def __getattr__(self, a: str):
+            import importlib
+            import sys
+
+            n = object.__getattribute__(self, "_n")
+            m = sys.modules.get(n)
+            if m is None or getattr(getattr(m, "__spec__", None), "_initializing", False):
+                m = importlib.import_module(n)
+            return getattr(m, a)
+
+        def __setattr__(self, a: str, v) -> None:
+            import importlib
+            import sys
+
+            n = object.__getattribute__(self, "_n")
+            m = sys.modules.get(n)
+            if m is None or getattr(getattr(m, "__spec__", None), "_initializing", False):
+                m = importlib.import_module(n)
+            setattr(m, a, v)
+
+    _sched = _LazyMod("cron.scheduler")
+    _origin = _LazyMod("cron.scheduler_delivery_origin")
+    _preflight = _LazyMod("cron.scheduler_preflight")
+    _script = _LazyMod("cron.scheduler_script")

@@ -1923,6 +1923,28 @@ def route_classified_error(
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or (_is_transport_failure and retry_count >= 2)
     ) and not (getattr(classified, "error_context", None) or {}).get("usage_window")  # never switch models on a plan limit
+    # P0-1 Hybrid Router: trip the europe-west2 15s cooldown and pin the interactive/subagent
+    # session to locations/global on any Vertex 429 or stream-stale timeout, even when
+    # _fallback_chain is empty (e.g. delegate_task subagents) or on retry #1 of a timeout.
+    if str(getattr(agent, "provider", "") or "").lower() == "vertex" and (
+        (is_rate_limited and _wrapped_output_cap_budget is None)
+        or classified.reason == FailoverReason.timeout
+    ):
+        try:
+            from agent.vertex_adapter import record_vertex_regional_429
+
+            _v_sid = (
+                None
+                if (
+                    getattr(agent, "_write_origin", None) == "background_review"
+                    or getattr(agent, "_memory_write_origin", None) == "background_review"
+                    or getattr(agent, "_turn_origin", None) == "background_review"
+                )
+                else str(getattr(agent, "session_id", "") or "") or None
+            )
+            record_vertex_regional_429(session_id=_v_sid)
+        except Exception:
+            pass
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an
         # upstream-aggregator 429 — the pool can't help, always fall back.
@@ -1936,14 +1958,6 @@ def route_classified_error(
         # CF-82: when primary/current provider is Vertex AI, Dynamic Shared Quota (DSQ) 429s
         # are transient per-second capacity bursts; retry in-place with backoff before
         # escalating to the emergency OpenRouter fallback on the final retry attempt.
-        # P0-1 Hybrid Router: also trip the europe-west2 15s cooldown on any Vertex 429 so
-        # the very next retry routes to locations/global instead of hitting regional 429 again.
-        if str(getattr(agent, "provider", "") or "").lower() == "vertex" and is_rate_limited:
-            try:
-                from agent.vertex_adapter import record_vertex_regional_429
-                record_vertex_regional_429()
-            except Exception:
-                pass
         _vertex_dsq_backoff_may_recover = (
             str(getattr(agent, "provider", "") or "").lower() == "vertex"
             and is_rate_limited
