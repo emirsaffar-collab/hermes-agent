@@ -825,6 +825,10 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     last_kanban_poll = last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         now = time.monotonic()
+        from tools.process_registry import process_registry as _live_pr
+        if _live_pr is not None and _live_pr.completion_queue is not queue:
+            process_registry = _live_pr
+            queue = _live_pr.completion_queue
         # Completions whose owner process died after this one started (#97202); throttled per profile home.
         try:
             async_delegation.maybe_sweep_orphaned_completions(queue)

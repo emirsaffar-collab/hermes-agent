@@ -424,11 +424,17 @@ def restore_undelivered_completions(target_queue) -> int:
         return 0  # nothing to replay; a replay must not create (or migrate) the ledger (#123265)
     recover_abandoned_delegations()
     now = time.time()
+    alive = _owner_liveness()
     with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
+        raw_rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at, owner_pid, owner_started_at
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
+        rows = [
+            (did, payload, comp, disp)
+            for did, payload, comp, disp, pid, started in raw_rows
+            if pid is None or int(pid) == os.getpid() or alive is None or not alive(pid, started)
+        ]
         return _replay_pending(conn, rows, target_queue, now, startup=True)
 
 
