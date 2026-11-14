@@ -109,6 +109,20 @@ def _status_path() -> Path:
     return Path.home() / ".hermes" / "state" / "ai-cost-realtime-status.json"
 
 
+def _emergency_brake_flag_path() -> Path:
+    env_p = os.environ.get("HERMES_AI_EMERGENCY_BRAKE_FLAG_PATH")
+    if env_p:
+        return Path(env_p)
+    return Path.home() / ".hermes" / "state" / "ai-emergency-brake-override.flag"
+
+
+def is_manual_emergency_brake_active() -> bool:
+    try:
+        return _emergency_brake_flag_path().exists()
+    except Exception:
+        return False
+
+
 def _day_cet(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts, tz=_STOCKHOLM_TZ).strftime("%Y-%m-%d")
 
@@ -382,7 +396,7 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
             cur.execute(
                 """
                 SELECT COUNT(*), COALESCE(SUM(net_eur), 0.0),
-                       COALESCE(SUM(CASE WHEN source NOT IN ('desktop', 'log_tail') THEN net_eur ELSE 0.0 END), 0.0),
+                       COALESCE(SUM(CASE WHEN source NOT IN ('desktop', 'mobile', 'tui', 'tui_gateway', 'gui', 'web', 'cli', 'interactive', 'log_tail') THEN net_eur ELSE 0.0 END), 0.0),
                        COALESCE(SUM(uncached_in), 0), COALESCE(SUM(cached_in), 0),
                        COALESCE(SUM(cache_reset), 0)
                 FROM llm_call_ledger WHERE day_cet = ? AND source != 'log_tail'
@@ -437,12 +451,28 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
     hit1h = round(100.0 * ca1h / max(1, u1h + ca1h), 2) if (u1h + ca1h) > 0 else 100.0
     hitday = round(100.0 * caday / max(1, uday + caday), 2) if (uday + caday) > 0 else 100.0
     hitday_all = round(100.0 * caday_all / max(1, uday_all + caday_all), 2) if (uday_all + caday_all) > 0 else 100.0
+    manual_brake = is_manual_emergency_brake_active()
+    eurday_f = float(eurday or 0.0)
+    eur15_f = float(eur15 or 0.0)
+    q_int = int(q_count or 0)
+    if manual_brake:
+        breaker_state = "MANUAL_EMERGENCY_BRAKE"
+    elif eurday_f >= TIER3_DAILY_HARD_CAP_EUR:
+        breaker_state = "TIER3_DAILY_HARD_CAP"
+    elif eurday_f >= TIER2_DAILY_SOFT_CAP_EUR or eur15_f >= TIER2_ESTATE_15M_BURST_EUR:
+        breaker_state = "TIER2_DAILY_SOFT_CAP"
+    elif q_int > 0:
+        breaker_state = "TIER1_SESSION_QUARANTINED"
+    else:
+        breaker_state = "ARMED_OK"
 
     return {
         "ts": ts_now,
         "day_cet": day_cet,
+        "breaker_state": breaker_state,
+        "manual_emergency_brake_active": manual_brake,
         "calls_15m": int(c15 or 0),
-        "net_eur_15m": round(float(eur15 or 0.0), 4),
+        "net_eur_15m": round(eur15_f, 4),
         "cache_hit_pct_15m": hit15,
         "cache_resets_15m": int(cr15 or 0),
         "calls_1h": int(c1h or 0),
@@ -450,14 +480,14 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
         "cache_hit_pct_1h": hit1h,
         "cache_resets_1h": int(cr1h or 0),
         "calls_today": int(cday or 0),
-        "net_eur_today": round(float(eurday or 0.0), 4),
+        "net_eur_today": round(eurday_f, 4),
         "calls_today_all": int(cday_all or 0),
         "net_eur_today_all": round(float(eurday_all or 0.0), 4),
         "cache_hit_pct_today_all": hitday_all,
         "net_eur_today_non_interactive": round(float(eurday_non_int or 0.0), 4),
         "cache_hit_pct_today": hitday,
         "cache_resets_today": int(crday or 0),
-        "active_quarantined_sessions": int(q_count or 0),
+        "active_quarantined_sessions": q_int,
         "may_2027_daily_target_eur": MAY_2027_DAILY_TARGET_EUR,
     }
 
@@ -511,7 +541,7 @@ def evaluate_realtime_spend_breaker(
     ts_now = float(now if now is not None else time.time())
     day_cet = _day_cet(ts_now)
     src = (source or "desktop").strip().lower()
-    is_interactive = src in ("desktop", "tui_gateway", "cli", "interactive")
+    is_interactive = src in ("desktop", "mobile", "tui", "tui_gateway", "gui", "web", "cli", "interactive")
     is_tier0 = is_tier0_critical_cron(job_name, session_id)
 
     try:
@@ -615,6 +645,14 @@ def evaluate_realtime_spend_breaker(
             "allowed": True,
             "reason": "tier0_critical_cron_exempt",
             "session_net_eur_15m": s_eur_15m,
+            "estate_net_eur_today": estate_today,
+        }
+
+    # Manual Home Assistant Emergency Brake Override blocks all non-Tier-0 non-interactive sessions
+    if is_manual_emergency_brake_active():
+        return {
+            "allowed": False,
+            "reason": "manual_ha_emergency_brake (Home Assistant Emergency Brake switch is ON)",
             "estate_net_eur_today": estate_today,
         }
 

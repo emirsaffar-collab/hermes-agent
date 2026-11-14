@@ -117,5 +117,37 @@ def test_bq_verified_rates_and_in_process_upgrades_log_tail(tmp_path, monkeypatc
     assert summary["calls_today_all"] == 1
     assert summary["net_eur_today"] == summary["net_eur_today_all"]
 
+    # Interactive human surfaces (desktop, mobile, tui) are never blocked by Tier 3 daily cap
+    rsb.record_realtime_llm_call(
+        session_id="cron_big",
+        source="cron",
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=20_000_000,
+        uncached_input_tokens=20_000_000,
+        cache_read_tokens=0,
+        output_tokens=20_000_000,
+        request_id="rid_big_cap",
+    )
+    verdict_mobile = rsb.evaluate_realtime_spend_breaker(
+        session_id="20261114_053148_a1c3c5",
+        source="mobile",
+        model="google/gemini-4-argon",
+        provider="vertex",
+        making_productive_progress=True,
+    )
+    assert verdict_mobile["allowed"] is True
+    assert verdict_mobile["reason"] == "interactive_allowed"
+    verdict_tui = rsb.evaluate_realtime_spend_breaker(
+        session_id="20261114_053148_a1c3c6",
+        source="tui",
+        model="google/gemini-4-argon",
+        provider="vertex",
+        making_productive_progress=True,
+    )
+    assert verdict_tui["allowed"] is True
+    assert verdict_tui["reason"] == "interactive_allowed"
+
+
 
 
