@@ -245,10 +245,14 @@ def _session_rows_sig(conn, mtime):
         # A state.db without a readable sessions table (foreign schema, legacy or transient file): keep
         # the old mtime contract so any move still wakes the sidebar instead of silently never broadcasting.
         return (_MTIME_FALLBACK, mtime), True
-    expr = " || ',' || ".join(f"quote({f})" for f in fields)
-    row = conn.execute(f"SELECT count(*), group_concat({expr}, ';') FROM sessions").fetchone()
-    raw = f"{row[0]}:{row[1] or ''}".encode("utf-8", "backslashreplace")
-    digest = hashlib.blake2b(raw, digest_size=16)
+    row_expr = " || '|' || ".join(f"quote({field})" for field in fields)
+    cur = conn.execute(f"SELECT {row_expr} FROM sessions")
+    digest = hashlib.blake2b(digest_size=16)
+    count = 0
+    while batch := cur.fetchmany(4096):
+        count += len(batch)
+        digest.update(("".join(f"{r[0]}\n" for r in batch)).encode("utf-8", "surrogatepass"))
+    digest.update(f":{count}".encode("ascii"))
     return (fields, digest.digest()), False
 
 

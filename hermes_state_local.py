@@ -4,9 +4,9 @@ import threading
 import time
 from collections import OrderedDict
 
+from hermes_state_common import LOCAL_POLICY_PREFIX as POLICY_PREFIX, NONDEFAULT_POLICY_WHERE
 from hermes_state_runtime import RuntimeStoreError, _epoch, _json
 
-POLICY_PREFIX = 'gateway.local_policy.v1:'
 API_BINDING_PREFIX = 'gateway.api.binding.v1.'
 API_DECLARED_PREFIX = 'gateway.api.conversation.v1.'
 
@@ -159,10 +159,14 @@ def retire_local_receipts(conn, session_ids):
     targets = set(session_ids)
     if not targets:
         return
-    # Prefix scans (GLOB uses the key index), not one LIKE per id: a prune retires thousands.
-    gone = [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
-                                               (POLICY_PREFIX + '*',))
-            if _policy_target(value) in targets]
+    # Single-snapshot UNION: direct PK probe for default receipts (entry.session_id == key suffix)
+    # plus partial index idx_state_meta_local_policy_special for repointed receipts.
+    rows = conn.execute(
+        'SELECT key,value FROM state_meta WHERE key IN (SELECT ? || value FROM json_each(?)) '
+        f'UNION SELECT key,value FROM state_meta WHERE {NONDEFAULT_POLICY_WHERE}',
+        (POLICY_PREFIX, json.dumps(sorted(targets))),
+    ).fetchall()
+    gone = [key for key, value in rows if _policy_target(value) in targets]
     gone += [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
                                                 (API_DECLARED_PREFIX + '*',)) if value in targets]
     gone += [API_BINDING_PREFIX + sid for sid in targets]

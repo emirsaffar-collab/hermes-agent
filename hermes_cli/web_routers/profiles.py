@@ -246,6 +246,7 @@ _SIDEBAR_CACHE_MAX_ENTRIES = 32
 _SIDEBAR_PROFILE_CACHE_MAX_ENTRIES = 256
 _SIDEBAR_PROFILE_CACHE = OrderedDict()
 _SIDEBAR_PROFILE_CACHE_LOCK = threading.Lock()
+_PROFILES_SESSIONS_SCAN_LOCK = threading.Lock()
 
 
 def _stat_fingerprint(path: Path):
@@ -386,7 +387,6 @@ def _csv_list(value: Optional[str]) -> list[str]:
 
 
 @sessions_router.get("/api/profiles/sessions")
-@_sidebar_singleflight_cache
 def get_profiles_sessions(
     # ``le=500`` caps the page size — this endpoint fans out across EVERY profile's state.db.
     # 500 (not 100) because desktop callers use limit=200 and the electron remote-merge
@@ -445,25 +445,37 @@ def get_profiles_sessions(
             home, source=source_val, sources=sources_list,
             exclude_sources=exclude_list_opt)
         scoped = {**filters, "exclude_sources": exclude, "include_subagents": include_subagents}
-        profile_cache_key = (
-            str(db_path), _sidebar_db_fingerprint(db_path), "profiles_sessions",
-            per_profile, order, bool(full), source_val,
-            tuple(sources_list or ()), tuple(exclude or ()),
-            include_subagents, min_msg_cnt,
-            inc_archived, arch_only,
-        )
-        cached_pair = _sidebar_profile_cache_get(profile_cache_key)
+        use_cache = _SIDEBAR_CACHE_TTL_SECONDS > 0 and storage_state(db_path) != STORAGE_CORRUPT
+        def _cache_key(
+            db_path=db_path, per_profile=per_profile, order=order, full=full,
+            source_val=source_val, sources_list=sources_list, exclude=exclude,
+            include_subagents=include_subagents, min_msg_cnt=min_msg_cnt,
+            inc_archived=inc_archived, arch_only=arch_only,
+        ):
+            return (
+                str(db_path), _sidebar_db_fingerprint(db_path), "profiles_sessions",
+                per_profile, order, bool(full), source_val,
+                tuple(sources_list or ()), tuple(exclude or ()),
+                include_subagents, min_msg_cnt,
+                inc_archived, arch_only,
+            )
+        cached_pair = _sidebar_profile_cache_get(_cache_key()) if use_cache else None
         if cached_pair is None:
-            def _read(db, scoped=scoped, profile_cache_key=profile_cache_key):
-                rows = db.list_sessions_rich(
-                    limit=per_profile, offset=0, order_by_last_active=order == "recent",
-                    # Same SQL-level blob skip as /api/sessions.
-                    compact_rows=not full, include_pinned=True, **scoped)
-                cnt = db.session_count(exclude_children=True, **scoped)
-                pair = (rows, cnt)
-                _sidebar_profile_cache_put(profile_cache_key, pair)
-                return pair
-            cached_pair = _read_profile_db(name, home, errors, _read)
+            with (_PROFILES_SESSIONS_SCAN_LOCK if use_cache else contextlib.nullcontext()):
+                if use_cache:
+                    cached_pair = _sidebar_profile_cache_get(_cache_key())
+                if cached_pair is None:
+                    def _read(db, scoped=scoped, _cache_key=_cache_key, use_cache=use_cache):
+                        rows = db.list_sessions_rich(
+                            limit=per_profile, offset=0, order_by_last_active=order == "recent",
+                            # Same SQL-level blob skip as /api/sessions.
+                            compact_rows=not full, include_pinned=True, **scoped)
+                        cnt = db.session_count(exclude_children=True, **scoped)
+                        pair = (rows, cnt)
+                        if use_cache:
+                            _sidebar_profile_cache_put(_cache_key(), pair)
+                        return pair
+                    cached_pair = _read_profile_db(name, home, errors, _read)
             if cached_pair is None:
                 continue
         rows, cnt = cached_pair

@@ -804,13 +804,27 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """
 
+LOCAL_POLICY_PREFIX = "gateway.local_policy.v1:"
+_LOCAL_POLICY_ID_OFFSET = len(LOCAL_POLICY_PREFIX) + 1
+# Shared partial-index predicate for non-default local policy receipts in state_meta:
+# every valid receipt outside this predicate has key='gateway.local_policy.v1:'||sid,
+# session_id=sid, lineage=None, entry.session_id=sid, and a non-derived request_id.
+NONDEFAULT_POLICY_WHERE = (
+    f"key GLOB '{LOCAL_POLICY_PREFIX}*' AND json_valid(value) AND ("
+    f"json_type(value, '$.lineage') IS NOT NULL "
+    f"OR json_extract(value, '$.entry.session_id') IS NOT substr(key, {_LOCAL_POLICY_ID_OFFSET}) "
+    f"OR json_extract(value, '$.session_id') IS NOT substr(key, {_LOCAL_POLICY_ID_OFFSET}) "
+    "OR json_extract(value, '$.request_id') GLOB 'bot-chat:*' "
+    "OR json_extract(value, '$.request_id') GLOB 'a2a:*')"
+)
+
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
 # sessions_runtime_ledger_delete_guard: every delete path in this release retires a session's ledger rows
 # (session_admissions / worker_executions, ON DELETE RESTRICT) first, so only a release that predates the
 # gateway runtime reaches it. Such a release (schema_version 31 too, and it never refuses a newer schema)
 # otherwise dies on the bare FK with no hint. It prints the RAISE text verbatim and buckets errors by phrase,
 # so the text must stay free of the words it reads as storage damage, lock contention or disk trouble.
-DEFERRED_INDEX_SQL = """
+DEFERRED_INDEX_SQL = f"""
 DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard;
 CREATE TRIGGER IF NOT EXISTS sessions_runtime_ledger_delete_guard
 BEFORE DELETE ON sessions
@@ -960,15 +974,14 @@ CREATE INDEX IF NOT EXISTS idx_worker_executions_status_epoch
 CREATE INDEX IF NOT EXISTS idx_state_meta_local_policy_lineage
     ON state_meta(key)
     WHERE json_valid(value) AND json_array_length(value, '$.lineage') > 1;
+CREATE INDEX IF NOT EXISTS idx_state_meta_local_policy_special
+    ON state_meta(key)
+    WHERE {NONDEFAULT_POLICY_WHERE};
 CREATE INDEX IF NOT EXISTS idx_sessions_end_reason
     ON sessions(end_reason, id)
     WHERE end_reason IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_sessions_pinned_started
-    ON sessions(started_at DESC)
-    WHERE pinned = 1;
-CREATE INDEX IF NOT EXISTS idx_sessions_unarchived_source_started
-    ON sessions(source, started_at DESC)
-    WHERE archived = 0 AND hidden = 0;
+CREATE INDEX IF NOT EXISTS idx_sessions_source_started
+    ON sessions(source, started_at DESC);
 """
 
 
