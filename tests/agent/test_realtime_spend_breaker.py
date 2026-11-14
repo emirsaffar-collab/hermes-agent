@@ -149,5 +149,51 @@ def test_bq_verified_rates_and_in_process_upgrades_log_tail(tmp_path, monkeypatc
     assert verdict_tui["reason"] == "interactive_allowed"
 
 
+def test_manual_ha_emergency_brake_override_blocks_non_interactive_only(tmp_path, monkeypatch):
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    brake_flag = tmp_path / "ai-emergency-brake-override.flag"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+    monkeypatch.setenv("HERMES_AI_EMERGENCY_BRAKE_FLAG_PATH", str(brake_flag))
+
+    assert rsb.is_manual_emergency_brake_active() is False
+    v_ok = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_normal",
+        source="cron",
+        job_name="atlas-watchdog",
+    )
+    assert v_ok["allowed"] is True
+
+    brake_flag.write_text("on\n")
+    assert rsb.is_manual_emergency_brake_active() is True
+    summary = rsb.get_realtime_spend_summary()
+    assert summary["manual_emergency_brake_active"] is True
+    assert summary["breaker_state"] == "MANUAL_EMERGENCY_BRAKE"
+
+    v_blocked = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_normal",
+        source="cron",
+        job_name="atlas-watchdog",
+    )
+    assert v_blocked["allowed"] is False
+    assert "manual_ha_emergency_brake" in v_blocked["reason"]
+
+    v_tier0 = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_tier0",
+        source="cron",
+        job_name="alert-triage",
+    )
+    assert v_tier0["allowed"] is True
+
+    v_desktop = rsb.evaluate_realtime_spend_breaker(
+        session_id="desktop_user",
+        source="desktop",
+        making_productive_progress=True,
+    )
+    assert v_desktop["allowed"] is True
+
+
+
 
 
