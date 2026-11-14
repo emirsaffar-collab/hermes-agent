@@ -1839,7 +1839,8 @@ class SessionDB(
         if not prefix:
             return []
         rows = self._read_all(
-            "SELECT key, value FROM state_meta WHERE key LIKE ? ESCAPE '\\'", (_escape_like(prefix) + "%",),
+            "SELECT key, value FROM state_meta WHERE key >= ? AND key < ? AND key LIKE ? ESCAPE '\\'",
+            (prefix, prefix + "\uffff", _escape_like(prefix) + "%"),
         )
         return [(row[0], row[1]) for row in rows]
 
