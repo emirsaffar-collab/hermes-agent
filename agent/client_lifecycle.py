@@ -478,16 +478,22 @@ class ClientLifecycleMixin:
             req_model = (api_kwargs or {}).get("model") or getattr(self, "model", None)
             is_interactive = (
                 getattr(self, "_write_origin", None) != "background_review"
+                and getattr(self, "_memory_write_origin", None) != "background_review"
+                and getattr(self, "_turn_origin", None) != "background_review"
+                and ":bg-review:" not in str(getattr(self, "session_id", "") or "")
                 and getattr(self, "platform", None) != "cron"
             )
             parsed_vertex = parse_vertex_base_url(raw_base_url)
             if parsed_vertex is not None:
                 project_id, configured_region = parsed_vertex
+                _cc = getattr(self, "context_compressor", None)
+                _last_prompt_tok = int(getattr(_cc, "last_prompt_tokens", 0) or 0) if _cc is not None else 0
                 target_region, slot_held = acquire_vertex_hybrid_region(
                     req_model,
                     configured_region=configured_region,
                     interactive=is_interactive,
                     session_id=getattr(self, "session_id", None),
+                    last_prompt_tokens=_last_prompt_tok,
                 )
                 routed_base_url = build_vertex_base_url(project_id, target_region)
                 request_kwargs["base_url"] = routed_base_url

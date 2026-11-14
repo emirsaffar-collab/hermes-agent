@@ -417,6 +417,63 @@ def begin_iteration(
             )
         return _verdict("break")
 
+    with suppress(Exception):
+        from agent.realtime_spend_breaker import evaluate_realtime_spend_breaker
+        from agent.session_source import session_source_for
+
+        _rt_src = (
+            "background_review"
+            if getattr(agent, "_write_origin", None) == "background_review"
+            else session_source_for(getattr(agent, "platform", None))
+        )
+        _tg_ctrl = getattr(agent, "_tool_guardrails", None)
+        _productive = (
+            bool(_tg_ctrl.is_making_productive_progress())
+            if _tg_ctrl is not None and callable(getattr(_tg_ctrl, "is_making_productive_progress", None))
+            else True
+        )
+        _rt_job = str(
+            getattr(agent, "cron_job_name", None)
+            or getattr(agent, "_turn_route_task", "")
+            or ""
+        )
+        _tier0_extra_prefixes = (
+            "chat247-",
+            "nw-chat-",
+            "newintra-",
+            "medius-",
+            "lager-",
+            "2izii-",
+            "post-deploy-verify-",
+            "emir-morning-routine",
+            "alerts-digest",
+            "svea-",
+            "cart-",
+            "store-support-",
+        )
+        _rt_eval_job = (
+            f"chat-247:{_rt_job}"
+            if _rt_job.lower().startswith(_tier0_extra_prefixes)
+            else _rt_job
+        )
+        _rt_verdict = evaluate_realtime_spend_breaker(
+            session_id=str(getattr(agent, "session_id", "") or "unknown"),
+            source=_rt_src,
+            model=str(getattr(agent, "model", "") or ""),
+            provider=str(getattr(agent, "provider", "") or ""),
+            job_name=_rt_eval_job,
+            making_productive_progress=_productive,
+            consecutive_calls_since_user=int(api_call_count or 0),
+        )
+        if not _rt_verdict.get("allowed", True):
+            _turn_exit_reason = f"realtime_spend_breaker:{_rt_verdict.get('reason', 'cap_exceeded')}"
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n🛑 Realtime AI spend breaker tripped ({_rt_verdict.get('reason')}) — stopping loop.",
+                    diagnostic=True,
+                )
+            return _verdict("break")
+
     api_call_count += 1
     agent._api_call_count = api_call_count
     agent._touch_activity(f"starting API call #{api_call_count}")

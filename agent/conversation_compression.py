@@ -3421,11 +3421,14 @@ def _reset_read_dedup_caches(
     """
     with contextlib.suppress(Exception):
         from tools.file_tools_read_tracking import reset_file_dedup
-        reset_file_dedup(task_id)
+        reset_file_dedup(task_id, surviving_messages=surviving_messages)
     if session_id:
         with contextlib.suppress(Exception):
             from tools.computer_use.tool import reset_screenshot_dedup
             reset_screenshot_dedup(session_id)
+        with contextlib.suppress(Exception):
+            from agent.vertex_adapter import reset_vertex_sticky_region
+            reset_vertex_sticky_region(session_id, only_if_global=True)
     with contextlib.suppress(Exception):
         from tools.skills_tool import reset_skill_view_dedup
         reset_skill_view_dedup(task_id, surviving_messages=surviving_messages)

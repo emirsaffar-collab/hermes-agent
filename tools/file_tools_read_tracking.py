@@ -21,6 +21,7 @@ container is hard-capped (``_cap_read_tracker_data``) so long sessions stay smal
 import contextlib
 import contextvars
 import hashlib
+import json
 import logging
 import os
 import stat
@@ -231,7 +232,69 @@ def _bump_consecutive(task_data: dict, key: tuple) -> int:
     return task_data["consecutive"]
 
 
-def reset_file_dedup(task_id: str | None = None):
+def seed_file_dedup_from_messages(task_id: str | None, messages: list | None) -> None:
+    """Re-seed ``dedup_generation_reads`` for unpruned ``read_file`` outputs that survived in *messages*."""
+    if not task_id or not isinstance(messages, list):
+        return
+    tid = str(task_id)
+    call_args: dict[str, tuple[str, int, int]] = {}
+    surviving_call_ids: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                if fn.get("name") != "read_file":
+                    continue
+                tc_id = tc.get("id")
+                if not tc_id:
+                    continue
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    continue
+                p = args.get("path")
+                if not p or not isinstance(p, str):
+                    continue
+                off = int(args.get("offset", 1) or 1)
+                lim = int(args.get("limit", 2000) or 2000)
+                resolved = _resolved_or_none(p, tid) or os.path.realpath(os.path.expanduser(p))
+                call_args[str(tc_id)] = (resolved, off, lim)
+        elif role == "tool":
+            tc_id = str(msg.get("tool_call_id") or "")
+            if tc_id not in call_args:
+                continue
+            content = str(msg.get("content") or "")
+            if not content or "[read_file output demoted at compaction" in content:
+                continue
+            try:
+                payload = json.loads(content)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("content"), str) and not payload.get("deduplicated"):
+                surviving_call_ids.add(tc_id)
+    if not surviving_call_ids:
+        return
+    candidate_keys = [call_args[cid] for cid in surviving_call_ids if cid in call_args]
+    with _read_tracker_lock:
+        td = _read_tracker.get(tid)
+        if not td:
+            return
+        dedup_map = dict(td.get("dedup") or {})
+    valid_keys = [k for k in candidate_keys if k in dedup_map and _file_metadata(k[0]) == dedup_map[k]]
+    if valid_keys:
+        with _read_tracker_lock:
+            td = _read_tracker.get(tid)
+            if td is not None:
+                gen = td.setdefault("dedup_generation_reads", set())
+                gen.update(valid_keys)
+
+
+def reset_file_dedup(task_id: str | None = None, *, surviving_messages: list | None = None):
     """Advance the read-dedup generation after context compression (one task, or all
     when ``task_id`` is None). The per-key ``dedup`` metadata map is PRESERVED so unchanged
     files keep returning stubs instead of re-bloating the reclaimed context; the
@@ -260,6 +323,8 @@ def reset_file_dedup(task_id: str | None = None):
                 for p in changed:
                     if task_data["full_write_baselines"].get(p) == baselines[p]:
                         task_data["full_write_baselines"].pop(p, None)
+    if task_id is not None and surviving_messages:
+        seed_file_dedup_from_messages(task_id, surviving_messages)
 
 
 def notify_other_tool_call(task_id: str = "default"):

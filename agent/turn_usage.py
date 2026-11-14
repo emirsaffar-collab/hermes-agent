@@ -304,6 +304,35 @@ def record_response_usage(
                 agent.session_id, total_tokens, e,
             )
 
+    with suppress(Exception):
+        import os as _os_rt
+        from agent.realtime_spend_breaker import record_realtime_llm_call
+
+        _rt_source = (
+            "background_review"
+            if getattr(agent, "_write_origin", None) == "background_review"
+            else _agent_session_source(agent)
+        )
+        _rt_job = str(
+            getattr(agent, "cron_job_name", None)
+            or _os_rt.environ.get("HERMES_CRON_JOB_NAME", "")
+            or getattr(agent, "_turn_route_task", "")
+            or ""
+        )
+        record_realtime_llm_call(
+            session_id=str(getattr(agent, "session_id", "") or "unknown"),
+            source=_rt_source,
+            provider=str(_agg_cost_provider or agent.provider or "unknown"),
+            model=str(_agg_cost_model or agent.model or "unknown"),
+            prompt_tokens=int(usage_dict.get("prompt_tokens") or prompt_tokens or 0),
+            uncached_input_tokens=int(canonical_usage.input_tokens or 0),
+            cache_read_tokens=int(canonical_usage.cache_read_tokens or 0),
+            output_tokens=int((canonical_usage.output_tokens or 0) + (canonical_usage.reasoning_tokens or 0)),
+            request_id=_rid if isinstance(_rid, str) else None,
+            job_name=_rt_job,
+            estimated_cost_usd=_cost_delta,
+        )
+
     if agent.verbose_logging:
         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
 
