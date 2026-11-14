@@ -220,7 +220,8 @@ def acquire_vertex_hybrid_region(
     raw_sid = str(session_id or "")
     pinned_region = get_session_vertex_region_affinity(session_id)
     is_bg_review_for_ew2_parent = (
-        ":bg-review:" in raw_sid and pinned_region == EUROPE_WEST2_VERTEX_REGION
+        pinned_region == EUROPE_WEST2_VERTEX_REGION
+        and (bool(raw_sid) or ":bg-review:" in raw_sid)
     )
     if (
         (interactive or is_bg_review_for_ew2_parent)

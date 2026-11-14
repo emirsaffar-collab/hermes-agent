@@ -58,6 +58,18 @@ def test_bg_review_inherits_parent_europe_west2_affinity():
     assert slot is True
     vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
 
+    # Real build_cache_parity_fork shares parent.session_id directly (without :bg-review:)
+    region_direct, slot_direct = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=False,
+        session_id=parent_sid,
+        last_prompt_tokens=0,
+    )
+    assert region_direct == "europe-west2"
+    assert slot_direct is True
+    vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
+
 
 def test_seed_file_dedup_from_messages_seeds_surviving_reads(tmp_path):
     f = tmp_path / "sample.py"

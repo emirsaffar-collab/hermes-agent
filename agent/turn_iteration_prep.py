@@ -423,7 +423,11 @@ def begin_iteration(
 
         _rt_src = (
             "background_review"
-            if getattr(agent, "_write_origin", None) == "background_review"
+            if (
+                getattr(agent, "_write_origin", None) == "background_review"
+                or getattr(agent, "_memory_write_origin", None) == "background_review"
+                or getattr(agent, "_turn_origin", None) == "background_review"
+            )
             else session_source_for(getattr(agent, "platform", None))
         )
         _tg_ctrl = getattr(agent, "_tool_guardrails", None)

@@ -310,7 +310,11 @@ def record_response_usage(
 
         _rt_source = (
             "background_review"
-            if getattr(agent, "_write_origin", None) == "background_review"
+            if (
+                getattr(agent, "_write_origin", None) == "background_review"
+                or getattr(agent, "_memory_write_origin", None) == "background_review"
+                or getattr(agent, "_turn_origin", None) == "background_review"
+            )
             else _agent_session_source(agent)
         )
         _rt_job = str(
