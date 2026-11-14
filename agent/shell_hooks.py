@@ -50,20 +50,32 @@ _TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id
 
 # (home, event, matcher, command) wired in this process: matcher in the key (one script may register
 # per-tool under one event), home so multiplexed-gateway profiles can register identical triples.
-_registered: set[tuple[str, str, Optional[str], str]] = set()
-_logged_registrations: set[tuple[str, str, Optional[str], str]] = set()
-_registered_lock = threading.Lock()
+_prev_registered = globals().get("_registered")
+_registered: set[tuple[str, str, Optional[str], str]] = (
+    _prev_registered if isinstance(_prev_registered, set) else set()
+)
+_prev_logged = globals().get("_logged_registrations")
+_logged_registrations: set[tuple[str, str, Optional[str], str]] = (
+    _prev_logged if isinstance(_prev_logged, set) else set(_registered)
+)
+_registered_lock: threading.Lock = globals().get("_registered_lock") or threading.Lock()
 # Non-POSIX fallback for allowlist read-modify-write; separate from _registered_lock so an allowlist
 # write never waits on (or nests inside) a registry update.
-_allowlist_write_lock = threading.Lock()
+_allowlist_write_lock: threading.Lock = globals().get("_allowlist_write_lock") or threading.Lock()
 # sync_from_config: read + apply as one step, so an older snapshot never lands after a newer one.
-_sync_lock = threading.Lock()
+_sync_lock: threading.Lock = globals().get("_sync_lock") or threading.Lock()
 # Consent that lives only in this process (guarded by _sync_lock): (home, event, command) a launch's
 # --accept-hooks approved but the allowlist does not hold yet, this process's own --accept-hooks, and
 # the skipped hooks already logged.
-_launch_consent: set[tuple[str, str, str]] = set()
-_process_accept = False
-_skip_logged: set[tuple[str, str, str]] = set()
+_prev_launch_consent = globals().get("_launch_consent")
+_launch_consent: set[tuple[str, str, str]] = (
+    _prev_launch_consent if isinstance(_prev_launch_consent, set) else set()
+)
+_process_accept: bool = bool(globals().get("_process_accept", False))
+_prev_skip_logged = globals().get("_skip_logged")
+_skip_logged: set[tuple[str, str, str]] = (
+    _prev_skip_logged if isinstance(_prev_skip_logged, set) else set()
+)
 
 
 def _home_key() -> str:

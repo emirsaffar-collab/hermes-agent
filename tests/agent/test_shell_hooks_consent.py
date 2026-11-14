@@ -259,6 +259,15 @@ class TestNeverPromptOutsideForegroundCLI:
         assert "shell hook registered:" in caplog.text
         assert len(plugins._plugin_manager._hooks.get("on_session_start", [])) == 1
 
+        import importlib
+        importlib.reload(shell_hooks)
+        caplog.clear()
+        plugins._plugin_manager._hooks.clear()
+        with caplog.at_level(logging.INFO, logger="agent.shell_hooks"):
+            shell_hooks.re_register_config_hooks()
+        assert "shell hook registered:" not in caplog.text
+        assert len(plugins._plugin_manager._hooks.get("on_session_start", [])) == 1
+
 
 # ── Allowlist + revoke + mtime ────────────────────────────────────────────
 
