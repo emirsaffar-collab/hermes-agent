@@ -28,7 +28,7 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 DELIVERY_DB: Optional[Path] = None
-_PROCESS_ID = uuid.uuid4().hex
+_PROCESS_ID: str = globals().get("_PROCESS_ID") or uuid.uuid4().hex
 _lock = threading.RLock()
 _ACTIVE_DELIVERIES: set[str] = set()
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")

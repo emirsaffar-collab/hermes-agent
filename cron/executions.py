@@ -42,7 +42,7 @@ _STATUS_CHECK = "('claimed','running','completed','failed','unknown','cancelled'
 # dead-owner sweep must treat these as final, never replay or re-book them.
 FIRER_FINISHED_STATES = frozenset({"completed", "failed", "cancelled"})
 _lock = threading.RLock()
-_PROCESS_ID = uuid.uuid4().hex
+_PROCESS_ID: str = globals().get("_PROCESS_ID") or uuid.uuid4().hex
 
 
 # --- executions ledger --------------------------------------------------------------------------

@@ -18,12 +18,14 @@ import re
 # forbidden substrings must pass ``mask_code_consumers=False`` or the payload hides in the blanked
 # body (#127698).
 _INERT_HEREDOC_CONSUMER_RE = re.compile(
-    r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?"
-    r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
+    r"^(?:\\?\s)*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?"
+    r'(?:["\']?[A-Za-z0-9_./ ~-]+/["\']?)?'
+    r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)[\"']?(?=\s|$)",
     re.IGNORECASE)
 _STRICT_INERT_HEREDOC_CONSUMER_RE = re.compile(
-    r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?"
-    r"cat(?=\s|$)",
+    r"^(?:\\?\s)*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?"
+    r'(?:["\']?[A-Za-z0-9_./ ~-]+/["\']?)?'
+    r"cat[\"']?(?=\s|$)",
     re.IGNORECASE)
 
 
@@ -263,11 +265,11 @@ def strip_inert_heredoc_bodies(command: str, *, mask_code_consumers: bool = True
             and not post_heredoc_list_operator
         ):
             masked_opener = _mask_simple_quotes(command[command_start:command_end])
-            masked_owner = _mask_simple_quotes(command[owner_start:command_end])
+            raw_owner = command[owner_start:command_end]
             if not any(
                 marker in masked_opener
                 for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")
-            ) and consumer_re.search(masked_owner):
+            ) and consumer_re.search(raw_owner):
                 ranges.extend(body_ranges)
         command_start = body_cursor
     # Single-pass rebuild (ranges are sorted and non-overlapping), bodies -> their newlines only.

@@ -73,18 +73,67 @@ _TRAILING_BACKGROUND_AMP_RE = re.compile(r"\s&\s*(?:#.*)?$")
 
 
 def _strip_quotes(command: str) -> str:
-    """Blank quoted / backtick content and provably-inert heredoc bodies so
-    regex checks can't match keywords (nohup, setsid, '&') inside strings.
+    """Blank quoted / backtick content, shell comments, and provably-inert
+    heredoc bodies so regex checks can't match keywords (nohup, setsid, '&')
+    inside strings or comments.
 
     Heredocs are masked FIRST: their delimiter may itself be quoted
     (``<<'EOF'``). ``strip_inert_heredoc_bodies`` is conservative — only a
     quoted, terminated delimiter on a simple opener fed to a known non-shell
     consumer is masked, so a real background operator can't hide in one.
     """
-    result = strip_inert_heredoc_bodies(command)
-    result = re.sub(r"'[^']*'", "''", result)
-    result = re.sub(r'"(?:[^"\\]|\\.)*"', '""', result)
-    return re.sub(r"`[^`]*`", "``", result)
+    text = strip_inert_heredoc_bodies(command)
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "\n":
+                out.append("  ")
+                i += 2
+                continue
+            if nxt in ("'", '"', "`", "#", "&", "\\"):
+                out.append("__")
+                i += 2
+                continue
+            out.append(ch)
+            out.append(nxt)
+            i += 2
+            continue
+        if ch == "'":
+            end = text.find("'", i + 1)
+            if end == -1:
+                out.append(text[i:])
+                break
+            out.append("''")
+            i = end + 1
+            continue
+        if ch in ('"', "`"):
+            j = i + 1
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if text[j] == ch:
+                    break
+                j += 1
+            if j >= n:
+                out.append(text[i:])
+                break
+            out.append(ch * 2)
+            i = j + 1
+            continue
+        if ch == "#" and (i == 0 or text[i - 1].isspace() or text[i - 1] in ";&|()"):
+            nl = text.find("\n", i + 1)
+            if nl == -1:
+                break
+            i = nl
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 _LONG_LIVED_FOREGROUND_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (

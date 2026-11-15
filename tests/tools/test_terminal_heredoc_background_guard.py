@@ -322,3 +322,38 @@ class TestStripHelpers:
         # python bitwise-and inside a quoted body as payload, not a background operator.
         cmd = "python3 - <<'PY'" + NL + "z = a " + AMP + " b" + NL + "PY"
         assert (" " + AMP + " ") not in strip_inert_heredoc_bodies(cmd)
+
+    def test_tilde_and_quoted_space_interpreter_paths_mask_heredoc(self):
+        cmd_tilde = (
+            "~/.local/bin/python3.11 - << 'PY'" + NL
+            + "# 2. Backtest open-asks.py " + AMP + " lager-owner-monitor.py" + NL
+            + "print('ok')" + NL
+            + "PY"
+        )
+        assert guidance(cmd_tilde) is None
+        cmd_quoted = (
+            '"/Users/test/Claude Code/.venv/bin/python3" - <<\'PY\'' + NL
+            + "x = a " + AMP + " b" + NL
+            + "PY"
+        )
+        assert guidance(cmd_quoted) is None
+
+    def test_backslash_newline_before_cat_heredoc_masks_body(self):
+        cmd = (
+            "cp a b " + AMP + AMP + " \\" + NL
+            + "cat <<'EOF' > out.txt" + NL
+            + "foo " + AMP + " bar" + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is None
+
+    def test_shell_comment_and_escaped_single_quote_do_not_false_positive(self):
+        cmd_comment = (
+            "# run gate.sh + playwright 4-viewport geometry " + AMP + " screenshot capture" + NL
+            + "/bin/bash scripts/gate.sh"
+        )
+        assert guidance(cmd_comment) is None
+        cmd_escaped_sq = (
+            "python3 script.py --summary 'Today'\\''s Timeline: verify.py " + AMP + " dogfood.py PASS'"
+        )
+        assert guidance(cmd_escaped_sq) is None

@@ -514,3 +514,26 @@ def test_history_orders_by_instant_across_dst_fall_back(monkeypatch, tmp_path):
     ]
     page = executions.list_executions(job_id="dst-job", before_claimed_at=later["claimed_at"])
     assert [r["id"] for r in page] == [earlier["id"]]
+
+
+def test_module_reload_preserves_process_id_for_inflight_execution(monkeypatch, tmp_path):
+    """In-process hot-reload (e.g. plugin symbol reload) must not regenerate _PROCESS_ID
+    and orphan an in-flight execution row."""
+    import importlib
+    from cron import delivery_queue
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    before_exec_pid = executions._PROCESS_ID
+    before_deliv_pid = delivery_queue._PROCESS_ID
+    record = executions.create_execution("reload-job", source="scheduler")
+    assert executions.mark_execution_running(record["id"]) is not None
+
+    importlib.reload(executions)
+    importlib.reload(delivery_queue)
+    _point_ledger(monkeypatch, tmp_path)
+
+    assert executions._PROCESS_ID == before_exec_pid
+    assert delivery_queue._PROCESS_ID == before_deliv_pid
+    finished = executions.finish_execution(record["id"], success=True)
+    assert finished is not None
+    assert finished["status"] == "completed"
