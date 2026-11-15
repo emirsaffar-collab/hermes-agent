@@ -356,12 +356,24 @@ def _build_child_agent(
     child._inherited_conversation_id = conversation_id(parent_agent)
     child._root_session_id = getattr(parent_agent, "_root_session_id", None) or parent_sid  # type: ignore[attr-defined]
     _p_plat = str(getattr(parent_agent, "platform", "") or "").strip().lower()
+    _p_db_src = ""
+    if _p_plat in ("", "gateway", "local", "cli") and parent_sid:
+        with _quiet(None):
+            _sdb = getattr(parent_agent, "session_db", None) or getattr(parent_agent, "_session_db", None)
+            if _sdb is not None and callable(getattr(_sdb, "get_session", None)):
+                _srow = _sdb.get_session(parent_sid)
+                if isinstance(_srow, dict):
+                    _p_db_src = str(_srow.get("source") or "").strip().lower()
     child._parent_session_source = (  # type: ignore[attr-defined]
         getattr(parent_agent, "_parent_session_source", None)
         or (
             "cron"
-            if getattr(parent_agent, "cron_job_name", None) or str(parent_sid or "").startswith("cron_")
-            else _p_plat
+            if (
+                getattr(parent_agent, "cron_job_name", None)
+                or str(parent_sid or "").startswith("cron_")
+                or _p_db_src == "cron"
+            )
+            else (_p_db_src or _p_plat)
         )
     )
     child._delegate_context = context  # rides the first user turn, not the system prompt

@@ -69,7 +69,7 @@ TIER0_CRITICAL_CRON_15M_SAFETY_CAP_EUR = 12.00
 TIER2_ESTATE_15M_BURST_EUR = 8.00
 TIER2_DAILY_SOFT_CAP_EUR = 150.00
 TIER3_DAILY_HARD_CAP_EUR = 195.00
-_CF92_ITER0_FIX_REV = 2
+_CF92_ITER0_FIX_REV = 3
 
 _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "chat-247",
@@ -583,7 +583,7 @@ def evaluate_realtime_spend_breaker(
 ) -> dict[str, Any]:
     ts_now = float(now if now is not None else time.time())
     day_cet = _day_cet(ts_now)
-    src = (source or "desktop").strip().lower()
+    src = (source or "unknown").strip().lower()
     p_src = (parent_source or "").strip().lower()
     p_sid = (parent_session_id or "").strip()
     _interactive_surfaces = ("desktop", "mobile", "tui", "tui_gateway", "gui", "web", "cli", "interactive")
@@ -621,7 +621,16 @@ def evaluate_realtime_spend_breaker(
                     }
 
             # 2) Per-session (and subagent-family) 15m and 1h spend + cache resets
-            if family_job_tag:
+            if family_job_tag and not is_interactive_subagent:
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
+                    FROM llm_call_ledger
+                    WHERE (session_id IN (?, ?) OR job_name = ?) AND ts >= ?
+                    """,
+                    (session_id, p_sid, family_job_tag, ts_now - 900.0),
+                )
+            elif family_job_tag:
                 cur.execute(
                     """
                     SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
@@ -642,7 +651,12 @@ def evaluate_realtime_spend_breaker(
             s_eur_15m = float(s_eur_15m or 0.0)
             s_resets_15m = int(s_resets_15m or 0)
 
-            if family_job_tag:
+            if family_job_tag and not is_interactive_subagent:
+                cur.execute(
+                    "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE (session_id IN (?, ?) OR job_name = ?) AND ts >= ?",
+                    (session_id, p_sid, family_job_tag, ts_now - 3600.0),
+                )
+            elif family_job_tag:
                 cur.execute(
                     "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE (session_id = ? OR job_name = ?) AND ts >= ?",
                     (session_id, family_job_tag, ts_now - 3600.0),

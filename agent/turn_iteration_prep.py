@@ -367,7 +367,7 @@ class IterationStart:
     _turn_exit_reason: Any
 
 
-_CF92_ITER0_FIX_REV = 2
+_CF92_ITER0_FIX_REV = 3
 
 
 def begin_iteration(
@@ -435,6 +435,12 @@ def begin_iteration(
             if (
                 getattr(agent, "platform", None) == "subagent"
                 or int(getattr(agent, "_delegate_depth", 0) or 0) > 0
+            )
+            else "cron"
+            if (
+                getattr(agent, "cron_job_name", None)
+                or str(getattr(agent, "session_id", "") or "").startswith("cron_")
+                or str(getattr(agent, "platform", "") or "").strip().lower() == "cron"
             )
             else session_source_for(getattr(agent, "platform", None))
         )
