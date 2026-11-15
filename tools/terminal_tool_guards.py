@@ -12,6 +12,7 @@ keeps resolving.
 import functools
 import json
 import logging
+import os
 import re
 import shlex
 import stat
@@ -668,6 +669,9 @@ def gateway_lifecycle_block(
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
+        # Local backend only: the command shares this process's PID namespace, and the probe above
+        # proved this process IS the supervised gateway (#149944).
+        gateway_pid=os.getpid() if env_type == "local" else None,
         read_remote_script=(
             None
             if env_type == "local"
