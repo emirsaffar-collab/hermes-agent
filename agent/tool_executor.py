@@ -37,6 +37,11 @@ from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent import plugin_live_notes
 from agent.lsp import deferred as lsp_deferred
 from agent.prompt_cache_scope import conversation_id
+from agent.tool_executor_deadline import (
+    batch_deadline,
+    deadline_with_floor,
+    declared_deadline_floor,
+)
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
     InlineToolContext,
@@ -934,7 +939,6 @@ def _run_sequential_tool_execution_middleware(
     are ``_NEVER_PARALLEL_TOOLS`` and run inline below, before any deadline is armed, so
     they need no ``_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS`` entry."""
     from agent.tool_dispatch_helpers import _extend_tool_timeout
-    from agent.tool_executor_deadline import deadline_with_floor, declared_deadline_floor
 
     timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else deadline_with_floor(
         _resolve_sequential_tool_timeout(), declared_deadline_floor(function_name, function_args))
@@ -1628,8 +1632,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
 
     # Resolved before the batch is built so the start-order gate can clamp under the deadline.
-    from agent.tool_executor_deadline import batch_deadline
-
     timeout_s = batch_deadline(_resolve_concurrent_tool_timeout(), parsed_calls)
     batch = _ConcurrentBatch(agent, messages, effective_task_id, parsed_calls, timeout_s)
     agent._current_tool = tool_names_str

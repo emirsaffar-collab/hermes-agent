@@ -111,3 +111,13 @@ class TestSequentialRunnerHonoursTheFloor:
         monkeypatch.setattr(reg_mod, "registry", _LegacyRegistry())
         monkeypatch.setattr(reg_mod, "ToolRegistry", _LegacyRegistry)
         assert declared_deadline_floor("terminal", {}) is None
+
+    def test_tool_executor_binds_deadline_helpers_eagerly_at_import(self):
+        """agent.tool_executor must bind batch_deadline, deadline_with_floor, and
+        declared_deadline_floor at module top-level so a mid-session git update on disk
+        cannot lazily import a newer tool_executor_deadline into a stale process."""
+        import agent.tool_executor as te
+
+        assert callable(getattr(te, "batch_deadline", None))
+        assert callable(getattr(te, "deadline_with_floor", None))
+        assert callable(getattr(te, "declared_deadline_floor", None))
