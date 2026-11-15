@@ -10,9 +10,18 @@ _DECLARED_DEADLINE_GRACE_S = 5.0
 
 def declared_deadline_floor(name: str, args: dict) -> float | None:
     """Lower bound this call's deadline must clear, from the tool's own declaration."""
-    from tools.registry import registry
+    from tools.registry import ToolRegistry, registry
 
-    floor = registry.get_deadline_floor(name, args)
+    get_floor = getattr(registry, "get_deadline_floor", None) or getattr(
+        ToolRegistry, "get_deadline_floor", None
+    )
+    if get_floor is None:
+        return None
+    floor = (
+        get_floor(name, args)
+        if hasattr(get_floor, "__self__")
+        else get_floor(registry, name, args)
+    )
     return None if floor is None else floor + _DECLARED_DEADLINE_GRACE_S
 
 

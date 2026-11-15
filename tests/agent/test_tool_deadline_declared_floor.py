@@ -96,3 +96,18 @@ class TestSequentialRunnerHonoursTheFloor:
         result = _run(fake_agent, name, {}, monkeypatch, generic=0.3, work_seconds=1.0)
         assert not isinstance(result.result, _ToolTimeoutResult)
         assert result.result == "real result"
+
+    def test_declared_deadline_floor_tolerates_pre_reload_registry_instance(self, monkeypatch):
+        """During a live carried merge / hot-reload where tool_executor_deadline imports
+        against a pre-merge in-memory ToolRegistry singleton lacking get_deadline_floor,
+        declared_deadline_floor must degrade to None or class-method fallback rather than
+        raising AttributeError and breaking all tool calls."""
+        import tools.registry as reg_mod
+        from agent.tool_executor_deadline import declared_deadline_floor
+
+        class _LegacyRegistry:
+            pass
+
+        monkeypatch.setattr(reg_mod, "registry", _LegacyRegistry())
+        monkeypatch.setattr(reg_mod, "ToolRegistry", _LegacyRegistry)
+        assert declared_deadline_floor("terminal", {}) is None
