@@ -78,7 +78,43 @@ _STATUS_FIELDS = (
     ("leaveReason", "leave_reason", None), ("micState", "mic_state", None),
     # rtc capture telemetry
     ("rtcCapturing", "rtc_capturing", False), ("audioFragments", "audio_fragments", 0),
-    ("whisperModel", "whisper_model", None))
+    ("whisperModel", "whisper_model", None), ("pausedCapture", "paused_capture", False))
+
+
+_WAKE_ADDRESS_RE = re.compile(
+    r"\b(?:"
+    r"mr\.?\s*agent\w*|mister\s*agent\w*|mr\.?\s*notetaker|"
+    r"it-?notetaker|it-?nautiker|notetaker|notiker|"
+    r"mötesanteckning\w*|mötesbotten|ai-?botten|chattbotten|botten|bot|"
+    r"ai-?robot\w*|roboten|robot|ai-?agent\w*|agenten|"
+    r"min\s+kära\s+ai|kära\s+ai\w*|ai-?kolleg\w*|ai-?mir"
+    r")\b",
+    re.IGNORECASE,
+)
+_WAKE_IDIOM_EXCLUDE_RE = re.compile(
+    r"\b(?:i\s+grund\s+och\s+botten|gasen\s+i\s+botten|topp\s+till\s+botten|"
+    r"glashyllor\s+och\s+botten|stillbotten|komma\s+till\s+botten|roboterad\s+order)\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_voice_control(text: str) -> Optional[str]:
+    """Classify real-world spoken control commands addressed to Mr Agent / botten / roboten / agenten / notetaker."""
+    if not text or not _WAKE_ADDRESS_RE.search(text):
+        return None
+    cleaned = _WAKE_IDIOM_EXCLUDE_RE.sub("", text)
+    if not _WAKE_ADDRESS_RE.search(cleaned):
+        return None
+    low = cleaned.lower()
+    if re.search(r"\b(?:lämna\s+inte|stanna\s+kvar|gå\s+inte\s+ut)\b", low):
+        return "stay_in_call"
+    if re.search(r"\b(?:lämna\s+mötet|du\s+kan\s+lämna|hoppa\s+ut|gå\s+ur\s+mötet|leave\s+the\s+meeting)\b", low):
+        return "leave_call"
+    if re.search(r"\b(?:pausa\s+anteckning\w*|pausa\s+inspelning\w*|sluta\s+anteckna|sluta\s+spela\s+in|pause\s+notes)\b", low):
+        return "pause_capture"
+    if re.search(r"\b(?:fortsätt\s+anteckna|börja\s+anteckna|återuppta\s+anteckning\w*|resume\s+notes)\b", low):
+        return "resume_capture"
+    return None
 
 
 class _BotState:
@@ -122,9 +158,26 @@ class _BotState:
         if not text or key in self._seen:
             return
         self._seen.add(key)
-        self.transcript_lines += 1
         now_ts = time.time()
         self.last_caption_at = now_ts
+        vcmd = _classify_voice_control(text)
+        if vcmd == "resume_capture":
+            self.paused_capture = False
+            print(f"[meet_bot] voice_control=resume_capture by={speaker!r}", flush=True)
+        elif vcmd == "pause_capture":
+            self.paused_capture = True
+            print(f"[meet_bot] voice_control=pause_capture by={speaker!r}", flush=True)
+            self._flush()
+            return
+        elif vcmd == "stay_in_call":
+            self.stay_override_until = now_ts + 3600.0
+            print(f"[meet_bot] voice_control=stay_in_call (+3600s) by={speaker!r}", flush=True)
+        elif vcmd == "leave_call":
+            self.leave_reason = "voice_command_leave"
+            print(f"[meet_bot] voice_control=leave_call by={speaker!r}", flush=True)
+        if getattr(self, "paused_capture", False):
+            return
+        self.transcript_lines += 1
         anchor = self.joined_at or self.join_attempted_at
         cap_epoch = (float(anchor) + float(offset_s)) if (offset_s is not None and anchor) else now_ts
         ts = time.strftime("%H:%M:%S", time.localtime(cap_epoch))
@@ -1287,6 +1340,8 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
     alone_since = None
     while not stop_flag["stop"]:
         now = time.time()
+        if getattr(state, "leave_reason", None) == "voice_command_leave":
+            return
         if deadline and now > deadline:
             joined_ts = getattr(state, "joined_at", None)
             last_cap_ts = getattr(state, "last_caption_at", None)
@@ -1333,7 +1388,8 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                 had_other_participants = True
                 alone_since = None
             elif isinstance(pcount, int) and pcount <= 1:
-                recent_audio = bool(state.last_caption_at and (now - float(state.last_caption_at)) < 45.0)
+                stay_until = float(getattr(state, "stay_override_until", 0.0) or 0.0)
+                recent_audio = bool(state.last_caption_at and (now - float(state.last_caption_at)) < 45.0) or (now < stay_until)
                 if recent_audio:
                     alone_since = None
                 elif had_other_participants:
