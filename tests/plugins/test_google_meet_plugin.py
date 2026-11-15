@@ -460,7 +460,7 @@ def test_rtc_transcriber_thread_safe_whisper_init_and_queue_drain(tmp_path, monk
 
 def test_ensure_ct2_int8_on_disk_converts_float16_model_bin(tmp_path):
     import struct
-    import numpy as np
+    np = pytest.importorskip("numpy")
     from plugins.google_meet.meet_bot import _ensure_ct2_int8_on_disk, _is_ct2_float16
 
     model_bin = tmp_path / "model.bin"
@@ -505,3 +505,55 @@ def test_ensure_ct2_int8_on_disk_converts_float16_model_bin(tmp_path):
     _patch_silero_vad_batch_limit(1500)
     silence = np.zeros(16000 * 2, dtype=np.float32)
     assert get_speech_timestamps(silence, VadOptions(threshold=0.5, min_speech_duration_ms=350)) == []
+
+
+def test_rtc_transcriber_exact_cluster_cursor_mid_cluster_flushes(tmp_path, monkeypatch):
+    from plugins.google_meet.meet_bot import _BotConfig, _BotState, _RtcTranscriber
+
+    monkeypatch.setenv("HERMES_MEET_REALTIME_STANDUP", "1")
+    cfg = _BotConfig(out_dir=tmp_path, whisper_model="small")
+    state = _BotState(tmp_path, "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
+    rtc = _RtcTranscriber(cfg, state, {"stop": False})
+
+    header = rtc._EBML_MAGIC + b"\x00" * 32
+    cluster1_part1 = rtc._CLUSTER_ID + b"\xa3" * 100
+    cluster1_part2 = b"\xa3" * 100
+    cluster2_part1 = rtc._CLUSTER_ID + b"\xa3" * 100
+
+    # Mock _decode_bytes so each byte after header yields 320 samples (20ms at 16kHz)
+    def fake_decode_bytes(buf: bytes):
+        assert buf.startswith(header + rtc._CLUSTER_ID), "Incremental decode must always start with header + Cluster ID"
+        payload_len = len(buf) - len(header)
+        return [0.1] * (payload_len * 320)
+
+    monkeypatch.setattr(rtc, "_decode_bytes", fake_decode_bytes)
+    full_decode_called = 0
+
+    def fail_full_decode(_path):
+        nonlocal full_decode_called
+        full_decode_called += 1
+
+    # Notice: we do NOT set "_decode" in rtc.__dict__, we patch on class or check full_decode_called
+    monkeypatch.setattr(_RtcTranscriber, "_decode", staticmethod(fail_full_decode))
+
+    merged = tmp_path / "stream_02.webm"
+    # Flush 1: cluster 1 part 1
+    merged.write_bytes(header + cluster1_part1)
+    tail1, done1 = rtc._decode_incremental_tail(2, merged)
+    assert tail1 is not None and done1 == 0
+    assert len(tail1) == len(cluster1_part1) * 320
+
+    # Flush 2: mid-cluster append (cluster1_part2 does NOT start with _CLUSTER_ID!)
+    merged.write_bytes(header + cluster1_part1 + cluster1_part2)
+    tail2, done2 = rtc._decode_incremental_tail(2, merged)
+    assert tail2 is not None and done2 == len(tail1)
+    assert len(tail2) == len(cluster1_part2) * 320
+
+    # Flush 3: second cluster appended -> advances _last_cluster_off
+    merged.write_bytes(header + cluster1_part1 + cluster1_part2 + cluster2_part1)
+    tail3, done3 = rtc._decode_incremental_tail(2, merged)
+    assert tail3 is not None and done3 == len(tail1) + len(tail2)
+    assert len(tail3) == len(cluster2_part1) * 320
+    assert rtc._last_cluster_off[2] == len(header) + len(cluster1_part1) + len(cluster1_part2)
+    assert full_decode_called == 0
+

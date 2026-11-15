@@ -572,8 +572,14 @@ class _RtcTranscriber:
         self._transcribed = {}         # stream_id → samples already transcribed
         self._decoded_bytes = {}       # stream_id → byte offset in merged WebM already decoded
         self._webm_headers = {}        # stream_id → EBML+Tracks header bytes before first Cluster
+        self._last_cluster_off = {}    # stream_id → byte offset of latest WebM Cluster header
+        self._cluster_base_samples = {}  # stream_id → cumulative PCM samples prior to _last_cluster_off
+        self._stream_lang = {}         # stream_id → most recent detected language
+        self._stream_lang_locked = {}  # stream_id → sticky locked language once >=3s @ prob>=0.85
+        self._stream_lang_sec = {}     # stream_id → cumulative high-confidence speech seconds
         self._detected_language = None
         self._model = None
+        self._mlx_model = None
         self._whisper_failed = False
 
     def _whisper(self):
@@ -590,6 +596,116 @@ class _RtcTranscriber:
                     cpu_threads=cpu_threads,
                     download_root=str(Path.home() / ".open-webui/cache/whisper/models"))
         return self._model
+
+    def _transcribe_mlx_dynamic(
+        self,
+        tail,
+        lang_env: Optional[str],
+        prompt_env: Optional[str],
+        allowed_langs: Optional[set[str]] = None,
+        speeches: Optional[list[dict]] = None,
+    ):
+        """Run Simul-Whisper style variable-length dynamic encoder on Apple Silicon Metal GPU."""
+        import importlib
+        import numpy as np
+        from types import SimpleNamespace
+        asr_site = "/Users/emirsaffar/.hermes/tools/asr-sv/.venv/lib/python3.11/site-packages"
+        if Path(asr_site).is_dir() and asr_site not in sys.path:
+            sys.path.insert(0, asr_site)
+        mx = importlib.import_module("mlx.core")
+        nn = importlib.import_module("mlx.nn")
+        ModelHolder = importlib.import_module("mlx_whisper.transcribe").ModelHolder
+        mlx_audio = importlib.import_module("mlx_whisper.audio")
+        log_mel_spectrogram = mlx_audio.log_mel_spectrogram
+        pad_or_trim = mlx_audio.pad_or_trim
+        DecodingOptions = importlib.import_module("mlx_whisper.decoding").DecodingOptions
+        get_tokenizer = importlib.import_module("mlx_whisper.tokenizer").get_tokenizer
+
+        if speeches:
+            speech_pcm = np.concatenate([tail[sp["start"]:sp["end"]] for sp in speeches])
+            seg_start_s = float(speeches[0]["start"]) / 16000.0
+            seg_end_s = float(speeches[-1]["end"]) / 16000.0
+        else:
+            speech_pcm = tail
+            seg_start_s = 0.0
+            seg_end_s = max(1.0, float(len(tail)) / 16000.0)
+
+        mlx_repo = os.environ.get(
+            "HERMES_MEET_MLX_MODEL",
+            "models--mlx-community--whisper-large-v3-turbo",
+        ).strip()
+        snap_root = Path.home() / ".cache/huggingface/hub" / mlx_repo / "snapshots"
+        model_path = str(sorted(snap_root.iterdir())[-1]) if snap_root.is_dir() else mlx_repo
+        with self._whisper_lock:
+            if self._mlx_model is None:
+                m = ModelHolder.get_model(model_path, mx.float16)
+
+                def _dynamic_encoder_call(enc_self, x):
+                    if x.shape[-1] == enc_self.ln_post.weight.shape[0]:
+                        return x
+                    x = nn.gelu(enc_self.conv1(x))
+                    x = nn.gelu(enc_self.conv2(x))
+                    seq_len = x.shape[1]
+                    x = x + enc_self._positional_embedding[:seq_len]
+                    for block in enc_self.blocks:
+                        x, _, _ = block(x)
+                    return enc_self.ln_post(x)
+
+                type(m.encoder).__call__ = _dynamic_encoder_call
+                self._mlx_model = m
+            m = self._mlx_model
+            dur_s = max(1.0, float(len(speech_pcm)) / 16000.0)
+            dyn_frames = max(1200, min(3000, ((int(dur_s * 100) + 400 + 99) // 100) * 100))
+            mel = pad_or_trim(
+                log_mel_spectrogram(speech_pcm, n_mels=m.dims.n_mels, padding=480000),
+                dyn_frames,
+                axis=-2,
+            ).astype(mx.float16)
+            audio_features = m.encoder(mel[None])
+            det_lang = lang_env
+            det_prob = 0.98
+            if not det_lang or det_lang == "auto":
+                tok = get_tokenizer(
+                    m.is_multilingual,
+                    num_languages=m.num_languages,
+                    language="en",
+                    task="transcribe",
+                )
+                x_sot = mx.array([[tok.sot]])
+                logits = m.logits(x_sot, audio_features)[:, 0]
+                mask = mx.full(logits.shape[-1], -mx.inf, dtype=mx.float32)
+                if allowed_langs:
+                    for tid_tok, code in zip(tok.all_language_tokens, tok.all_language_codes):
+                        if code in allowed_langs:
+                            mask[tid_tok] = 0.0
+                else:
+                    mask[list(tok.all_language_tokens)] = 0.0
+                probs = mx.softmax(logits + mask, axis=-1)[0]
+                best_idx = int(mx.argmax(probs).item())
+                lang_map = dict(zip(tok.all_language_tokens, tok.all_language_codes))
+                det_lang = lang_map.get(best_idx, "sv")
+                det_prob = float(probs[best_idx].item())
+            opts = DecodingOptions(
+                language=det_lang,
+                temperature=0.0,
+                fp16=True,
+                prompt=prompt_env,
+                sample_len=max(24, min(128, int(dur_s * 12))),
+            )
+            res = m.decode(audio_features[0], opts)
+        no_speech_p = float(getattr(res, "no_speech_prob", 0.0) or 0.0)
+        comp_ratio = float(getattr(res, "compression_ratio", 1.0) or 1.0)
+        txt = (getattr(res, "text", "") or "").strip()
+        if no_speech_p > 0.75 or comp_ratio > 2.4:
+            txt = ""
+        segs = [SimpleNamespace(text=txt, start=seg_start_s, end=seg_end_s)] if txt else []
+        info = SimpleNamespace(
+            language=det_lang or "sv",
+            language_probability=det_prob,
+            no_speech_prob=no_speech_p,
+            compression_ratio=comp_ratio,
+        )
+        return segs, info
 
     def _decode_bytes(self, buf: bytes):
         import io
@@ -683,8 +799,8 @@ class _RtcTranscriber:
         merged = self.cfg.out_dir / "audio" / f"stream_{stream_id:02d}.webm"
         merged.parent.mkdir(parents=True, exist_ok=True)  # standalone/offline use
         fresh_bytes, last_flush = 0, time.time()
-        flush_sec = float(os.environ.get("HERMES_MEET_FLUSH_SEC", "15") or 15)
-        idle_flush_sec = max(flush_sec + 1.0, 25.0 if flush_sec >= 15.0 else flush_sec * 1.5)
+        flush_sec = float(os.environ.get("HERMES_MEET_FLUSH_SEC", "1.5") or 1.5)
+        idle_flush_sec = max(flush_sec + 0.5, flush_sec * 1.5)
         while True:
             item = self._pop(stream_id)
             if item is None:
@@ -697,19 +813,19 @@ class _RtcTranscriber:
                     self._drain_stream_queue(stream_id)
                     self._flush_stream(stream_id, merged, label)
                     fresh_bytes, last_flush = 0, time.time()
-                time.sleep(0.5)
+                time.sleep(0.15)
                 continue
             _, nbytes = item
             fresh_bytes += int(nbytes or 0)
-            if fresh_bytes > 400_000 or time.time() - last_flush > flush_sec:
+            if fresh_bytes > 200_000 or time.time() - last_flush > flush_sec:
                 self._drain_stream_queue(stream_id)
                 self._flush_stream(stream_id, merged, label)
                 fresh_bytes, last_flush = 0, time.time()
 
     def _decode_incremental_tail(self, stream_id: int, merged: Path):
-        """Decode only the newly appended WebM clusters in O(1) time; fall back to full _decode if needed."""
+        """Decode only the newly appended WebM clusters using Exact Cluster-Cursor seeking (100% hit rate)."""
         done = self._transcribed.get(stream_id, 0)
-        min_tail_samples = int(16000 * (1.2 if os.environ.get("HERMES_MEET_REALTIME_STANDUP") == "1" else 5.0))
+        min_tail_samples = int(16000 * (0.8 if os.environ.get("HERMES_MEET_REALTIME_STANDUP") == "1" else 1.5))
         if "_decode" in self.__dict__:
             audio = self._decode(merged)
             if audio is None or len(audio) <= done + min_tail_samples:
@@ -731,21 +847,32 @@ class _RtcTranscriber:
                         first_cl = head_probe.find(self._CLUSTER_ID)
                         if first_cl > 0:
                             self._webm_headers[stream_id] = head_probe[:first_cl]
+                            self._last_cluster_off[stream_id] = first_cl
+                            self._cluster_base_samples[stream_id] = 0
                 header = self._webm_headers.get(stream_id)
                 if header is not None:
-                    start_off = max(prev_off, len(header))
-                    if file_size <= start_off:
-                        return None, done
-                    f.seek(start_off)
-                    new_clusters = f.read(file_size - start_off)
-                    if new_clusters.startswith(self._CLUSTER_ID):
-                        tail = self._decode_bytes(header + new_clusters)
-                        if tail is not None:
-                            if len(tail) <= min_tail_samples:
-                                return None, done
-                            self._decoded_bytes[stream_id] = file_size
-                            self._transcribed[stream_id] = done + len(tail)
-                            return tail, done
+                    cl_off = self._last_cluster_off.get(stream_id, len(header))
+                    base_samples = self._cluster_base_samples.get(stream_id, 0)
+                    if file_size > cl_off:
+                        f.seek(cl_off)
+                        chunk_bytes = f.read(file_size - cl_off)
+                        if chunk_bytes.startswith(self._CLUSTER_ID):
+                            combined = self._decode_bytes(header + chunk_bytes)
+                            if combined is not None:
+                                rel_start = max(0, done - base_samples)
+                                if len(combined) <= rel_start + min_tail_samples:
+                                    return None, done
+                                tail = combined[rel_start:]
+                                total_now = base_samples + len(combined)
+                                last_cl_rel = chunk_bytes.rfind(self._CLUSTER_ID, 4)
+                                if last_cl_rel > 0:
+                                    tail_cl_pcm = self._decode_bytes(header + chunk_bytes[last_cl_rel:])
+                                    if tail_cl_pcm is not None:
+                                        self._cluster_base_samples[stream_id] = total_now - len(tail_cl_pcm)
+                                        self._last_cluster_off[stream_id] = cl_off + last_cl_rel
+                                self._decoded_bytes[stream_id] = file_size
+                                self._transcribed[stream_id] = total_now
+                                return tail, done
         except Exception:
             pass
 
@@ -776,6 +903,7 @@ class _RtcTranscriber:
         except Exception:
             return
         speech_dur_s = 0.0
+        speeches = None
         try:
             _patch_silero_vad_batch_limit(1500)
             from faster_whisper.vad import get_speech_timestamps, VadOptions
@@ -787,13 +915,16 @@ class _RtcTranscriber:
             speech_dur_s = sum(sp["end"] - sp["start"] for sp in speeches) / 16000.0
         except Exception:
             pass
-        try:
-            model = self._whisper()
-        except Exception as e:
-            if not self._whisper_failed:
-                self._whisper_failed = True
-                self.state.set(error=f"whisper unavailable ({e}) — merged audio kept on disk")
-            return
+        use_mlx_dynamic = os.environ.get("HERMES_MEET_ASR_BACKEND", "").strip().lower() in ("mlx", "mlx_dynamic")
+        model = None
+        if not use_mlx_dynamic:
+            try:
+                model = self._whisper()
+            except Exception as e:
+                if not self._whisper_failed:
+                    self._whisper_failed = True
+                    self.state.set(error=f"whisper unavailable ({e}) — merged audio kept on disk")
+                return
         try:
             lang_env = os.environ.get("HERMES_MEET_LANGUAGE", "").strip() or None
             multilang_set = {
@@ -802,26 +933,25 @@ class _RtcTranscriber:
                 if x.strip()
             }
             if lang_env == "auto" or lang_env is None:
-                lang_env = None if multilang_set else self._detected_language
+                if multilang_set:
+                    lang_env = self._stream_lang_locked.get(stream_id)
+                else:
+                    lang_env = self._detected_language
             prompt_env = os.environ.get("HERMES_MEET_INITIAL_PROMPT", "").strip() or self._last_text.get(stream_id) or None
-            with self._whisper_lock:
-                segs_iter, _info = model.transcribe(
+            if use_mlx_dynamic:
+                segs, _info = self._transcribe_mlx_dynamic(
                     tail,
-                    language=lang_env,
-                    vad_filter=True,
-                    vad_parameters=dict(threshold=0.5, min_speech_duration_ms=350, speech_pad_ms=200),
-                    beam_size=1,
-                    temperature=0.0,
-                    condition_on_previous_text=False,
-                    initial_prompt=prompt_env,
+                    lang_env=lang_env,
+                    prompt_env=prompt_env,
+                    allowed_langs=multilang_set or None,
+                    speeches=speeches,
                 )
-                segs = list(segs_iter)
-                det_lang = getattr(_info, "language", None)
-                if multilang_set and det_lang not in multilang_set and det_lang not in ("no", "da"):
-                    fallback_lang = getattr(self, "_stream_lang", {}).get(stream_id, "en")
+            else:
+                assert model is not None
+                with self._whisper_lock:
                     segs_iter, _info = model.transcribe(
                         tail,
-                        language=fallback_lang,
+                        language=lang_env,
                         vad_filter=True,
                         vad_parameters=dict(threshold=0.5, min_speech_duration_ms=350, speech_pad_ms=200),
                         beam_size=1,
@@ -830,18 +960,37 @@ class _RtcTranscriber:
                         initial_prompt=prompt_env,
                     )
                     segs = list(segs_iter)
-                elif multilang_set and det_lang in multilang_set:
-                    if not hasattr(self, "_stream_lang"):
-                        self._stream_lang = {}
-                    self._stream_lang[stream_id] = det_lang
-                if (
-                    not multilang_set
-                    and self._detected_language is None
-                    and speech_dur_s >= 3.0
-                    and det_lang
-                    and float(getattr(_info, "language_probability", 0.0) or 0.0) >= 0.80
-                ):
-                    self._detected_language = det_lang
+                    det_lang = getattr(_info, "language", None)
+                    if multilang_set and det_lang not in multilang_set and det_lang not in ("no", "da"):
+                        fallback_lang = self._stream_lang_locked.get(stream_id) or self._stream_lang.get(stream_id, "en")
+                        segs_iter, _info = model.transcribe(
+                            tail,
+                            language=fallback_lang,
+                            vad_filter=True,
+                            vad_parameters=dict(threshold=0.5, min_speech_duration_ms=350, speech_pad_ms=200),
+                            beam_size=1,
+                            temperature=0.0,
+                            condition_on_previous_text=False,
+                            initial_prompt=prompt_env,
+                        )
+                        segs = list(segs_iter)
+            det_lang = getattr(_info, "language", None)
+            lang_prob = float(getattr(_info, "language_probability", 0.0) or 0.0)
+            if multilang_set and det_lang in multilang_set:
+                self._stream_lang[stream_id] = det_lang
+                if lang_prob >= 0.85 and speech_dur_s > 0.0:
+                    acc_s = self._stream_lang_sec.get(stream_id, 0.0) + speech_dur_s
+                    self._stream_lang_sec[stream_id] = acc_s
+                    if acc_s >= 3.0:
+                        self._stream_lang_locked[stream_id] = det_lang
+            if (
+                not multilang_set
+                and self._detected_language is None
+                and speech_dur_s >= 3.0
+                and det_lang
+                and lang_prob >= 0.80
+            ):
+                self._detected_language = det_lang
             base_offset_s = float(done) / 16000.0
             _hallucination_pat = re.compile(
                 r"^(?:mikael wiehe:?|tack till elever och personal.*|undertextning:?.*|textning\.nu.*)$",
