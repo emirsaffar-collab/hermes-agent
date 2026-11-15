@@ -358,7 +358,7 @@ class SessionSearchMixin:
     _TRIGRAM_BOUNDARY_SWEEP_SQL = (
         "INSERT INTO messages_fts_trigram(rowid, content, tool_name) "
         "SELECT m.id, m.content, m.tool_name FROM messages m JOIN sessions s ON s.id = m.session_id "
-        f"WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' AND {fts_trigram_session_sql('s')} "
+        f"WHERE m.id > ? AND m.id <= ? AND COALESCE(m.active, 1) = 1 AND m.role <> 'tool' AND {fts_trigram_session_sql('s')} "
         "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)"
     )
     _CHUNK_INSERT_SQL = (
@@ -370,7 +370,7 @@ class SessionSearchMixin:
     _TRIGRAM_CHUNK_INSERT_SQL = (
         "INSERT INTO messages_fts_trigram(rowid, content, tool_name) "
         "SELECT m.id, m.content, m.tool_name FROM messages m JOIN sessions s ON s.id = m.session_id "
-        f"WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' AND {fts_trigram_session_sql('s')}"
+        f"WHERE m.id > ? AND m.id <= ? AND COALESCE(m.active, 1) = 1 AND m.role <> 'tool' AND {fts_trigram_session_sql('s')}"
     )
 
     def _fts_rebuild_finish(self) -> None:

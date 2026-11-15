@@ -45,3 +45,7 @@ def test_inactive_compaction_messages_excluded_from_trigram_src(db: SessionDB):
 
     assert m1 in view_ids, "Active message should be present in messages_fts_trigram_src"
     assert m2 not in view_ids, "Inactive compaction message must be excluded from messages_fts_trigram_src"
+    assert m1 in _trigram_rowids(db), "Active message should remain in messages_fts_trigram_docsize"
+    assert m2 not in _trigram_rowids(db), "Inactive compaction message must be removed from messages_fts_trigram_docsize"
+    assert db._conn is not None
+    db._conn.execute("INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('integrity-check')")

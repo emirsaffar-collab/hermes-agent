@@ -248,11 +248,16 @@ class SessionSchemaMixin:
         never replaces an existing broad trigger). No FTS rebuild: correctness was already
         gated by WHEN clauses; OF only skips trigger evaluation. Returns the number dropped."""
         legacy_layout = self._db_has_legacy_inline_fts(cursor)
-        update_names = ("messages_fts_update", "messages_fts_trigram_update")
+        update_names = ("messages_fts_update", *_FTS_TRIGRAM_TRIGGERS)
         placeholders = ", ".join("?" for _ in update_names)
         sql = f"SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN ({placeholders})"
         rows = cursor.execute(sql, update_names).fetchall()
-        to_drop = [name for name, sql in rows if self._fts_update_trigger_needs_narrowing(sql)]
+        to_drop = [
+            name
+            for name, trigger_sql in rows
+            if self._fts_update_trigger_needs_narrowing(trigger_sql)
+            or (not legacy_layout and name in _FTS_TRIGRAM_TRIGGERS and "ACTIVE" not in (trigger_sql or "").upper())
+        ]
         if not to_drop:
             return 0
         for name in to_drop:
@@ -876,7 +881,7 @@ class SessionSchemaMixin:
         cursor.execute(
             "INSERT INTO messages_fts_trigram(rowid, content, tool_name) "
             "SELECT m.id, m.content, m.tool_name FROM messages m JOIN sessions s ON s.id = m.session_id "
-            f"WHERE m.session_id IN ({marks}) AND m.role <> 'tool' AND {fts_trigram_session_sql('s')} "
+            f"WHERE m.session_id IN ({marks}) AND COALESCE(m.active, 1) = 1 AND m.role <> 'tool' AND {fts_trigram_session_sql('s')} "
             "AND (m.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta "
             "WHERE key = 'fts_rebuild_high_water'), -1) "
             "OR m.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta "

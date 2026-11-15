@@ -1154,7 +1154,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages
-WHEN new.role <> 'tool'
+WHEN COALESCE(new.active, 1) = 1
+   AND new.role <> 'tool'
    AND EXISTS (SELECT 1 FROM sessions
                WHERE id = new.session_id AND {FTS_TRIGRAM_SESSION_SQL})
    AND (new.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
@@ -1167,7 +1168,8 @@ BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages
-WHEN old.role <> 'tool'
+WHEN COALESCE(old.active, 1) = 1
+   AND old.role <> 'tool'
    AND EXISTS (SELECT 1 FROM sessions
                WHERE id = old.session_id AND {FTS_TRIGRAM_SESSION_SQL})
    AND (old.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
@@ -1180,10 +1182,11 @@ BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update
-AFTER UPDATE OF content, tool_name, role ON messages
+AFTER UPDATE OF content, tool_name, role, active ON messages
 WHEN (old.content IS NOT new.content
     OR old.tool_name IS NOT new.tool_name
-    OR old.role IS NOT new.role)
+    OR old.role IS NOT new.role
+    OR COALESCE(old.active, 1) IS NOT COALESCE(new.active, 1))
    AND (old.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
                            WHERE key = 'fts_rebuild_high_water'), -1)
      OR old.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
@@ -1191,12 +1194,14 @@ WHEN (old.content IS NOT new.content
 BEGIN
     INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name)
     SELECT 'delete', old.id, old.content, old.tool_name
-    WHERE old.role <> 'tool'
+    WHERE COALESCE(old.active, 1) = 1
+      AND old.role <> 'tool'
       AND EXISTS (SELECT 1 FROM sessions
                   WHERE id = old.session_id AND {FTS_TRIGRAM_SESSION_SQL});
     INSERT INTO messages_fts_trigram(rowid, content, tool_name)
     SELECT new.id, new.content, new.tool_name
-    WHERE new.role <> 'tool'
+    WHERE COALESCE(new.active, 1) = 1
+      AND new.role <> 'tool'
       AND EXISTS (SELECT 1 FROM sessions
                   WHERE id = new.session_id AND {FTS_TRIGRAM_SESSION_SQL});
 END;
