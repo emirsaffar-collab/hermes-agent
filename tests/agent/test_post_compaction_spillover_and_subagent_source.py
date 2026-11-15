@@ -241,6 +241,31 @@ def test_interactive_desktop_subagent_allowed_under_tier3_but_capped_by_tier1_fa
     assert v_desk_sub_ok["allowed"] is True
     assert v_desk_sub_ok["reason"] == "interactive_subagent_allowed"
 
+    # 2b) Iteration 0 (consecutive_calls_since_user=0, before first LLM/tool call so
+    #     ToolGuardrailController.is_making_productive_progress() is False) must also be allowed,
+    #     while stalled loop (making_productive_progress=False, consecutive_calls_since_user>=12) is blocked.
+    v_desk_sub_iter0 = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_desk_child_iter0",
+        source="subagent",
+        parent_session_id="desk_root_1",
+        parent_source="desktop",
+        making_productive_progress=False,
+        consecutive_calls_since_user=0,
+    )
+    assert v_desk_sub_iter0["allowed"] is True
+    assert v_desk_sub_iter0["reason"] == "interactive_subagent_allowed"
+
+    v_desk_sub_stalled = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_desk_child_stalled",
+        source="subagent",
+        parent_session_id="desk_root_1",
+        parent_source="desktop",
+        making_productive_progress=False,
+        consecutive_calls_since_user=12,
+    )
+    assert v_desk_sub_stalled["allowed"] is False
+    assert "tier3_daily_hard_cap" in v_desk_sub_stalled["reason"]
+
     # 3) If parent spawns multiple fresh child session_ids that collectively burn >= €4.00 in 15m,
     #    family lineage ('parent:desk_root_1') trips Tier 1A and quarantines the parent lineage!
     for idx in range(3):

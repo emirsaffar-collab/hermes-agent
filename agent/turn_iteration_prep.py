@@ -367,6 +367,9 @@ class IterationStart:
     _turn_exit_reason: Any
 
 
+_CF92_ITER0_FIX_REV = 2
+
+
 def begin_iteration(
     agent: Any, *, messages: Any, conversation_history: Any, original_user_message: Any,
     api_call_count: Any, interrupted: Any, _turn_exit_reason: Any,
@@ -437,7 +440,9 @@ def begin_iteration(
         )
         _tg_ctrl = getattr(agent, "_tool_guardrails", None)
         _productive = (
-            bool(_tg_ctrl.is_making_productive_progress())
+            True
+            if int(api_call_count or 0) == 0
+            else bool(_tg_ctrl.is_making_productive_progress())
             if _tg_ctrl is not None and callable(getattr(_tg_ctrl, "is_making_productive_progress", None))
             else True
         )

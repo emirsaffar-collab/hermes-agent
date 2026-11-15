@@ -69,6 +69,7 @@ TIER0_CRITICAL_CRON_15M_SAFETY_CAP_EUR = 12.00
 TIER2_ESTATE_15M_BURST_EUR = 8.00
 TIER2_DAILY_SOFT_CAP_EUR = 150.00
 TIER3_DAILY_HARD_CAP_EUR = 195.00
+_CF92_ITER0_FIX_REV = 2
 
 _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "chat-247",
@@ -738,7 +739,13 @@ def evaluate_realtime_spend_breaker(
     # Bounded subagents spawned by an active interactive Desktop/Mobile/TUI parent
     # (already vetted by Tier 1A per-session and family €4/15m & €10/1h caps above)
     # are allowed so the 190k-token parent does not have to run child work inline.
-    if is_interactive_subagent and making_productive_progress:
+    # Note: on iteration 0 (before the first LLM/tool round), ToolGuardrailController
+    # has _turn_productive_calls == 0 so making_productive_progress is False; allow
+    # initial turn entry (consecutive_calls_since_user <= 1) while blocking stalled loops.
+    if is_interactive_subagent and (
+        making_productive_progress
+        or int(consecutive_calls_since_user or 0) <= 1
+    ):
         return {
             "allowed": True,
             "reason": "interactive_subagent_allowed",
