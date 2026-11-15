@@ -1071,6 +1071,30 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
             payload["partial"] = True
         if _error_surface:
             payload["error_surface"] = _error_surface
+        _failure_reason = str(result.get("failure_reason") or "")
+        if (
+            st.terminal_callback is None
+            and not session.get("_turn_cancel_requested")
+            and (
+                _failure_reason == "session_persistence_failed"
+                or _failure_reason.startswith("session_persistence_failed:")
+                or _failure_reason == "loop_error"
+            )
+        ):
+            # Unpersisted mid-turn abort: the failure exists only in volatile inflight_turn
+            # memory (state.db append failed or tool round stopped without a final reply).
+            # Preserve the interrupted_turns.json marker across backend recycle / session reap.
+            st.receipt_committed = False
+            try:
+                from tui_gateway.turn_marker import mark_turn_interrupted, rekey_turn_marker
+                _m_home = _session_home(session)  # type: ignore[name-defined]
+                _cur_key = str(session.get("session_key") or st.marker_key or "")
+                if st.marker_key and _cur_key and _cur_key != st.marker_key:
+                    rekey_turn_marker(_m_home, st.marker_key, _cur_key)
+                if _cur_key:
+                    mark_turn_interrupted(_m_home, _cur_key)
+            except Exception:
+                pass
     if st.terminal_callback is not None:
         st.receipt_attempted = True
         st.terminal_callback({

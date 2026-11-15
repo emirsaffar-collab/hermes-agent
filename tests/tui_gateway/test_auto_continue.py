@@ -701,3 +701,75 @@ def test_boot_sweep_resumes_unloaded_dead_writer_markers_and_skips_live_writer(
     assert len(resumed_calls) == 1
     assert resumed_calls[0][1]["session_id"] == "bg-dead-session"
     assert read_turn_marker(marker_home, "bg-stale-session") is None
+
+
+@pytest.mark.parametrize(
+    "failure_reason",
+    [
+        "session_persistence_failed:unknown",
+        "session_persistence_failed:locked",
+        "loop_error",
+    ],
+)
+def test_unpersisted_mid_turn_abort_preserves_marker_for_boot_sweep(
+    monkeypatch, emits, turn_env, marker_home, failure_reason
+):
+    """When a Desktop/TUI turn aborts with session_persistence_failed:* or loop_error,
+    its terminal state was NOT committed to state.db (only held in volatile inflight_turn).
+    _complete_turn_payload and run_body's finally must preserve (and rekey/stamp) the
+    interrupted_turns.json marker so a subsequent backend recycle auto-continues the turn."""
+
+    def _run(message, **kwargs):
+        return {
+            "final_response": "",
+            "failed": True,
+            "error": "Session storage failed mid-turn",
+            "failure_reason": failure_reason,
+        }
+
+    agent = types.SimpleNamespace(
+        session_id="rotated-session-key",
+        run_conversation=_run,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True, session_key="initial-session-key")
+
+    def _simulate_compress_rotate(sid, sess, **_kw):
+        sess["session_key"] = "rotated-session-key"
+
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", _simulate_compress_rotate)
+
+    server._run_prompt_submit("rid", "sid", session, "go")  # type: ignore[attr-defined]
+
+    # Marker must survive under the rotated session key with interrupted_at stamped
+    assert read_turn_marker(marker_home, "initial-session-key") is None
+    marker = read_turn_marker(marker_home, "rotated-session-key")
+    assert marker is not None
+    assert marker["prompt"] == "go"
+    assert marker.get("interrupted_at") is not None
+
+
+def test_user_cancelled_or_billing_error_still_clears_marker(
+    monkeypatch, emits, turn_env, marker_home
+):
+    """Negative-polarity counterpart: a user-cancelled turn (_turn_cancel_requested=True)
+    or a billing_block failure must still clear the marker so it does not auto-continue."""
+
+    def _run_billing(message, **kwargs):
+        return {
+            "final_response": "",
+            "failed": True,
+            "error": "Billing limit reached",
+            "failure_reason": "billing_block",
+        }
+
+    agent = types.SimpleNamespace(
+        session_id="billing-session-key",
+        run_conversation=_run_billing,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True, session_key="billing-session-key")
+    server._run_prompt_submit("rid", "sid", session, "go")  # type: ignore[attr-defined]
+    assert read_turn_marker(marker_home, "billing-session-key") is None
+
+
