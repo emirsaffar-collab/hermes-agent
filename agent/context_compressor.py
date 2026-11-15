@@ -37,7 +37,11 @@ from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.context_compressor_sampling import SummaryInputSamplingMixin
 from agent.context_compressor_prompt_rules import EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt
 from agent.context_compressor_retry import retryable_user_text, typed_prompt_content
-from agent.context_compressor_typed_input import TYPED_TURNS_POINTER, typed_summary_messages
+from agent.context_compressor_typed_input import (
+    TYPED_TURNS_POINTER,
+    flatten_typed_tool_turns,
+    typed_summary_messages,
+)
 from agent.conversation_compression_scaffolding import is_user_role_scaffolding
 from agent.context_compressor_tail import (
     demote_stale_tail_tools, lean_tail_budget, is_demoted_stub, skill_view_names_by_call_id, tail_cut_pricer,
@@ -175,6 +179,23 @@ def _response_finish_reason(response: Any) -> str:
         return str(reason).strip().lower() if reason else ""
     except Exception:
         return ""
+
+
+def _response_has_tool_calls(response: Any) -> bool:
+    """True when ``response`` ended in ``tool_calls`` or carries non-empty ``choices[0].message.tool_calls``."""
+    if _response_finish_reason(response) in {"tool_calls", "function_call"}:
+        return True
+    try:
+        first = (
+            (response.get("choices") or [{}])[0]
+            if isinstance(response, dict)
+            else (getattr(response, "choices", None) or [None])[0]
+        )
+        msg = first.get("message") if isinstance(first, dict) else getattr(first, "message", None)
+        tcs = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
+        return bool(tcs)
+    except Exception:
+        return False
 
 
 # Marker for a length-stopped (PARTIAL) summary; the except-branch classifier keys
@@ -4310,7 +4331,41 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             _ac_mod.extract_content_or_reasoning = _healed_extract_content_or_reasoning
             globals()["extract_content_or_reasoning"] = _healed_extract_content_or_reasoning
         content = extract_content_or_reasoning(response, max_reasoning_chars=8000)
-        where = f"(provider={self.provider or 'auto'} model={self.summary_model or self.model})"
+        if (
+            not content.strip()
+            and _response_has_tool_calls(response)
+            and any(m.get("tool_calls") or m.get("role") == "tool" for m in call_kwargs["messages"])
+        ):
+            logger.warning(
+                "Compression summary model '%s' returned tool_calls with empty content; "
+                "retrying on the same route with tool turns flattened to assistant text.",
+                _aux_model or self.summary_model or self.model,
+            )
+            call_kwargs["messages"] = flatten_typed_tool_turns(call_kwargs["messages"])
+            _retry_start = time.monotonic()
+            try:
+                with aux_interrupt_protection():
+                    response = call_llm(**call_kwargs)
+            finally:
+                _aux_model = _aux_route.get("model") or _aux_model or self.summary_model or self.model or ""
+                self._last_aux_resolved_model = _aux_model or None
+                self._record_aux_compression_call(
+                    prompt_messages=call_kwargs["messages"],
+                    max_tokens=call_kwargs.get("max_tokens"),
+                    duration_ms=int((time.monotonic() - _retry_start) * 1000),
+                    aux_provider=_aux_route.get("provider") or self.provider or "",
+                    aux_model=_aux_model,
+                    effective_aux_context=self.context_length if _aux_model == self.model else None,
+                    phase_timings=_latency_info,
+                )
+            if self._compression_cancelled():
+                raise AuxiliaryExplicitCancellation()
+            self._note_aux_route_fallback(_aux_route)
+            content = extract_content_or_reasoning(response, max_reasoning_chars=8000)
+        where = (
+            f"(provider={_aux_route.get('provider') or self.provider or 'auto'} "
+            f"model={_aux_model or self.summary_model or self.model})"
+        )
         # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels) return a well-formed HTTP 200
         # with an empty or whitespace-only ``content`` instead of an error or empty ``choices``. That
         # payload passes ``_validate_llm_response`` (a ``message`` exists), so it reaches here and would

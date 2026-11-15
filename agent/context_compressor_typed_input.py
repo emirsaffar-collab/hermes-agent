@@ -100,6 +100,43 @@ def typed_summary_messages(
     _close_calls()
     if out and out[0]["role"] != "user":
         out.insert(0, {"role": "user", "content": _CONVERSATION_START})
-    if out and out[-1]["role"] == "user":  # the caller's pointer is a user message; keep roles alternating
+    if out and out[-1]["role"] != "assistant":  # close trailing user or tool turn before the caller's user pointer
         out.append({"role": "assistant", "content": _CONVERSATION_END})
+    return out
+
+
+def flatten_typed_tool_turns(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert assistant ``tool_calls`` and ``role=tool`` messages into ``role=assistant`` text blocks.
+
+    Used when a provider's OpenAI-compatible gateway (e.g. Vertex AI Gemini) synthesizes function
+    declarations from historical ``tool_calls`` in ``messages`` and the summarizer emits a spurious
+    ``finish_reason='tool_calls'`` instead of summary text. Real ``role=user`` turns remain the only
+    ``role=user`` messages so the #146750 compaction-laundering invariant holds.
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            parts = [m["content"]] if (m.get("content") or "").strip() else []
+            for tc in m["tool_calls"]:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    parts.append(
+                        f"[Tool call {tc.get('id', '')}: {fn.get('name', 'tool')}({fn.get('arguments', '')})]"
+                    )
+            text = "\n".join(parts)
+            if out and out[-1]["role"] == "assistant" and not out[-1].get("tool_calls"):
+                out[-1]["content"] = (out[-1]["content"] + "\n\n" + text).strip()
+            else:
+                out.append({"role": "assistant", "content": text})
+        elif role == "tool":
+            text = f"[Tool result {m.get('tool_call_id', '')}]: {m.get('content', '')}"
+            if out and out[-1]["role"] == "assistant" and not out[-1].get("tool_calls"):
+                out[-1]["content"] = (out[-1]["content"] + "\n\n" + text).strip()
+            else:
+                out.append({"role": "assistant", "content": text})
+        elif role == "assistant" and out and out[-1]["role"] == "assistant" and not out[-1].get("tool_calls"):
+            out[-1]["content"] = (out[-1]["content"] + "\n\n" + (m.get("content") or "")).strip()
+        else:
+            out.append(dict(m))
     return out

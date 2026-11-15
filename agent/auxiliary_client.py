@@ -7102,14 +7102,18 @@ class _ChatStreamAccumulator:
             return False
         made_progress = False
         from agent.message_content import flatten_message_text
+        from agent.reasoning_carriers import is_google_thought
 
+        google_thought = is_google_thought(delta)
         piece = flatten_message_text(getattr(delta, "content", None), sep="")
-        if piece:
+        if piece and not google_thought:
             self.content_parts.append(piece)
             made_progress = True
         reasoning_piece = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
         if reasoning_piece is None and isinstance(getattr(delta, "model_extra", None), dict):
             reasoning_piece = delta.model_extra.get("reasoning") or delta.model_extra.get("reasoning_content")
+        if reasoning_piece is None and google_thought:
+            reasoning_piece = piece or None
         reasoning_piece = flatten_message_text(reasoning_piece, sep="")
         if reasoning_piece:
             self.reasoning_parts.append(reasoning_piece)
