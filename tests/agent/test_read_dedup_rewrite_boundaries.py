@@ -177,3 +177,15 @@ def test_seed_file_dedup_from_messages_handles_hook_suffix_and_rotation(tmp_path
     assert second.get("dedup") is True
     assert second.get("status") == "unchanged"
     clear_file_ops_cache("sid_new")
+
+    # Fresh task_id seeded via reset_file_dedup / migrate_file_read_state must also carry
+    # read_history so a subsequent fresh (non-dedup) read_file call does not raise KeyError.
+    other = tmp_path / "other.py"
+    other.write_text("z = 3\n", encoding="utf-8")
+    migrate_file_read_state("sid_cold_old", "sid_cold_new")
+    reset_file_dedup("sid_cold_new", surviving_messages=surviving)
+    fresh_after_seed = json.loads(read_file_tool(path=str(other), offset=1, limit=50, task_id="sid_cold_new"))
+    assert "error" not in fresh_after_seed
+    assert "z = 3" in fresh_after_seed.get("content", "")
+    clear_file_ops_cache("sid_cold_old")
+    clear_file_ops_cache("sid_cold_new")

@@ -69,6 +69,11 @@ _existing_read_tracker = globals().get("_read_tracker")
 if isinstance(_existing_read_tracker, dict):
     _existing_read_tracker.__class__ = _PerAgentTracker
     _read_tracker: dict = _existing_read_tracker
+    for _td in list(_read_tracker.values()):
+        if isinstance(_td, dict):
+            _td.setdefault("last_key", None)
+            _td.setdefault("consecutive", 0)
+            _td.setdefault("read_history", set())
 else:
     _read_tracker = _PerAgentTracker()
 
@@ -98,6 +103,9 @@ def _task_data(task_id: str) -> dict:
     (search_tool / tests create partial entries). Lock must be held."""
     task_data = _read_tracker.setdefault(task_id, {
         "last_key": None, "consecutive": 0, "read_history": set()})
+    task_data.setdefault("last_key", None)
+    task_data.setdefault("consecutive", 0)
+    task_data.setdefault("read_history", set())
     for key in ("dedup", "dedup_hits", "read_timestamps", "read_coverage", "full_write_baselines",
                 "blind_patches"):
         task_data.setdefault(key, {})
@@ -311,8 +319,9 @@ def seed_file_dedup_from_messages(task_id: str | None, messages: list | None) ->
     if valid_keys:
         with _read_tracker_lock:
             td = _read_tracker.setdefault(
-                tid, {"last_key": None, "consecutive": 0, "dedup": {}, "dedup_generation_reads": set()}
+                tid, {"last_key": None, "consecutive": 0, "read_history": set(), "dedup": {}, "dedup_generation_reads": set()}
             )
+            td.setdefault("read_history", set())
             dedup_store = td.setdefault("dedup", {})
             for k, meta in missing_meta.items():
                 dedup_store.setdefault(k, meta)
@@ -335,7 +344,7 @@ def migrate_file_read_state(old_task_id: str | None, new_task_id: str | None) ->
         old_data = _read_tracker.get(old_tid)
         dst = _read_tracker.get(new_tid)
         if old_data is None and dst is None:
-            dst = {"last_key": None, "consecutive": 0, "dedup": {}, "dedup_generation_reads": set()}
+            dst = {"last_key": None, "consecutive": 0, "read_history": set(), "dedup": {}, "dedup_generation_reads": set()}
             _read_tracker[old_tid] = dst
             _read_tracker[new_tid] = dst
         elif old_data is not None and dst is None:

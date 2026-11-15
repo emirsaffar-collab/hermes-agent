@@ -582,7 +582,7 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     complete = False
     with _read_tracker_lock:
         count, dedup = _note_read_served(task_data, dedup_key, path, offset, limit)
-        task_data["read_history"].add((path, offset, limit))
+        task_data.setdefault("read_history", set()).add((path, offset, limit))
         try:
             if _on_host(resolved_str):
                 _mtime_now = os.path.getmtime(resolved_str)

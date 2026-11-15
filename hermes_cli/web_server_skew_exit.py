@@ -71,7 +71,12 @@ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fe
                     try:
                         import importlib
                         import sys
-                        for mod_name in ("agent.message_sanitization", "agent.turn_preflight"):
+                        for mod_name in (
+                            "agent.message_sanitization",
+                            "agent.turn_preflight",
+                            "tools.file_tools_read_tracking",
+                            "tools.file_tools",
+                        ):
                             mod = sys.modules.get(mod_name)
                             if mod is not None:
                                 importlib.reload(mod)
