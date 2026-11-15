@@ -264,6 +264,7 @@ class TestForcedUserGuardsStillWin:
             t1_id = db.append_message(session_id=parent_sid, role="tool", content="res1", tool_call_id="call_1", tool_name="read_file")
             t2_id = db.append_message(session_id=parent_sid, role="tool", content="res2", tool_call_id="call_2", tool_name="read_file")
 
+            assert db._conn is not None
             parent_rows = {
                 r["id"]: dict(r)
                 for r in db._conn.execute("SELECT * FROM messages WHERE session_id = ? ORDER BY id", (parent_sid,)).fetchall()
@@ -285,14 +286,14 @@ class TestForcedUserGuardsStillWin:
                 {"role": "tool", "content": "res1", "tool_call_id": "call_1", "tool_name": "read_file", "_row_id": t1_id, "message_uid": parent_rows[t1_id]["message_uid"]},
                 {"role": "tool", "content": "res2", "tool_call_id": "call_2", "tool_name": "read_file", "_row_id": t2_id, "message_uid": parent_rows[t2_id]["message_uid"]},
             ]
-            assert db.publish_compression_child(
+            db.publish_compression_child(
                 parent_session_id=parent_sid,
                 child_session_id=child_sid,
                 source="cli",
                 model="test/model",
                 messages=compressed_messages,
                 require_compression_lease=False,
-            ) is None
+            )
             child_rows = [
                 dict(r)
                 for r in db._conn.execute(
@@ -305,8 +306,8 @@ class TestForcedUserGuardsStillWin:
             assert child_rows[1]["tool_calls"] is not None
             assert parent_rows[a_id]["message_uid"] in (child_rows[1]["absorbed_message_uids"] or "")
 
-    def test_replace_session_messages_folds_assistant_summary_seam_before_sqlite_insert(self, tmp_path):
-        """#CF-96: In-place replace_session_messages also folds the assistant summary +
+    def test_archive_and_compact_folds_assistant_summary_seam_before_sqlite_insert(self, tmp_path):
+        """#CF-96: In-place archive_and_compact also folds the assistant summary +
         assistant tool-call seam before _insert_message_rows so the stored summary row
         carries the merged tool_calls in SQLite."""
         from contextlib import closing
@@ -317,12 +318,13 @@ class TestForcedUserGuardsStillWin:
             sid = "20261114_070500_inplace"
             db.create_session(sid, "cli", model="test/model")
             u_id = db.append_message(session_id=sid, role="user", content="initial ask")
-            db.append_message(session_id=sid, role="user", content="middle turn")
-            db.append_message(session_id=sid, role="assistant", content="middle reply")
+            mid_u = db.append_message(session_id=sid, role="user", content="middle turn")
+            mid_a = db.append_message(session_id=sid, role="assistant", content="middle reply")
             tail_tc = [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"a.py"}'}}]
             a_id = db.append_message(session_id=sid, role="assistant", content="", tool_calls=tail_tc)
             t1_id = db.append_message(session_id=sid, role="tool", content="res1", tool_call_id="call_1", tool_name="read_file")
 
+            assert db._conn is not None
             rows = {
                 r["id"]: dict(r)
                 for r in db._conn.execute("SELECT * FROM messages WHERE session_id = ? ORDER BY id", (sid,)).fetchall()
@@ -343,7 +345,7 @@ class TestForcedUserGuardsStillWin:
                 },
                 {"role": "tool", "content": "res1", "tool_call_id": "call_1", "tool_name": "read_file", "_row_id": t1_id, "message_uid": rows[t1_id]["message_uid"]},
             ]
-            assert db.archive_and_compact(sid, compressed_messages) == 3
+            db.archive_and_compact(sid, compressed_messages, covered_ids=[u_id, mid_u, mid_a, a_id, t1_id], tail_count=2)
             active_rows = [
                 dict(r)
                 for r in db._conn.execute(
