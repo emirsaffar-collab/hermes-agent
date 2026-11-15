@@ -334,3 +334,52 @@ class TestNoticeStripLifecycle:
         assert "fresh task" in tail_text
         assert "skill_view(name='hodle-design-system')" in tail_text
         assert "keep this human text" in tail_text
+
+    def test_strip_stale_todo_snapshot_never_truncates_compaction_summary(self):
+        """Regression test for row id=7467188 guillotine bug:
+        1) _typed_user_text strips merged TODO_INJECTION_HEADER tails from user turns so they never
+           enter ## Historical Task Snapshot or ## User Messages.
+        2) _strip_stale_todo_snapshot never strips before _SUMMARY_END_MARKER even if a compaction
+           summary quotes TODO_INJECTION_HEADER inside its body."""
+        from agent.context_compressor import (
+            SUMMARY_PREFIX,
+            _INFLIGHT_TASK_REPLAY_HEADER,
+            _SUMMARY_END_MARKER,
+            _restated_request_text,
+            _typed_user_text,
+        )
+        from agent.conversation_compression import _strip_stale_todo_snapshot
+
+        folded_user = (
+            _INFLIGHT_TASK_REPLAY_HEADER
+            + "\n"
+            + "i plugged in my phone so you are able to do everything\n\n"
+            + TODO_INJECTION_HEADER
+            + "\n- [>] t1. setup phone (in_progress)\n\n"
+            + _PRUNED_SKILL_RELOAD_NOTICE_HEADER
+            + "\nReload lazily: skill_view(name='fleet-status-board')."
+        )
+        restated = _restated_request_text(folded_user)
+        assert restated == "i plugged in my phone so you are able to do everything"
+        assert TODO_INJECTION_HEADER not in restated
+        assert _typed_user_text("hello world\n\n" + TODO_INJECTION_HEADER + "\n- [ ] t1") == "hello world"
+
+        composite_carrier = (
+            SUMMARY_PREFIX
+            + " Earlier turns were compacted.\n## Historical Task Snapshot\n"
+            + "User asked: test "
+            + TODO_INJECTION_HEADER
+            + "\n\n## Pruned Skills\n"
+            + _skill_pruned_marker("fleet-status-board")
+            + "\n\n"
+            + _SUMMARY_END_MARKER
+            + "\n\n"
+            + folded_user
+        )
+        stripped = _strip_stale_todo_snapshot(composite_carrier)
+        assert "## Pruned Skills" in stripped
+        assert _skill_pruned_marker("fleet-status-board") in stripped
+        assert _SUMMARY_END_MARKER in stripped
+        assert "i plugged in my phone so you are able to do everything" in stripped
+        assert not stripped.endswith("fleet-status-board').")
+

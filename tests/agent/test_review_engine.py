@@ -423,10 +423,26 @@ def test_collect_parent_loaded_skills_stacked_and_pruned():
             ),
         },
         {
+            "role": "user",
+            "content": (
+                "[Your active task list was preserved across context compression]\n"
+                "- [>] t1. verify (in_progress)\n\n"
+                "[Skills pruned during compression — reload before acting on these tasks]\n"
+                "Reload lazily: skill_view(name='always-verify'); skill_view(name='diligence-pipeline')."
+            ),
+        },
+        {
             "role": "tool",
             "content": "[SKILL_PRUNED: content lost in compression; reload with skill_view(name='rca')]",
         },
     ]
     loaded = re_mod.collect_parent_loaded_skills(parent, msgs)
-    assert loaded == ["dab", "deep-research", "research-and-plan", "rca"]
+    assert loaded == [
+        "dab",
+        "deep-research",
+        "research-and-plan",
+        "always-verify",
+        "diligence-pipeline",
+        "rca",
+    ]
 

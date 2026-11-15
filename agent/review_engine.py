@@ -117,6 +117,9 @@ def collect_parent_loaded_skills(parent_agent, messages: list[dict[str, Any]], l
             for m_passive in re.finditer(r"\[SKILL_PRUNED:\s*([a-z0-9][a-z0-9_-]*)\s+\(", txt):
                 candidates.append(m_passive.group(1))
             if role == "user":
+                if "[Skills pruned during compression" in txt:
+                    for m_reload in re.finditer(r"skill_view\(name=['\"]([^'\"]+)['\"]\)", txt):
+                        candidates.append(m_reload.group(1))
                 for m_stack in re.finditer(r"^Skills loaded:\s*(.+)$", txt, re.MULTILINE):
                     for s_item in m_stack.group(1).split(","):
                         if s_item.strip():

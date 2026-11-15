@@ -2290,10 +2290,18 @@ def _compressed_has_busy_steer(messages: list) -> bool:
 def _strip_stale_todo_snapshot(content: Any) -> Any:
     """Remove a previously merged todo-snapshot block from message content.
     Snapshots are appended to the trailing user turn, so a surviving header is stale; stripping before
-    re-injection prevents accumulation across boundaries."""
+    re-injection prevents accumulation across boundaries. Never strip inside a compaction summary body
+    (before ``_SUMMARY_END_MARKER`` or on a summary-prefixed message lacking ``_SUMMARY_END_MARKER``)."""
+    from agent.context_compressor import SUMMARY_PREFIX, _SUMMARY_END_MARKER
     from tools.todo_tool import TODO_INJECTION_HEADER
     if isinstance(content, str):
-        idx = content.find(TODO_INJECTION_HEADER)
+        search_from = 0
+        end_idx = content.find(_SUMMARY_END_MARKER)
+        if end_idx != -1:
+            search_from = end_idx + len(_SUMMARY_END_MARKER)
+        elif content.lstrip().startswith(SUMMARY_PREFIX):
+            return content
+        idx = content.find(TODO_INJECTION_HEADER, search_from)
         if idx == -1:
             return content
         return content[:idx].rstrip()
@@ -2301,7 +2309,15 @@ def _strip_stale_todo_snapshot(content: Any) -> Any:
         cleaned = []
         for part in content:
             text = str(part.get("text") or "") if isinstance(part, dict) and part.get("type") == "text" else ""
-            idx = text.find(TODO_INJECTION_HEADER) if text else -1
+            search_from = 0
+            if text:
+                end_idx = text.find(_SUMMARY_END_MARKER)
+                if end_idx != -1:
+                    search_from = end_idx + len(_SUMMARY_END_MARKER)
+                elif text.lstrip().startswith(SUMMARY_PREFIX):
+                    cleaned.append(part)
+                    continue
+            idx = text.find(TODO_INJECTION_HEADER, search_from) if text else -1
             if idx == -1:
                 cleaned.append(part)
             elif stripped := text[:idx].rstrip():

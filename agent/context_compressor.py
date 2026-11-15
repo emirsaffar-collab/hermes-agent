@@ -1292,7 +1292,13 @@ def _typed_user_text(content: str) -> str:
     Its inline skill body and any expanded ``@file:``/``@folder:`` attachment blocks are not the user's words —
     skills are carried by ``[SKILL_PRUNED: ...]`` markers and file paths remain in the ``@file:`` token."""
     from agent.skill_commands import describe_skill_invocation, skills_loaded_by_scaffold
-    cleaned = _ATTACHED_CONTEXT_FOOTER_RE.sub("", content) if isinstance(content, str) else content
+    from tools.todo_tool import TODO_INJECTION_HEADER
+    if not isinstance(content, str):
+        return content
+    cleaned = _ATTACHED_CONTEXT_FOOTER_RE.sub("", content)
+    todo_idx = cleaned.find(TODO_INJECTION_HEADER)
+    if todo_idx > 0:
+        cleaned = cleaned[:todo_idx].rstrip()
     return (describe_skill_invocation(cleaned, separator=" ") or "") if skills_loaded_by_scaffold(cleaned) else cleaned
 
 
