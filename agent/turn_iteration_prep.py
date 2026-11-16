@@ -476,9 +476,13 @@ def begin_iteration(
             if _rt_job.lower().startswith(_tier0_extra_prefixes)
             else _rt_job
         )
+        _rot_sids = getattr(agent, "_rotated_from_session_ids", None)
+        _rot_parent = max(_rot_sids) if isinstance(_rot_sids, set) and _rot_sids else ""
         _rt_parent_sid = str(
             getattr(agent, "_root_session_id", None)
             or getattr(agent, "parent_session_id", None)
+            or getattr(agent, "_parent_session_id", None)
+            or _rot_parent
             or ""
         )
         _rt_parent_src = str(getattr(agent, "_parent_session_source", None) or "")

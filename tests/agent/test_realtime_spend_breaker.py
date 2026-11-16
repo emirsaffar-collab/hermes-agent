@@ -274,7 +274,85 @@ def test_pruned_system_prompt_38k_floor_and_per_session_15m_reset_aggregation(tm
     assert r_reg_b["cache_reset"] == 0
 
 
+def test_ew2_macro_clusters_sustained_cold_cache_and_compression_rotation_lineage(tmp_path, monkeypatch):
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
 
+    # 1) All 9 europe-west2 macro-clusters carry the 1.10x regional multiplier
+    eur_global = rsb.compute_call_net_eur(
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=200_000,
+        uncached_input_tokens=80_000,
+        cache_read_tokens=120_000,
+        output_tokens=1_000,
+        cluster_id="Kyg7QP",
+    )
+    for macro in ("0L8P", "9_oP", "6-wP", "6_gP", "08QP", "4ATb", "7bQP", "7PIP", "9wMP"):
+        eur_reg = rsb.compute_call_net_eur(
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=200_000,
+            uncached_input_tokens=80_000,
+            cache_read_tokens=120_000,
+            output_tokens=1_000,
+            cluster_id=f"Ky{macro}",
+        )
+        assert round(eur_reg / eur_global, 4) == 1.10
 
+    # 2) Sustained 0% cold-cache failure on Flash (Turn 1-2 = 0, Turn 3+ = 1)
+    resets = []
+    for idx in range(6):
+        row = rsb.record_realtime_llm_call(
+            session_id="flash_cold_storm",
+            source="cron",
+            job_name="chat247-owner",
+            provider="vertex",
+            model="google/gemini-3.8-flash",
+            prompt_tokens=60_000 + idx * 1_000,
+            uncached_input_tokens=60_000 + idx * 1_000,
+            cache_read_tokens=0,
+            output_tokens=300,
+            request_id=f"rid_flash_cold_{idx}",
+        )
+        resets.append(row["cache_reset"])
+    assert resets == [0, 0, 1, 1, 1, 1]
 
+    # 3) Compression child rotation (#CF-91) preserves rolling 15m spend across parent -> child
+    for idx in range(2):
+        rsb.record_realtime_llm_call(
+            session_id="cron_parent_rot",
+            source="cron",
+            job_name="atlas-watchdog",
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=800_000,
+            uncached_input_tokens=800_000,  # ~€1.44 net each -> €2.89 total on parent
+            cache_read_tokens=0,
+            output_tokens=1_000,
+            request_id=f"rid_rot_p_{idx}",
+        )
+    rsb.record_realtime_llm_call(
+        session_id="cron_child_rot",
+        source="cron",
+        job_name="atlas-watchdog",
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=800_000,
+        uncached_input_tokens=800_000,  # +€1.44 on child -> combined €4.33 >= €4.00 Tier 1 cap
+        cache_read_tokens=0,
+        output_tokens=1_000,
+        request_id="rid_rot_c_0",
+    )
+    verdict_rot = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_child_rot",
+        source="cron",
+        job_name="atlas-watchdog",
+        parent_session_id="cron_parent_rot",
+        parent_source="cron",
+    )
+    assert verdict_rot["allowed"] is False
+    assert "tier1_session_15m_cap" in verdict_rot["reason"]
 

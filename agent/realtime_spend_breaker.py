@@ -42,7 +42,9 @@ VERTEX_ARGON_OUT_EUR_PER_M = 8.981000
 
 # Regional europe-west2 SKUs (A891-E7A5-FDA5, F61C-57E6-DBE0, EA0E-13A1-6B07) carry 1.10x multiplier
 VERTEX_EU_WEST2_REGIONAL_MULTIPLIER = 1.10
-_EU_WEST2_MACRO_CLUSTERS: frozenset[str] = frozenset({"0L8P", "9_oP", "6-wP", "6_gP"})
+_EU_WEST2_MACRO_CLUSTERS: frozenset[str] = frozenset(
+    {"0L8P", "9_oP", "6-wP", "6_gP", "08QP", "4ATb", "7bQP", "7PIP", "9wMP"}
+)
 
 # Global Flash SKUs: 2A35-AC68-14D6 (in), 8658-6939-8BEC (cache), 90FD-DC5F-DC55 (out)
 VERTEX_FLASH_UNCACHED_IN_EUR_PER_M = 0.673573
@@ -277,9 +279,12 @@ def record_realtime_llm_call(
     out = max(0, int(output_tokens or 0))
     prompt = int(prompt_tokens or (uncached + cached))
     cluster_id = extract_vertex_cluster_id(request_id)
-    is_argon_live = (
+    is_live_call = (
         str(source) != "log_tail"
         and not str(session_id).startswith("log_tail")
+    )
+    is_argon_live = (
+        is_live_call
         and prompt > 55_000
         and "argon" in (model or "").lower()
     )
@@ -320,27 +325,43 @@ def record_realtime_llm_call(
     try:
         con = _connect()
         try:
-            if is_argon_live and not cache_reset:
-                prev_row = con.execute(
+            if is_live_call and not cache_reset and (
+                is_argon_live or (prompt >= 45_000 and cached == 0 and uncached >= 45_000)
+            ):
+                prev_rows = con.execute(
                     """
                     SELECT prompt_tokens, cached_in
                     FROM llm_call_ledger
                     WHERE session_id = ? AND ts >= ? AND request_id != ?
-                    ORDER BY ts DESC, id DESC LIMIT 1
+                    ORDER BY ts DESC, id DESC LIMIT 2
                     """,
                     (row_info["session_id"], now - 1800.0, req_key),
-                ).fetchone()
-                if prev_row is not None:
-                    prev_prompt, prev_cached = int(prev_row[0] or 0), int(prev_row[1] or 0)
+                ).fetchall()
+                if prev_rows:
+                    prev_prompt, prev_cached = int(prev_rows[0][0] or 0), int(prev_rows[0][1] or 0)
                     if (
-                        prev_cached >= 42_000
-                        and cached < 42_000
-                        and prompt >= prev_prompt * 0.85
+                        is_argon_live
+                        and (
+                            (
+                                prev_cached >= 42_000
+                                and cached < 42_000
+                                and prompt >= prev_prompt * 0.85
+                            )
+                            or (
+                                prompt >= prev_prompt
+                                and prev_cached >= 35_000
+                                and (prev_cached - cached) >= 16_384
+                                and cached < prompt * 0.50
+                            )
+                        )
                     ) or (
-                        prompt >= prev_prompt
-                        and prev_cached >= 35_000
-                        and (prev_cached - cached) >= 16_384
-                        and cached < prompt * 0.50
+                        len(prev_rows) >= 2
+                        and cached < 10_000
+                        and uncached >= 45_000
+                        and all(
+                            int(r[0] or 0) >= 40_000 and int(r[1] or 0) < 10_000
+                            for r in prev_rows
+                        )
                     ):
                         cache_reset = 1
                         row_info["cache_reset"] = 1
@@ -600,8 +621,8 @@ def evaluate_realtime_spend_breaker(
         con = _connect()
         try:
             cur = con.cursor()
-            # 1) Check explicit quarantine table (including parent lineage for subagents)
-            if p_sid and src == "subagent":
+            # 1) Check explicit quarantine table (including parent lineage for subagents / compression rotation)
+            if p_sid:
                 cur.execute(
                     "SELECT reason, net_eur_window FROM quarantined_sessions WHERE session_id IN (?, ?) AND expires_at > ? ORDER BY expires_at DESC LIMIT 1",
                     (session_id, p_sid, ts_now),
@@ -620,7 +641,7 @@ def evaluate_realtime_spend_breaker(
                         "session_net_eur_15m": float(q_row[1]),
                     }
 
-            # 2) Per-session (and subagent-family) 15m and 1h spend + cache resets
+            # 2) Per-session (and subagent-family / compression-rotation parent) 15m and 1h spend + cache resets
             if family_job_tag and not is_interactive_subagent:
                 cur.execute(
                     """
@@ -638,6 +659,14 @@ def evaluate_realtime_spend_breaker(
                     WHERE (session_id = ? OR job_name = ?) AND ts >= ?
                     """,
                     (session_id, family_job_tag, ts_now - 900.0),
+                )
+            elif p_sid:
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
+                    FROM llm_call_ledger WHERE session_id IN (?, ?) AND ts >= ?
+                    """,
+                    (session_id, p_sid, ts_now - 900.0),
                 )
             else:
                 cur.execute(
@@ -660,6 +689,11 @@ def evaluate_realtime_spend_breaker(
                 cur.execute(
                     "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE (session_id = ? OR job_name = ?) AND ts >= ?",
                     (session_id, family_job_tag, ts_now - 3600.0),
+                )
+            elif p_sid:
+                cur.execute(
+                    "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE session_id IN (?, ?) AND ts >= ?",
+                    (session_id, p_sid, ts_now - 3600.0),
                 )
             else:
                 cur.execute(
