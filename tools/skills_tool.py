@@ -683,7 +683,7 @@ def skill_view(
             return _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` or inspect the files directly on disk.")
         if file_path and skill_dir:
             return _serve_skill_file(
-                skill_dir, file_path, name, list_available=True, mark_read=True,
+                skill_dir, file_path, resolved_name, list_available=True, mark_read=True,
                 hint="Use a relative path within the skill directory")
         # tags/related_skills: metadata.hermes.* (agentskills.io) first, then top-level.
         metadata = frontmatter.get("metadata")

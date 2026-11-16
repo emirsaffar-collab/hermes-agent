@@ -198,3 +198,25 @@ class TestSkillViewDedupRaces:
         assert r3.get("dedup") is True
         assert r3.get("status") == "cross_epoch_digest"
         clear_skill_view_state("rot-s3")
+
+    def test_linked_file_dedup_canonicalizes_category_qualified_skill_name(self, skills_home):
+        cat_dir = skills_home / "skills" / "research" / "cat-skill"
+        cat_dir.mkdir(parents=True)
+        (cat_dir / "SKILL.md").write_text(
+            "---\nname: cat-skill\ndescription: Categorized skill.\n---\n# Cat Skill\n",
+            encoding="utf-8",
+        )
+        refs = cat_dir / "references"
+        refs.mkdir()
+        (refs / "deep.md").write_text("# Deep Reference\n\nBody text here.\n", encoding="utf-8")
+
+        r1 = _view("research/cat-skill", file_path="references/deep.md", task="t-cat")
+        assert r1["success"] is True
+        assert r1["name"] == "cat-skill"
+        assert "Body text here" in r1.get("content", "")
+
+        # Calling with bare skill name must hit the same dedup key ("cat-skill", "references/deep.md")
+        r2 = _view("cat-skill", file_path="references/deep.md", task="t-cat")
+        assert r2["success"] is True
+        assert r2.get("dedup") is True
+        assert r2.get("status") == "unchanged"

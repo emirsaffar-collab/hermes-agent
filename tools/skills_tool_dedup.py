@@ -197,11 +197,18 @@ def seed_skill_view_dedup_from_messages(task_id: str | None, messages: list | No
         return
     with _skill_view_tracker_lock:
         cache = _skill_view_tracker.setdefault(str(task_id), {})
+        epoch_map = _skill_view_epoch_history.setdefault(str(task_id), {})
         for key, digest in entries:
             cache.pop(key, None)
             cache[key] = digest
             while len(cache) > _SKILL_VIEW_DEDUP_CAP:
                 del cache[next(iter(cache))]
+            prev_ep = epoch_map.get(key)
+            if prev_ep is None or prev_ep[0] != digest:
+                epoch_map.pop(key, None)
+                epoch_map[key] = (digest, 1, "")
+                while len(epoch_map) > _SKILL_VIEW_DEDUP_CAP:
+                    del epoch_map[next(iter(epoch_map))]
 
 
 def reset_skill_view_dedup(
