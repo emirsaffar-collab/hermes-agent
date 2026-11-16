@@ -126,7 +126,13 @@ _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "daily-retrospective",
     "night-driver",
     "saffar-",
-    "atlas-",
+    "atlas-steward",
+    "atlas-freshness",
+    "atlas-answer-drafts",
+    "atlas-qa-probe",
+    "atlas-decision-sync",
+    "atlas-doc-review",
+    "atlas-estate-sync",
     "hiss-",
     "archive-done-jobs",
     "iz-",
@@ -316,6 +322,8 @@ def _hc_monitored_job_names() -> frozenset[str]:
         scripts_dir = Path.home() / ".hermes" / "scripts"
         names: set[str] = set()
         for j in data.get("jobs", []):
+            if not str(j.get("prompt") or "").strip():
+                continue
             blob = " ".join(str(j.get(k) or "") for k in ("prompt", "script", "monitor_script"))
             if "hc-ping.sh" not in blob and "hc.uropenn.se" not in blob:
                 cand_files: set[Path] = set()
@@ -338,8 +346,6 @@ def _hc_monitored_job_names() -> frozenset[str]:
                         except Exception:
                             pass
             jname_low = str(j.get("name") or "").strip().lower()
-            if "builder-owner" in jname_low:
-                continue
             is_prefix_tier0 = bool(
                 jname_low and any(jname_low.startswith(p) or p in jname_low for p in _TIER0_CRITICAL_PREFIXES)
             )
@@ -373,8 +379,6 @@ def is_tier0_critical_cron(job_name: str | None, session_id: str | None = None) 
         low = candidate.strip().lower()
         if not low:
             continue
-        if "builder-owner" in low:
-            return False
         if low in hc_names:
             return True
         if any(low.startswith(p) or p in low for p in _TIER0_CRITICAL_PREFIXES):
