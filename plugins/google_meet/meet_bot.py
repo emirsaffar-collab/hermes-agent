@@ -83,7 +83,7 @@ _STATUS_FIELDS = (
 
 _WAKE_ADDRESS_RE = re.compile(
     r"\b(?:"
-    r"mr\.?\s*agent\w*|mister\s*agent\w*|mr\.?\s*notetaker|"
+    r"mr\.?\s*[ae]gent\w*|mister\s*[ae]gent\w*|mr\.?\s*notetaker|"
     r"it-?notetaker|it-?nautiker|notetaker|notiker|"
     r"mötesbotten|ai-?botten|chattbotten|botten|"
     r"ai-?robot\w*|roboten|ai-?agent\w*|agenten|"
@@ -105,17 +105,25 @@ def _classify_voice_control(text: str) -> Optional[str]:
     cleaned = _WAKE_IDIOM_EXCLUDE_RE.sub("", text)
     if not _WAKE_ADDRESS_RE.search(cleaned):
         return None
-    low = cleaned.lower()
-    if re.search(r"\b(?:lämna\s+inte|stanna\s+kvar|gå\s+inte\s+ut)\b", low):
-        return "stay_in_call"
+    candidates = [cleaned]
     if len(cleaned.split()) > 14:
-        return None
-    if re.search(r"\b(?:lämna\s+mötet|du\s+kan\s+lämna|hoppa\s+ut|gå\s+ur\s+mötet|leave\s+the\s+meeting)\b", low):
-        return "leave_call"
-    if re.search(r"\b(?:pausa\s+anteckning\w*|pausa\s+inspelning\w*|sluta\s+anteckna|sluta\s+spela\s+in|pause\s+notes)\b", low):
-        return "pause_capture"
-    if re.search(r"\b(?:fortsätt\s+anteckna|börja\s+anteckna|återuppta\s+anteckning\w*|resume\s+notes)\b", low):
-        return "resume_capture"
+        candidates = [
+            s.strip()
+            for s in re.split(r"[.!?]+", cleaned)
+            if s.strip() and _WAKE_ADDRESS_RE.search(s)
+        ]
+    for cand in candidates:
+        if len(cand.split()) > 16:
+            continue
+        low = cand.lower()
+        if re.search(r"\b(?:lämna\s+inte|stanna\s+kvar|gå\s+inte\s+ut)\b", low):
+            return "stay_in_call"
+        if re.search(r"\b(?:lämnar?\s+m[öa]t+et|du\s+kan\s+lämna|hoppa\s+ut|gå\s+ur\s+mötet|leave\s+the\s+meeting)\b", low):
+            return "leave_call"
+        if re.search(r"\b(?:pausa\s+anteckning\w*|pausa\s+inspelning\w*|sluta\s+anteckna|sluta\s+spela\s+in|pause\s+notes)\b", low):
+            return "pause_capture"
+        if re.search(r"\b(?:fortsätt\s+anteckna|börja\s+anteckna|återuppta\s+anteckning\w*|resume\s+notes)\b", low):
+            return "resume_capture"
     return None
 
 
@@ -126,21 +134,39 @@ class _BotState:
         self.__dict__.update({attr: default for _, attr, default in _STATUS_FIELDS if attr})
         self.__dict__.update(out_dir=out_dir, meeting_id=meeting_id, url=url, _seen=set(),  # seen "speaker|text"
                              speaker_timeline=[],  # list of (epoch_ts, speaker_name) from DOM active-speaker/captions
+                             actual_participants=set(),
+                             stream_meta={},
+                             last_audio_activity_at=None,
+                             _last_timeline_flush_at=0.0,
+                             speaker_timeline_path=out_dir / "speaker_timeline.json",
                              transcript_path=out_dir / "transcript.txt", status_path=out_dir / "status.json")
         out_dir.mkdir(parents=True, exist_ok=True)
         self._flush()
 
+    @staticmethod
+    def clean_speaker_label(speaker: str) -> str:
+        spk = (speaker or "").strip()
+        spk = re.sub(
+            r"\s+(?:och\s+\d+\s+till|and\s+\d+\s+more|\((?:presentation|presenterar|presenting)\))\s*$",
+            "",
+            spk,
+            flags=re.IGNORECASE,
+        ).strip()
+        return spk
+
     def record_dom_speaker(self, speaker: str, epoch_ts: Optional[float] = None) -> None:
         """Record an active human speaker observed in the Meet/Teams DOM at *epoch_ts*."""
-        spk = (speaker or "").strip()
+        spk = self.clean_speaker_label(speaker)
         if not spk or spk.lower() in {"unknown", "you", "du", "mig", "me"}:
             return
         if re.search(r"(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant)", spk, re.IGNORECASE):
             return
+        if not re.match(r"^Voice\s+\d+$", spk, re.IGNORECASE):
+            self.actual_participants.add(spk)
         ts = float(epoch_ts) if epoch_ts is not None else time.time()
         self.speaker_timeline.append((ts, spk))
-        if len(self.speaker_timeline) > 5000:
-            self.speaker_timeline = self.speaker_timeline[-2500:]
+        if len(self.speaker_timeline) > 40000:
+            self.speaker_timeline = self.speaker_timeline[-36000:]
 
     def resolve_speaker_at(self, epoch_ts: float, fallback: str, window_s: float = 6.0) -> str:
         """Return the closest DOM-observed active speaker within *window_s* of *epoch_ts*, or *fallback*."""
@@ -155,7 +181,8 @@ class _BotState:
 
     def record_caption(self, speaker: str, text: str, offset_s: Optional[float] = None) -> None:
         """Append a caption line unless this exact (speaker, text) was already seen."""
-        speaker, text = (speaker or "").strip() or "Unknown", (text or "").strip()
+        speaker = self.clean_speaker_label(speaker) or "Unknown"
+        text = (text or "").strip()
         key = f"{speaker}|{text}"
         if not text or key in self._seen:
             return
@@ -191,6 +218,25 @@ class _BotState:
         data = {key: getattr(self, attr) if attr else None for key, attr, _ in _STATUS_FIELDS}
         data.update(transcriptPath=str(self.transcript_path), pid=os.getpid())  # keeps table key order
         atomic_json_write(self.status_path, data)
+        now_ts = time.time()
+        if getattr(self, "exited", False) or (now_ts - getattr(self, "_last_timeline_flush_at", 0.0)) >= 10.0:
+            self._last_timeline_flush_at = now_ts
+            rle_tl = []
+            for ts, spk in getattr(self, "speaker_timeline", []):
+                if not rle_tl or rle_tl[-1][1] != spk or (ts - rle_tl[-1][2]) > 2.5:
+                    rle_tl.append([round(ts, 2), spk, round(ts, 2)])
+                else:
+                    rle_tl[-1][2] = round(ts, 2)
+            tl_data = {
+                "joinedAt": getattr(self, "joined_at", None),
+                "actualParticipants": sorted(getattr(self, "actual_participants", set())),
+                "streamMeta": getattr(self, "stream_meta", {}),
+                "timeline": rle_tl,
+            }
+            try:
+                atomic_json_write(self.speaker_timeline_path, tl_data)
+            except Exception:
+                pass
 
     def set(self, **kwargs) -> None:
         self.__dict__.update(kwargs)
@@ -683,7 +729,7 @@ class _RtcTranscriber:
                     axis=-2,
                 ).astype(mx.float16)
                 audio_features = m.encoder(mel[None])
-                if not det_lang or det_lang == "auto":
+                if not lang_env or lang_env == "auto":
                     tok = get_tokenizer(
                         m.is_multilingual,
                         num_languages=m.num_languages,
@@ -700,10 +746,27 @@ class _RtcTranscriber:
                     else:
                         mask[list(tok.all_language_tokens)] = 0.0
                     probs = mx.softmax(logits + mask, axis=-1)[0]
-                    best_idx = int(mx.argmax(probs).item())
-                    lang_map = dict(zip(tok.all_language_tokens, tok.all_language_codes))
-                    det_lang = lang_map.get(best_idx, "sv")
-                    det_prob = float(probs[best_idx].item())
+                    code_to_prob = {
+                        code: float(probs[tid_tok].item())
+                        for tid_tok, code in zip(tok.all_language_tokens, tok.all_language_codes)
+                    }
+                    sv_p = code_to_prob.get("sv", 0.0)
+                    en_p = code_to_prob.get("en", 0.0)
+                    pl_p = code_to_prob.get("pl", 0.0)
+                    if pl_p >= 0.72 and pl_p >= max(sv_p, en_p):
+                        det_lang = "pl"
+                        det_prob = pl_p
+                    elif en_p >= 0.35 and en_p > sv_p * 1.35:
+                        det_lang = "en"
+                        det_prob = en_p
+                    elif sv_p >= 0.10 or "sv" in (allowed_langs or {"sv"}):
+                        det_lang = "sv"
+                        det_prob = max(sv_p, 0.5)
+                    else:
+                        best_idx = int(mx.argmax(probs).item())
+                        lang_map = dict(zip(tok.all_language_tokens, tok.all_language_codes))
+                        det_lang = lang_map.get(best_idx, "sv")
+                        det_prob = float(probs[best_idx].item())
                 opts = DecodingOptions(
                     language=det_lang,
                     temperature=0.0,
@@ -715,6 +778,22 @@ class _RtcTranscriber:
                 no_speech_p = float(getattr(res, "no_speech_prob", 0.0) or 0.0)
                 comp_ratio = float(getattr(res, "compression_ratio", 1.0) or 1.0)
                 txt = (getattr(res, "text", "") or "").strip()
+                if (comp_ratio > 2.4 or re.search(r"\b(\w+)(?:[\s,]+\1){3,}", txt, re.IGNORECASE) or "tretkora" in txt.lower()) and prompt_env:
+                    res_unprompted = m.decode(
+                        audio_features[0],
+                        DecodingOptions(
+                            language=det_lang,
+                            temperature=0.0,
+                            fp16=True,
+                            prompt=None,
+                            sample_len=max(24, min(224, int(dur_s * 12))),
+                        ),
+                    )
+                    alt_comp = float(getattr(res_unprompted, "compression_ratio", 1.0) or 1.0)
+                    alt_txt = (getattr(res_unprompted, "text", "") or "").strip()
+                    if alt_comp <= 2.4 and alt_txt:
+                        res, comp_ratio, txt = res_unprompted, alt_comp, alt_txt
+                        no_speech_p = float(getattr(res_unprompted, "no_speech_prob", 0.0) or 0.0)
                 if no_speech_p <= 0.75 and comp_ratio <= 2.4 and txt:
                     c_s = seg_start_s + (float(c_start) / 16000.0)
                     c_e = min(seg_end_s, seg_start_s + (float(c_end) / 16000.0))
@@ -722,8 +801,8 @@ class _RtcTranscriber:
         info = SimpleNamespace(
             language=det_lang or "sv",
             language_probability=det_prob,
-            no_speech_prob=no_speech_p,
-            compression_ratio=comp_ratio,
+            no_speech_prob=0.0 if segs else no_speech_p,
+            compression_ratio=1.0 if segs else comp_ratio,
         )
         return segs, info
 
@@ -767,6 +846,22 @@ class _RtcTranscriber:
         merged.parent.mkdir(parents=True, exist_ok=True)
         try:
             data = path.read_bytes()
+            now_ts = time.time()
+            chunk_ms = float(os.environ.get("HERMES_MEET_CHUNK_MS", "10000") or 10000)
+            s_key = str(stream_id)
+            if s_key not in self.state.stream_meta:
+                self.state.stream_meta[s_key] = {
+                    "streamId": stream_id,
+                    "firstChunkEpoch": round(now_ts, 3),
+                    "streamStartEpoch": round(now_ts - (chunk_ms / 1000.0), 3),
+                    "chunks": 0,
+                    "bytes": 0,
+                }
+            self.state.stream_meta[s_key]["chunks"] = int(self.state.stream_meta[s_key].get("chunks", 0)) + 1
+            self.state.stream_meta[s_key]["bytes"] = int(self.state.stream_meta[s_key].get("bytes", 0)) + len(data)
+            self.state.stream_meta[s_key]["lastChunkEpoch"] = round(now_ts, 3)
+            if len(data) > 25_000:
+                self.state.last_audio_activity_at = now_ts
             if data.startswith(self._EBML_MAGIC):
                 cluster = data.find(self._CLUSTER_ID)
                 if cluster > 0 and stream_id not in self._webm_headers:
@@ -775,7 +870,10 @@ class _RtcTranscriber:
                     data = data[cluster:]
             with merged.open("ab") as f:
                 f.write(data)
-            self.state.set(audio_fragments=self.state.audio_fragments + 1)
+            self.state.set(
+                audio_fragments=self.state.audio_fragments + 1,
+                last_audio_activity_at=self.state.last_audio_activity_at,
+            )
             _quiet(path.unlink)
             return len(data)
         except Exception as e:
@@ -822,6 +920,10 @@ class _RtcTranscriber:
         flush_sec = float(os.environ.get("HERMES_MEET_FLUSH_SEC", "10") or 10)
         idle_flush_sec = max(flush_sec + 1.0, 20.0 if flush_sec >= 10.0 else flush_sec * 1.5)
         while True:
+            if self.stop.get("stop"):
+                self._drain_stream_queue(stream_id)
+                self._flush_stream(stream_id, merged, label)
+                return
             item = self._pop(stream_id)
             if item is None:
                 if self.stop.get("stop"):
@@ -934,6 +1036,7 @@ class _RtcTranscriber:
             sys.stderr.write(f"meet rtc: flush stream {stream_id}: +{len(tail)/16000:.1f}s new audio, peak {peak:.4f}\n")
             if peak < 0.01:  # digital silence / DTX noise floor
                 return
+            self.state.set(last_audio_activity_at=time.time())
         except Exception:
             return
         speech_dur_s = 0.0
@@ -947,6 +1050,8 @@ class _RtcTranscriber:
             if not speeches:
                 return
             speech_dur_s = sum(sp["end"] - sp["start"] for sp in speeches) / 16000.0
+            if speech_dur_s > 0.25:
+                self.state.set(last_audio_activity_at=time.time())
         except Exception:
             pass
         use_mlx_dynamic = os.environ.get("HERMES_MEET_ASR_BACKEND", "faster_whisper").strip().lower() in ("mlx", "mlx_dynamic")
@@ -960,14 +1065,17 @@ class _RtcTranscriber:
                     self.state.set(error=f"whisper unavailable ({e}) — merged audio kept on disk")
                 return
         try:
-            lang_env = os.environ.get("HERMES_MEET_LANGUAGE", "").strip() or None
+            raw_lang_env = os.environ.get("HERMES_MEET_LANGUAGE", "").strip() or None
+            lang_env = raw_lang_env
             multilang_set = {
                 x.strip().lower()
                 for x in os.environ.get("HERMES_MEET_MULTILANG", "").split(",")
                 if x.strip()
             }
             if lang_env == "auto" or lang_env is None:
-                if multilang_set:
+                if use_mlx_dynamic:
+                    lang_env = "auto"
+                elif multilang_set:
                     lang_env = self._stream_lang_locked.get(stream_id)
                 else:
                     lang_env = self._detected_language
@@ -989,10 +1097,11 @@ class _RtcTranscriber:
                     model = self._whisper()
             if not use_mlx_dynamic:
                 assert model is not None
+                fw_lang = None if lang_env == "auto" else lang_env
                 with self._whisper_lock:
                     segs_iter, _info = model.transcribe(
                         tail,
-                        language=lang_env,
+                        language=fw_lang,
                         vad_filter=True,
                         vad_parameters=dict(threshold=0.5, min_speech_duration_ms=350, speech_pad_ms=200),
                         beam_size=1,
@@ -1017,7 +1126,7 @@ class _RtcTranscriber:
                         segs = list(segs_iter)
             det_lang = getattr(_info, "language", None)
             lang_prob = float(getattr(_info, "language_probability", 0.0) or 0.0)
-            if multilang_set and det_lang in multilang_set:
+            if multilang_set and det_lang in multilang_set and det_lang != "pl":
                 self._stream_lang[stream_id] = det_lang
                 if lang_prob >= 0.85 and speech_dur_s > 0.0:
                     acc_s = self._stream_lang_sec.get(stream_id, 0.0) + speech_dur_s
@@ -1029,6 +1138,7 @@ class _RtcTranscriber:
                 and self._detected_language is None
                 and speech_dur_s >= 3.0
                 and det_lang
+                and det_lang != "pl"
                 and lang_prob >= 0.80
             ):
                 self._detected_language = det_lang
@@ -1037,13 +1147,14 @@ class _RtcTranscriber:
                 r"^(?:mikael wiehe:?|tack till elever och personal.*|undertextning:?.*|textning\.nu.*)$",
                 re.IGNORECASE,
             )
+            s_meta = self.state.stream_meta.get(str(stream_id), {})
+            anchor = s_meta.get("streamStartEpoch") or self.state.joined_at or self.state.join_attempted_at or time.time()
             for s in segs:
                 text = (s.text or "").strip()
                 if re.search(r"\b(\w+)(?:[\s,]+\1){4,}", text, re.IGNORECASE):
                     continue
                 if text and not _hallucination_pat.match(text):
                     seg_offset_s = base_offset_s + float(getattr(s, "start", 0.0) or 0.0)
-                    anchor = self.state.joined_at or self.state.join_attempted_at or time.time()
                     seg_epoch = float(anchor) + seg_offset_s
                     resolved_speaker = self.state.resolve_speaker_at(seg_epoch, fallback=label)
                     self.state.record_caption(speaker=resolved_speaker, text=text, offset_s=seg_offset_s)
@@ -1110,6 +1221,13 @@ _CAPTION_OBSERVER_JS = r"""
   };
 
   window.__hermesSpeakerQueue = [];
+  window.__hermesCleanSpeakerName = (raw) => {
+    let s = (raw || '').replace(/\s+/g, ' ').trim();
+    s = s.replace(/\s+(?:och|and|\+)\s+\d+\s+(?:till|more|andra|others)\b.*$/i, '').trim();
+    s = s.replace(/\s*\((?:presentation|presenterar|presenting|skärmdelning)\)\s*$/i, '').trim();
+    s = s.replace(/\s+(?:presenterar|is presenting|delar sin skärm)\s*$/i, '').trim();
+    return s;
+  };
   window.__hermesActiveSpeaker = () => {
     const botRe = /(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant|fireflies|otter\.ai)/i;
     const selfRe = /^(\s*(du|you|mig|me)\s*)$/i;
@@ -1124,13 +1242,13 @@ _CAPTION_OBSERVER_JS = r"""
       if (!isSpeaking) continue;
       const selfName = (t.getAttribute('data-self-name') || '').trim();
       const nameEl = t.querySelector('.zWGUib, .KcIKyf, .zs7s8d, [data-tid="participant-name"]');
-      const spk = (selfName || (nameEl ? nameEl.innerText : '') || '').trim();
+      const spk = window.__hermesCleanSpeakerName(selfName || (nameEl ? nameEl.innerText : '') || '');
       if (spk && !botRe.test(spk) && !selfRe.test(spk)) return spk;
     }
     // 2. Fallback: latest speaker header in live caption region
     const spkEls = document.querySelectorAll('div.KcIKyf, div.zs7s8d, span[jsname="YSxPC"]');
     if (spkEls.length) {
-      const lastSpk = (spkEls[spkEls.length - 1].innerText || '').trim();
+      const lastSpk = window.__hermesCleanSpeakerName(spkEls[spkEls.length - 1].innerText || '');
       if (lastSpk && !botRe.test(lastSpk) && !selfRe.test(lastSpk)) return lastSpk;
     }
     return null;
@@ -1191,6 +1309,14 @@ _PARTICIPANT_COUNT_JS = r"""
       }
       const botRe = /(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant|fireflies|otter\.ai|fathom|read\.ai|gemini\s+notes|meeting\s+bot|recording\s+bot)/i;
       const selfRe = /^(\s*(du|you|mig|me)\s*)$/i;
+      // Screen-share / presentation indicator means at least one human is actively presenting
+      if (/presenterar|is presenting|delar sin skärm|sharing their screen/i.test(bodyTxt)) {
+        return 2;
+      }
+      // Collapsed "+N till" / "and N more" indicator means multiple participants are in the call
+      if (/\b(?:och|and|\+)\s+\d+\s+(?:till|more|andra|others)\b/i.test(bodyTxt)) {
+        return 3;
+      }
       const tiles = Array.from(document.querySelectorAll('[data-participant-id], [data-cid="calling-participant-stream"], [data-tid="roster-participant"]'));
       if (tiles.length > 0) {
         const seenIds = new Set();
@@ -1594,7 +1720,12 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                 alone_since = None
             elif isinstance(pcount, int) and pcount <= 1:
                 stay_until = float(getattr(state, "stay_override_until", 0.0) or 0.0)
-                recent_audio = bool(state.last_caption_at and (now - float(state.last_caption_at)) < 45.0) or (now < stay_until)
+                last_act_ts = getattr(state, "last_audio_activity_at", None)
+                recent_audio = (
+                    bool(state.last_caption_at and (now - float(state.last_caption_at)) < 45.0)
+                    or bool(last_act_ts and (now - float(last_act_ts)) < 90.0)
+                    or (now < stay_until)
+                )
                 if recent_audio:
                     alone_since = None
                 elif had_other_participants:
@@ -1730,6 +1861,7 @@ def run_bot() -> int:
                 if chunk_ms != 10000:
                     context.add_init_script(f"window.__hermesMeetChunkMs = {chunk_ms};")
                 context.add_init_script(_RTC_HOOK_JS)
+            context.add_init_script(_CAPTION_OBSERVER_JS)
             page = context.new_page()
             if cfg.rtc_audio:
                 page.expose_function("__hermesMeetAudioChunk", _on_audio_chunk)
