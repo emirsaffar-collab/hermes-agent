@@ -85,8 +85,8 @@ _WAKE_ADDRESS_RE = re.compile(
     r"\b(?:"
     r"mr\.?\s*agent\w*|mister\s*agent\w*|mr\.?\s*notetaker|"
     r"it-?notetaker|it-?nautiker|notetaker|notiker|"
-    r"mötesanteckning\w*|mötesbotten|ai-?botten|chattbotten|botten|bot|"
-    r"ai-?robot\w*|roboten|robot|ai-?agent\w*|agenten|"
+    r"mötesbotten|ai-?botten|chattbotten|botten|"
+    r"ai-?robot\w*|roboten|ai-?agent\w*|agenten|"
     r"min\s+kära\s+ai|kära\s+ai\w*|ai-?kolleg\w*|ai-?mir"
     r")\b",
     re.IGNORECASE,
@@ -108,6 +108,8 @@ def _classify_voice_control(text: str) -> Optional[str]:
     low = cleaned.lower()
     if re.search(r"\b(?:lämna\s+inte|stanna\s+kvar|gå\s+inte\s+ut)\b", low):
         return "stay_in_call"
+    if len(cleaned.split()) > 14:
+        return None
     if re.search(r"\b(?:lämna\s+mötet|du\s+kan\s+lämna|hoppa\s+ut|gå\s+ur\s+mötet|leave\s+the\s+meeting)\b", low):
         return "leave_call"
     if re.search(r"\b(?:pausa\s+anteckning\w*|pausa\s+inspelning\w*|sluta\s+anteckna|sluta\s+spela\s+in|pause\s+notes)\b", low):
@@ -635,7 +637,7 @@ class _RtcTranscriber:
             "models--mlx-community--whisper-large-v3-turbo",
         ).strip()
         snap_root = Path.home() / ".cache/huggingface/hub" / mlx_repo / "snapshots"
-        model_path = str(sorted(snap_root.iterdir())[-1]) if snap_root.is_dir() else mlx_repo
+        model_path = str(max(snap_root.iterdir())) if snap_root.is_dir() else mlx_repo
         with self._whisper_lock:
             if self._mlx_model is None:
                 m = ModelHolder.get_model(model_path, mx.float16)
@@ -799,8 +801,8 @@ class _RtcTranscriber:
         merged = self.cfg.out_dir / "audio" / f"stream_{stream_id:02d}.webm"
         merged.parent.mkdir(parents=True, exist_ok=True)  # standalone/offline use
         fresh_bytes, last_flush = 0, time.time()
-        flush_sec = float(os.environ.get("HERMES_MEET_FLUSH_SEC", "1.5") or 1.5)
-        idle_flush_sec = max(flush_sec + 0.5, flush_sec * 1.5)
+        flush_sec = float(os.environ.get("HERMES_MEET_FLUSH_SEC", "10") or 10)
+        idle_flush_sec = max(flush_sec + 1.0, 20.0 if flush_sec >= 10.0 else flush_sec * 1.5)
         while True:
             item = self._pop(stream_id)
             if item is None:
@@ -813,19 +815,19 @@ class _RtcTranscriber:
                     self._drain_stream_queue(stream_id)
                     self._flush_stream(stream_id, merged, label)
                     fresh_bytes, last_flush = 0, time.time()
-                time.sleep(0.15)
+                time.sleep(0.25)
                 continue
             _, nbytes = item
             fresh_bytes += int(nbytes or 0)
-            if fresh_bytes > 200_000 or time.time() - last_flush > flush_sec:
+            if fresh_bytes > 400_000 or time.time() - last_flush > flush_sec:
                 self._drain_stream_queue(stream_id)
                 self._flush_stream(stream_id, merged, label)
                 fresh_bytes, last_flush = 0, time.time()
 
     def _decode_incremental_tail(self, stream_id: int, merged: Path):
-        """Decode only the newly appended WebM clusters using Exact Cluster-Cursor seeking (100% hit rate)."""
+        """Decode only the newly appended WebM clusters in O(1) time; support mid-cluster cursor when needed."""
         done = self._transcribed.get(stream_id, 0)
-        min_tail_samples = int(16000 * (0.8 if os.environ.get("HERMES_MEET_REALTIME_STANDUP") == "1" else 1.5))
+        min_tail_samples = int(16000 * (0.8 if os.environ.get("HERMES_MEET_REALTIME_STANDUP") == "1" else 5.0))
         if "_decode" in self.__dict__:
             audio = self._decode(merged)
             if audio is None or len(audio) <= done + min_tail_samples:
@@ -851,6 +853,20 @@ class _RtcTranscriber:
                             self._cluster_base_samples[stream_id] = 0
                 header = self._webm_headers.get(stream_id)
                 if header is not None:
+                    start_off = max(prev_off, len(header))
+                    if file_size > start_off:
+                        f.seek(start_off)
+                        new_clusters = f.read(file_size - start_off)
+                        if new_clusters.startswith(self._CLUSTER_ID):
+                            tail = self._decode_bytes(header + new_clusters)
+                            if tail is not None:
+                                if len(tail) <= min_tail_samples:
+                                    return None, done
+                                self._last_cluster_off[stream_id] = start_off
+                                self._cluster_base_samples[stream_id] = done
+                                self._decoded_bytes[stream_id] = file_size
+                                self._transcribed[stream_id] = done + len(tail)
+                                return tail, done
                     cl_off = self._last_cluster_off.get(stream_id, len(header))
                     base_samples = self._cluster_base_samples.get(stream_id, 0)
                     if file_size > cl_off:
@@ -915,7 +931,7 @@ class _RtcTranscriber:
             speech_dur_s = sum(sp["end"] - sp["start"] for sp in speeches) / 16000.0
         except Exception:
             pass
-        use_mlx_dynamic = os.environ.get("HERMES_MEET_ASR_BACKEND", "").strip().lower() in ("mlx", "mlx_dynamic")
+        use_mlx_dynamic = os.environ.get("HERMES_MEET_ASR_BACKEND", "faster_whisper").strip().lower() in ("mlx", "mlx_dynamic")
         model = None
         if not use_mlx_dynamic:
             try:
@@ -938,15 +954,22 @@ class _RtcTranscriber:
                 else:
                     lang_env = self._detected_language
             prompt_env = os.environ.get("HERMES_MEET_INITIAL_PROMPT", "").strip() or self._last_text.get(stream_id) or None
+            segs: list = []
+            _info = None
             if use_mlx_dynamic:
-                segs, _info = self._transcribe_mlx_dynamic(
-                    tail,
-                    lang_env=lang_env,
-                    prompt_env=prompt_env,
-                    allowed_langs=multilang_set or None,
-                    speeches=speeches,
-                )
-            else:
+                try:
+                    segs, _info = self._transcribe_mlx_dynamic(
+                        tail,
+                        lang_env=lang_env,
+                        prompt_env=prompt_env,
+                        allowed_langs=multilang_set or None,
+                        speeches=speeches,
+                    )
+                except Exception as mlx_err:
+                    sys.stderr.write(f"meet rtc: mlx_dynamic failed ({mlx_err}), falling back to faster_whisper\n")
+                    use_mlx_dynamic = False
+                    model = self._whisper()
+            if not use_mlx_dynamic:
                 assert model is not None
                 with self._whisper_lock:
                     segs_iter, _info = model.transcribe(
