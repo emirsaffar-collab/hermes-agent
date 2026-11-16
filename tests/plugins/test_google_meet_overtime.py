@@ -82,4 +82,48 @@ def test_chromium_drain_loop_overtime_extension_and_expiry(tmp_path: Path, capsy
         assert getattr(state_ceil, "leave_reason", None) == "duration_expired"
         assert status_ceil["leaveReason"] == "duration_expired"
 
+        # 4. Negative control C: <4h elapsed (5400s) but >=900s dead air after prior speech -> exits with duration_expired
+        stop_flag_dead = {"stop": False}
+        dead_dir = tmp_path / "dead"
+        state_dead = meet_bot._BotState(dead_dir, "mtg_dead", "https://meet.google.com/swr-pnoz-jnq")
+        state_dead.set(in_call=True, joined_at=now - 5400.0, last_caption_at=now - 1200.0, mic_state="muted")
+        cfg_dead = _make_cfg(duration_s=-1.0)
+
+        meet_bot._drain_loop(page, cfg_dead, state_dead, rt, stop_flag_dead)
+        status_dead = json.loads((dead_dir / "status.json").read_text(encoding="utf-8"))
+        assert getattr(state_dead, "leave_reason", None) == "duration_expired"
+        assert status_dead["leaveReason"] == "duration_expired"
+
+        # 5. Polarity check on _PARTICIPANT_COUNT_JS when all hooked WebRTC streams transition to inactive
+        page.set_content(
+            """<html><body><script>
+            window.__hermesRtcStreams = new Map([
+              [2, {state: 'inactive'}],
+              [3, {state: 'inactive'}],
+              [4, {state: 'inactive'}]
+            ]);
+            </script></body></html>"""
+        )
+        assert page.evaluate(meet_bot._PARTICIPANT_COUNT_JS) == 1
+        page.evaluate("window.__hermesRtcStreams.set(2, {state: 'recording'})")
+        assert page.evaluate(meet_bot._PARTICIPANT_COUNT_JS) == 2
+
+        # 5b. Polarity check on _PARTICIPANT_COUNT_JS when DOM retains a ghost [data-participant-id] tile
+        # after all remote WebRTC tracks end (__hermesMeetRtcPoll activeStreams === 0 -> returns 1, activeStreams === 1 -> returns 2)
+        page.set_content(
+            """<html><body>
+            <div data-participant-id="self-tile" style="width:200px;height:200px">Me</div>
+            <div data-participant-id="ghost-tile" style="width:200px;height:200px">Ghost</div>
+            <script>
+            window.__hermesMeetRtcPoll = () => ({pcs: 1, connectedPcs: 1, activeStreams: 0});
+            </script></body></html>"""
+        )
+        assert page.evaluate(meet_bot._PARTICIPANT_COUNT_JS) == 1
+        page.evaluate("window.__hermesMeetRtcPoll = () => ({pcs: 1, connectedPcs: 1, activeStreams: 1})")
+        assert page.evaluate(meet_bot._PARTICIPANT_COUNT_JS) == 2
+
+        # 6. Polarity check on _DENIED_PROBE_JS for Swedish post-call / left-meeting screen
+        page.set_content("<html><body><div>Du har lämnat mötet</div><button>Återgå till startskärmen</button></body></html>")
+        assert page.evaluate(meet_bot._DENIED_PROBE_JS) is True
+
         browser.close()

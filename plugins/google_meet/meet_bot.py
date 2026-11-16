@@ -362,8 +362,11 @@ _RTC_HOOK_JS = r"""
       try { if (mr.state !== 'inactive') mr.stop(); } catch (e) {}
     }
   };
-  window.__hermesMeetRtcPoll = () => ({streams: window.__hermesRtcStreams.size,
-                                       err: window.__hermesRtcErr || null});
+  window.__hermesMeetRtcPoll = () => ({
+    streams: window.__hermesRtcStreams.size,
+    activeStreams: Array.from(window.__hermesRtcStreams.values()).filter(mr => mr && mr.state === 'recording').length,
+    err: window.__hermesRtcErr || null
+  });
 })();
 """
 
@@ -656,51 +659,66 @@ class _RtcTranscriber:
                 type(m.encoder).__call__ = _dynamic_encoder_call
                 self._mlx_model = m
             m = self._mlx_model
-            dur_s = max(1.0, float(len(speech_pcm)) / 16000.0)
-            dyn_frames = max(1200, min(3000, ((int(dur_s * 100) + 400 + 99) // 100) * 100))
-            mel = pad_or_trim(
-                log_mel_spectrogram(speech_pcm, n_mels=m.dims.n_mels, padding=480000),
-                dyn_frames,
-                axis=-2,
-            ).astype(mx.float16)
-            audio_features = m.encoder(mel[None])
+            window_samples = 25 * 16000
+            total_samples = len(speech_pcm)
+            chunk_ranges = (
+                [(off, min(total_samples, off + window_samples)) for off in range(0, total_samples, window_samples)]
+                if total_samples > 30 * 16000
+                else [(0, total_samples)]
+            )
+            segs = []
             det_lang = lang_env
             det_prob = 0.98
-            if not det_lang or det_lang == "auto":
-                tok = get_tokenizer(
-                    m.is_multilingual,
-                    num_languages=m.num_languages,
-                    language="en",
-                    task="transcribe",
+            no_speech_p = 0.0
+            comp_ratio = 1.0
+            for c_start, c_end in chunk_ranges:
+                c_pcm = speech_pcm[c_start:c_end]
+                if len(c_pcm) < 1600:
+                    continue
+                dur_s = max(1.0, float(len(c_pcm)) / 16000.0)
+                dyn_frames = max(1200, min(3000, ((int(dur_s * 100) + 400 + 99) // 100) * 100))
+                mel = pad_or_trim(
+                    log_mel_spectrogram(c_pcm, n_mels=m.dims.n_mels, padding=480000),
+                    dyn_frames,
+                    axis=-2,
+                ).astype(mx.float16)
+                audio_features = m.encoder(mel[None])
+                if not det_lang or det_lang == "auto":
+                    tok = get_tokenizer(
+                        m.is_multilingual,
+                        num_languages=m.num_languages,
+                        language="en",
+                        task="transcribe",
+                    )
+                    x_sot = mx.array([[tok.sot]])
+                    logits = m.logits(x_sot, audio_features)[:, 0]
+                    mask = mx.full(logits.shape[-1], -mx.inf, dtype=mx.float32)
+                    if allowed_langs:
+                        for tid_tok, code in zip(tok.all_language_tokens, tok.all_language_codes):
+                            if code in allowed_langs:
+                                mask[tid_tok] = 0.0
+                    else:
+                        mask[list(tok.all_language_tokens)] = 0.0
+                    probs = mx.softmax(logits + mask, axis=-1)[0]
+                    best_idx = int(mx.argmax(probs).item())
+                    lang_map = dict(zip(tok.all_language_tokens, tok.all_language_codes))
+                    det_lang = lang_map.get(best_idx, "sv")
+                    det_prob = float(probs[best_idx].item())
+                opts = DecodingOptions(
+                    language=det_lang,
+                    temperature=0.0,
+                    fp16=True,
+                    prompt=prompt_env,
+                    sample_len=max(24, min(224, int(dur_s * 12))),
                 )
-                x_sot = mx.array([[tok.sot]])
-                logits = m.logits(x_sot, audio_features)[:, 0]
-                mask = mx.full(logits.shape[-1], -mx.inf, dtype=mx.float32)
-                if allowed_langs:
-                    for tid_tok, code in zip(tok.all_language_tokens, tok.all_language_codes):
-                        if code in allowed_langs:
-                            mask[tid_tok] = 0.0
-                else:
-                    mask[list(tok.all_language_tokens)] = 0.0
-                probs = mx.softmax(logits + mask, axis=-1)[0]
-                best_idx = int(mx.argmax(probs).item())
-                lang_map = dict(zip(tok.all_language_tokens, tok.all_language_codes))
-                det_lang = lang_map.get(best_idx, "sv")
-                det_prob = float(probs[best_idx].item())
-            opts = DecodingOptions(
-                language=det_lang,
-                temperature=0.0,
-                fp16=True,
-                prompt=prompt_env,
-                sample_len=max(24, min(128, int(dur_s * 12))),
-            )
-            res = m.decode(audio_features[0], opts)
-        no_speech_p = float(getattr(res, "no_speech_prob", 0.0) or 0.0)
-        comp_ratio = float(getattr(res, "compression_ratio", 1.0) or 1.0)
-        txt = (getattr(res, "text", "") or "").strip()
-        if no_speech_p > 0.75 or comp_ratio > 2.4:
-            txt = ""
-        segs = [SimpleNamespace(text=txt, start=seg_start_s, end=seg_end_s)] if txt else []
+                res = m.decode(audio_features[0], opts)
+                no_speech_p = float(getattr(res, "no_speech_prob", 0.0) or 0.0)
+                comp_ratio = float(getattr(res, "compression_ratio", 1.0) or 1.0)
+                txt = (getattr(res, "text", "") or "").strip()
+                if no_speech_p <= 0.75 and comp_ratio <= 2.4 and txt:
+                    c_s = seg_start_s + (float(c_start) / 16000.0)
+                    c_e = min(seg_end_s, seg_start_s + (float(c_end) / 16000.0))
+                    segs.append(SimpleNamespace(text=txt, start=c_s, end=c_e))
         info = SimpleNamespace(
             language=det_lang or "sv",
             language_probability=det_prob,
@@ -1161,6 +1179,16 @@ _PARTICIPANT_COUNT_JS = r"""
     (() => {
       const bodyTxt = document.body ? (document.body.innerText || '') : '';
       if (/Det finns ingen annan här|You're the only one here|Ingen annan är här|Väntar på att andra ska ansluta|Waiting for others to join/i.test(bodyTxt)) return 1;
+      if (window.__hermesRtcStreams && window.__hermesRtcStreams.size > 0) {
+        const activeStreams = Array.from(window.__hermesRtcStreams.values()).filter(mr => mr && mr.state === 'recording').length;
+        if (activeStreams === 0) return 1;
+      }
+      if (typeof window.__hermesMeetRtcPoll === 'function') {
+        try {
+          const rtc = window.__hermesMeetRtcPoll();
+          if (rtc && ((rtc.streams || 0) > 0 || (rtc.pcs || 0) >= 1) && rtc.activeStreams === 0) return 1;
+        } catch (e) {}
+      }
       const botRe = /(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant|fireflies|otter\.ai|fathom|read\.ai|gemini\s+notes|meeting\s+bot|recording\s+bot)/i;
       const selfRe = /^(\s*(du|you|mig|me)\s*)$/i;
       const tiles = Array.from(document.querySelectorAll('[data-participant-id], [data-cid="calling-participant-stream"], [data-tid="roster-participant"]'));
@@ -1190,7 +1218,7 @@ _PARTICIPANT_COUNT_JS = r"""
 _DENIED_PROBE_JS = r"""
     (() => {
       const text = document.body ? document.body.innerText || '' : '';
-      return /You can't join this video call|You were removed from the meeting|No one responded to your request to join|Du kan inte gå med i det här videosamtalet|Du har tagits bort från mötet|Ingen svarade på din förfrågan|Samtalet har avslutats|Call ended|Mötet har avslutats|The meeting has ended|Vi kunde inte släppa in dig|Sorry, we couldn't connect you|Ingen släppte in dig|No one let you in/i.test(text);
+      return /You can't join this video call|You were removed from the meeting|No one responded to your request to join|Du kan inte gå med i det här videosamtalet|Du har tagits bort från mötet|Ingen svarade på din förfrågan|Samtalet har avslutats|Call ended|Mötet har avslutats|The meeting has ended|Du har lämnat mötet|Du lämnade mötet|You left the meeting|You've left the meeting|Återgå till startskärmen|Return to home screen|Hur var ljudet och bilden|How was the audio and video|Vi kunde inte släppa in dig|Sorry, we couldn't connect you|Ingen släppte in dig|No one let you in/i.test(text);
     })();
     """
 
@@ -1520,7 +1548,12 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             is_in_call = bool(getattr(state, "in_call", False))
             in_call_elapsed = (now - float(joined_ts)) if joined_ts else 0.0
             recent_speech = bool(last_cap_ts and (now - float(last_cap_ts)) < 600.0)
-            still_populated = bool(is_in_call and alone_since is None and in_call_elapsed < 14400.0)
+            still_populated = bool(
+                is_in_call
+                and alone_since is None
+                and in_call_elapsed < 14400.0
+                and (last_cap_ts is None or (now - float(last_cap_ts)) < 900.0)
+            )
             if is_in_call and in_call_elapsed < 21600.0 and (recent_speech or still_populated):
                 deadline = now + 900.0
                 print(
