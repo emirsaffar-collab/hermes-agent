@@ -110,28 +110,37 @@ def _not_pinned_sql(alias: str = "s") -> str:
 class SessionMaintenanceMixin:
     """Retention pruning, stale-session archiving and VACUUM policy for SessionDB."""
 
-    def prune_empty_ghost_sessions(self, sessions_dir: Optional[Path] = None) -> int:
-        """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
+    def prune_empty_ghost_sessions(self, sessions_dir: Optional[Path] = None, max_batches: int = 100) -> int:
+        """Remove empty TUI and cron ghost sessions (no messages, >24hr old) in bounded write batches."""
         cutoff = time.time() - 86400
-        def _do(conn):
-            ids = [r[0] for r in conn.execute("""
-                SELECT id FROM sessions
-                WHERE source = 'tui'
-                  AND title IS NULL
-                  AND ended_at IS NOT NULL
-                  AND started_at < ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM messages WHERE messages.session_id = sessions.id
-                  )
-            """, (cutoff,)).fetchall()]
-            from hermes_state_mutation_retirement import retire_prunable
-            ids = retire_prunable(conn, ids)
-            for chunk in _id_chunks(ids):
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({_placeholders(chunk)})", chunk)
-            if ids:
-                self._delete_unreferenced_system_prompts(conn)
-            return ids
-        removed_ids = self._execute_write(_do) or []
+        removed_ids: list[str] = []
+        for _ in range(max(1, int(max_batches))):
+            def _do(conn):
+                ids = [r[0] for r in conn.execute("""
+                    SELECT id FROM sessions
+                    WHERE ((source = 'tui' AND title IS NULL) OR source = 'cron')
+                      AND ended_at IS NOT NULL
+                      AND started_at < ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM messages WHERE messages.session_id = sessions.id
+                      )
+                    LIMIT 500
+                """, (cutoff,)).fetchall()]
+                if not ids:
+                    return []
+                from hermes_state_mutation_retirement import retire_prunable
+                ids = retire_prunable(conn, ids)
+                for chunk in _id_chunks(ids):
+                    conn.execute(f"DELETE FROM sessions WHERE id IN ({_placeholders(chunk)})", chunk)
+                if ids:
+                    self._delete_unreferenced_system_prompts(conn)
+                return ids
+            batch = self._execute_write(_do) or []
+            if not batch:
+                break
+            removed_ids.extend(batch)
+            if len(batch) < 500:
+                break
         emit_session_deleted(self, removed_ids, reason="ghost_prune", sessions_dir=sessions_dir)
         from hermes_state_media import collect_retired_media
         collect_retired_media(self)

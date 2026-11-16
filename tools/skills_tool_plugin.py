@@ -42,12 +42,31 @@ def _truncate_description(description: str) -> str:
     return description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
 
 
+_SAFE_FRONTMATTER_CACHE: dict[tuple[str, int, int, int], dict[str, Any]] = {}
+
+
 def _safe_frontmatter(path: Path | None = None, *, content: str | None = None) -> dict[str, Any]:
     """Frontmatter of *path* (or of *content*), ``{}`` on any read/parse failure.
     Parses via ``tools.skills_tool._parse_frontmatter`` so test patches are honored."""
     from tools import skills_tool as _st
     with suppress(Exception):
-        return _st._parse_frontmatter(_read_skill_text(path) if content is None else content)[0]
+        if content is not None:
+            return _st._parse_frontmatter(content)[0]
+        if path is not None:
+            from agent import skill_utils as _su
+            parser_id = id(_st._parse_frontmatter) ^ id(getattr(_su, "parse_frontmatter", None))
+            stat_res = path.stat()
+            cache_key = (str(path), stat_res.st_mtime_ns, stat_res.st_size, parser_id)
+            cached = _SAFE_FRONTMATTER_CACHE.get(cache_key)
+            if cached is not None:
+                return dict(cached)
+            parsed = _st._parse_frontmatter(_read_skill_text(path))[0]
+            if isinstance(parsed, dict):
+                if len(_SAFE_FRONTMATTER_CACHE) > 4096:
+                    _SAFE_FRONTMATTER_CACHE.clear()
+                _SAFE_FRONTMATTER_CACHE[cache_key] = dict(parsed)
+                return dict(parsed)
+            return {}
     return {}
 
 

@@ -59,10 +59,11 @@ GLOBAL_VERTEX_REGION = "global"
 EUROPE_WEST2_VERTEX_REGION = "europe-west2"
 EUROPE_WEST2_ARGON_MAX_CONCURRENCY = 5
 EUROPE_WEST2_COOLDOWN_SECONDS = 15.0
-# carried-fix-anchor: EUROPE_WEST2_STICKY_WAIT_SECONDS = 3.0 (raised to 8.0s)
-EUROPE_WEST2_STICKY_WAIT_SECONDS = 8.0
-EUROPE_WEST2_DEEP_EPOCH_WAIT_SECONDS = 8.0
-GLOBAL_STICKY_EPOCH_MIN_TOKENS = 45_000
+# carried-fix-anchor: EUROPE_WEST2_STICKY_WAIT_SECONDS = 3.0 (raised to 12.0s; deep 20.0s; min_tok 35k)
+EUROPE_WEST2_INITIAL_WAIT_SECONDS = 3.0
+EUROPE_WEST2_STICKY_WAIT_SECONDS = 12.0
+EUROPE_WEST2_DEEP_EPOCH_WAIT_SECONDS = 20.0
+GLOBAL_STICKY_EPOCH_MIN_TOKENS = 35_000
 
 _prev_vertex_mod = sys.modules.get(__name__)
 _EUROPE_WEST2_ARGON_SEMAPHORE = getattr(
@@ -240,9 +241,16 @@ def acquire_vertex_hybrid_region(
                     wait_s = max(0.0, float(sticky_wait_seconds))
                 elif pinned_region == EUROPE_WEST2_VERTEX_REGION and prompt_tok >= GLOBAL_STICKY_EPOCH_MIN_TOKENS:
                     wait_s = EUROPE_WEST2_DEEP_EPOCH_WAIT_SECONDS
-                else:
+                elif pinned_region == EUROPE_WEST2_VERTEX_REGION:
                     wait_s = EUROPE_WEST2_STICKY_WAIT_SECONDS
-                if pinned_region == EUROPE_WEST2_VERTEX_REGION and wait_s > 0.0:
+                elif pinned_region is None and interactive and bool(session_id):
+                    wait_s = EUROPE_WEST2_INITIAL_WAIT_SECONDS
+                else:
+                    wait_s = 0.0
+                if (
+                    pinned_region == EUROPE_WEST2_VERTEX_REGION
+                    or (pinned_region is None and interactive and bool(session_id))
+                ) and wait_s > 0.0:
                     acquired = _EUROPE_WEST2_ARGON_SEMAPHORE.acquire(blocking=True, timeout=wait_s)
                 else:
                     acquired = _EUROPE_WEST2_ARGON_SEMAPHORE.acquire(blocking=False)

@@ -325,3 +325,49 @@ def test_cron_split_modules_concurrent_import_no_py314_deadlock():
                 if k.startswith("cron.") and "." not in k[5:]:
                     setattr(cron_pkg, k[5:], v)
 
+
+def test_turn1_interactive_session_waits_for_europe_west2_slot():
+    """Turn-1 interactive session (pinned_region=None) waits up to EUROPE_WEST2_INITIAL_WAIT_SECONDS
+    for a slot that frees up within the window instead of immediately spilling to global."""
+    import threading
+    import time
+    vertex_adapter.reset_vertex_hybrid_router_state()
+    slots = []
+    for i in range(vertex_adapter.EUROPE_WEST2_ARGON_MAX_CONCURRENCY):
+        reg, slot = vertex_adapter.acquire_vertex_hybrid_region(
+            "google/gemini-4-argon",
+            configured_region="global",
+            interactive=True,
+            session_id=f"holder-{i}",
+            sticky_wait_seconds=0.0,
+        )
+        assert reg == "europe-west2" and slot is True
+        slots.append(slot)
+
+    def _free_one_soon():
+        time.sleep(0.05)
+        vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
+
+    t = threading.Thread(target=_free_one_soon, daemon=True)
+    t.start()
+    try:
+        reg_turn1, slot_turn1 = vertex_adapter.acquire_vertex_hybrid_region(
+            "google/gemini-4-argon",
+            configured_region="global",
+            interactive=True,
+            session_id="new-turn1-session",
+            last_prompt_tokens=38_000,
+        )
+        try:
+            assert reg_turn1 == "europe-west2" and slot_turn1 is True
+            assert vertex_adapter.get_session_vertex_region_affinity("new-turn1-session") == "europe-west2"
+        finally:
+            if slot_turn1:
+                vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
+    finally:
+        t.join(timeout=1.0)
+        for _ in slots[1:]:
+            vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
+        vertex_adapter.reset_vertex_hybrid_router_state()
+
+

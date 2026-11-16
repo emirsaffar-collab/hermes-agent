@@ -245,13 +245,29 @@ def _session_rows_sig(conn, mtime):
         # A state.db without a readable sessions table (foreign schema, legacy or transient file): keep
         # the old mtime contract so any move still wakes the sidebar instead of silently never broadcasting.
         return (_MTIME_FALLBACK, mtime), True
-    row_expr = " || '|' || ".join(f"quote({field})" for field in fields)
-    cur = conn.execute(f"SELECT {row_expr} FROM sessions")
+    where_sql = (
+        " WHERE NOT (source = 'cron' AND ended_at IS NOT NULL AND COALESCE(message_count, 0) = 0)"
+        if {"source", "ended_at", "message_count"} <= available
+        else ""
+    )
+    cols_csv = ", ".join(fields)
     digest = hashlib.blake2b(digest_size=16)
-    count = 0
-    while batch := cur.fetchmany(4096):
-        count += len(batch)
-        digest.update(("".join(f"{r[0]}\n" for r in batch)).encode("utf-8", "surrogatepass"))
+    try:
+        cur = conn.execute(
+            f"SELECT COUNT(*), group_concat(json_array({cols_csv}), char(10)) FROM sessions{where_sql}"
+        )
+        row = (cur.fetchmany(4096) or [(0, None)])[0]
+        count, blob = int(row[0] or 0), row[1]
+        if blob:
+            digest.update(blob.encode("utf-8", "surrogatepass"))
+    except Exception:
+        digest = hashlib.blake2b(digest_size=16)
+        row_expr = " || '|' || ".join(f"quote({field})" for field in fields)
+        cur = conn.execute(f"SELECT {row_expr} FROM sessions{where_sql}")
+        count = 0
+        while batch := cur.fetchmany(4096):
+            count += len(batch)
+            digest.update(("".join(f"{r[0]}\n" for r in batch)).encode("utf-8", "surrogatepass"))
     digest.update(f":{count}".encode("ascii"))
     return (fields, digest.digest()), False
 

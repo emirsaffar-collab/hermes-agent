@@ -117,18 +117,21 @@ def test_legacy_delete_fences_cascaded_delegate_children(tmp_path):
 def test_sweeps_skip_sessions_with_live_work_and_retire_the_rest(tmp_path):
     with closing(SessionDB(tmp_path / 'state.db')) as db:
         epoch = rt.begin_runtime_epoch(db, instance_id='owner')
-        for sid, source in (('ghost_settled', 'tui'), ('ghost_busy', 'tui'),
+        for sid, source in (('ghost_settled', 'tui'), ('ghost_busy', 'tui'), ('cron_ghost', 'cron'),
                             ('old_settled', 'cli'), ('old_busy', 'cli'), ('old_plain', 'cli')):
             _old_ended(db, sid, source)
+        db.set_session_title('cron_ghost', 'scheduled silent check')
         _settled_admission(db, epoch, 'ghost_settled')
+        _settled_admission(db, epoch, 'cron_ghost')
         _started_admission(db, epoch, 'ghost_busy')
         _settled_admission(db, epoch, 'old_settled')
         _started_admission(db, epoch, 'old_busy')
 
-        assert db.prune_empty_ghost_sessions() == 1
+        assert db.prune_empty_ghost_sessions() == 2
         assert db.get_session('ghost_settled') is None
+        assert db.get_session('cron_ghost') is None
         assert db.get_session('ghost_busy') is not None, 'a live session must not abort the whole prune'
-        assert _ledger_rows(db, 'ghost_settled') == 0 and _ledger_rows(db, 'ghost_busy') == 1
+        assert _ledger_rows(db, 'ghost_settled') == 0 and _ledger_rows(db, 'cron_ghost') == 0 and _ledger_rows(db, 'ghost_busy') == 1
 
         assert db.prune_sessions(older_than_days=30) == 2
         assert db.get_session('old_settled') is None and db.get_session('old_plain') is None
