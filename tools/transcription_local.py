@@ -268,6 +268,9 @@ def detect_sv_or_en(model, speech_audio):
         probs.get("no", 0.0) + probs.get("nn", 0.0) + probs.get("da", 0.0)
     )
     en_prob = probs.get("en", 0.0)
+    pl_prob = probs.get("pl", 0.0)
+    if pl_prob > sv_family and pl_prob > en_prob and pl_prob >= 0.15:
+        return "pl"
     return "en" if en_prob > sv_family else "sv"
 
 def clean_hallucinations(tx):
@@ -309,7 +312,7 @@ for raw in sys.stdin:
             emit({"id": req_id, "ok": True, "language": "sv", "duration": 0.0, "segments": []})
             continue
         lang = req.get("language")
-        if not lang or lang not in ("sv", "en"):
+        if not lang or lang not in ("sv", "en", "pl"):
             lang = detect_sv_or_en(model, speech_audio)
         kwargs = {
             "path_or_hf_repo": repo,
@@ -362,7 +365,43 @@ for raw in sys.stdin:
             self._lock = threading.Lock()
             self._proc: Optional[subprocess.Popen] = None
             self._seq = 0
-            self._ensure_worker()
+
+        def _try_8817_worker(self, file_path: str):
+            if os.environ.get("HERMES_SKIP_8817_WORKER") == "1":
+                return None
+            import base64
+            import urllib.request
+            p = Path(file_path)
+            if not p.is_file():
+                return None
+            ext = (p.suffix or ".wav").lstrip(".") or "wav"
+            b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+            req_bytes = json.dumps(
+                {"audio_b64": b64, "ext": ext, "fast": True, "voice_gate": "off"}
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                "http://127.0.0.1:8817/transcribe",
+                data=req_bytes,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=45) as resp_http:
+                w_res = json.loads(resp_http.read().decode("utf-8"))
+            if not w_res.get("ok") or "_worker_error" in w_res:
+                return None
+            tx = str(w_res.get("transcript") or "").strip()
+            segments = (
+                [SimpleNamespace(text=tx, no_speech_prob=0.0, avg_logprob=-0.2)]
+                if tx
+                else []
+            )
+            c_langs = w_res.get("clause_languages") or []
+            lang = (c_langs[0] if c_langs else w_res.get("detected_language") or "sv").lower()
+            info = SimpleNamespace(
+                language=lang,
+                duration=float(w_res.get("audio_s") or 0.0),
+            )
+            return segments, info
 
         def _rpc(self, proc: subprocess.Popen, payload: dict) -> dict:
             self._seq += 1
@@ -405,6 +444,12 @@ for raw in sys.stdin:
 
         def transcribe(self, file_path: str, **kwargs):
             with self._lock:
+                try:
+                    fast_res = self._try_8817_worker(file_path)
+                    if fast_res is not None:
+                        return fast_res
+                except Exception:
+                    pass
                 proc = self._ensure_worker()
                 req = {
                     "cmd": "transcribe",
