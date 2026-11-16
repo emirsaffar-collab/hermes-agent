@@ -421,3 +421,7 @@ def test_tier0_cron_subagent_lineage_and_promo_cliff(tmp_path, monkeypatch):
     )
     assert v_nont0_sub["allowed"] is False
     assert v_nont0_sub["reason"].startswith("tier3_daily_hard_cap")
+
+    # 4) Summary breaker_state stays ARMED_OK when only interactive Desktop spend exceeds €195
+    summary_after_desktop = rsb.get_realtime_spend_summary()
+    assert summary_after_desktop["breaker_state"] == "ARMED_OK"

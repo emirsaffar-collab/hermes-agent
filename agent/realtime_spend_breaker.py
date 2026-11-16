@@ -459,13 +459,14 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
             cur.execute(
                 """
                 SELECT COUNT(*), COALESCE(SUM(net_eur), 0.0),
+                       COALESCE(SUM(CASE WHEN source IN ('cron', 'background_review') THEN net_eur ELSE 0.0 END), 0.0),
                        COALESCE(SUM(uncached_in), 0), COALESCE(SUM(cached_in), 0),
                        COALESCE(SUM(cache_reset), 0)
                 FROM llm_call_ledger WHERE ts >= ? AND source != 'log_tail'
                 """,
                 (t_15m,),
             )
-            c15, eur15, u15, ca15, cr15_total = cur.fetchone()
+            c15, eur15, eur15_cron_bg, u15, ca15, cr15_total = cur.fetchone()
 
             cur.execute(
                 """
@@ -496,13 +497,14 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
                 """
                 SELECT COUNT(*), COALESCE(SUM(net_eur), 0.0),
                        COALESCE(SUM(CASE WHEN source NOT IN ('desktop', 'mobile', 'tui', 'tui_gateway', 'gui', 'web', 'cli', 'interactive', 'log_tail') THEN net_eur ELSE 0.0 END), 0.0),
+                       COALESCE(SUM(CASE WHEN source IN ('cron', 'background_review') THEN net_eur ELSE 0.0 END), 0.0),
                        COALESCE(SUM(uncached_in), 0), COALESCE(SUM(cached_in), 0),
                        COALESCE(SUM(cache_reset), 0)
                 FROM llm_call_ledger WHERE day_cet = ? AND source != 'log_tail'
                 """,
                 (day_cet,),
             )
-            cday, eurday, eurday_non_int, uday, caday, crday = cur.fetchone()
+            cday, eurday, eurday_non_int, eurday_cron_bg, uday, caday, crday = cur.fetchone()
 
             cur.execute(
                 """
@@ -553,12 +555,14 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
     manual_brake = is_manual_emergency_brake_active()
     eurday_f = float(eurday or 0.0)
     eur15_f = float(eur15 or 0.0)
+    eurday_cron_bg_f = float(eurday_cron_bg or 0.0)
+    eur15_cron_bg_f = float(eur15_cron_bg or 0.0)
     q_int = int(q_count or 0)
     if manual_brake:
         breaker_state = "MANUAL_EMERGENCY_BRAKE"
-    elif eurday_f >= TIER3_DAILY_HARD_CAP_EUR:
+    elif eurday_cron_bg_f >= TIER3_DAILY_HARD_CAP_EUR:
         breaker_state = "TIER3_DAILY_HARD_CAP"
-    elif eurday_f >= TIER2_DAILY_SOFT_CAP_EUR or eur15_f >= TIER2_ESTATE_15M_BURST_EUR:
+    elif eurday_cron_bg_f >= TIER2_DAILY_SOFT_CAP_EUR or eur15_cron_bg_f >= TIER2_ESTATE_15M_BURST_EUR:
         breaker_state = "TIER2_DAILY_SOFT_CAP"
     elif q_int > 0:
         breaker_state = "TIER1_SESSION_QUARANTINED"
