@@ -722,7 +722,7 @@ def evaluate_realtime_spend_breaker(
                 )
             s_eur_1h = float(cur.fetchone()[0] or 0.0)
 
-            # 3) Estate 15m and Today spend
+            # 3) Estate 15m and Today spend (plus non-interactive pool so interactive spikes do not starve crons)
             cur.execute(
                 "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE ts >= ? AND source != 'log_tail'",
                 (ts_now - 900.0,),
@@ -734,6 +734,18 @@ def evaluate_realtime_spend_breaker(
                 (day_cet,),
             )
             estate_today = float(cur.fetchone()[0] or 0.0)
+
+            cur.execute(
+                "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE ts >= ? AND source IN ('cron', 'background_review')",
+                (ts_now - 900.0,),
+            )
+            non_interactive_15m = float(cur.fetchone()[0] or 0.0)
+
+            cur.execute(
+                "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE day_cet = ? AND source IN ('cron', 'background_review')",
+                (day_cet,),
+            )
+            non_interactive_today = float(cur.fetchone()[0] or 0.0)
         finally:
             con.close()
     except Exception as exc:
@@ -821,24 +833,26 @@ def evaluate_realtime_spend_breaker(
             "estate_net_eur_today": estate_today,
         }
 
-    # Tier 3: Daily Hard Cap (€195/day net) blocks all non-Tier-0 non-interactive sessions
-    if estate_today >= TIER3_DAILY_HARD_CAP_EUR:
+    # Tier 3: Daily Hard Cap (€195/day net on non-interactive pool) blocks non-Tier-0 non-interactive sessions
+    if non_interactive_today >= TIER3_DAILY_HARD_CAP_EUR:
         return {
             "allowed": False,
-            "reason": f"tier3_daily_hard_cap (estate today €{estate_today:.2f} >= €{TIER3_DAILY_HARD_CAP_EUR:.2f})",
+            "reason": f"tier3_daily_hard_cap (non-interactive today €{non_interactive_today:.2f} >= €{TIER3_DAILY_HARD_CAP_EUR:.2f})",
             "estate_net_eur_today": estate_today,
+            "non_interactive_net_eur_today": non_interactive_today,
         }
 
-    # Tier 2: Daily Soft Cap (€150/day net) or 15m Burst (€8/15m) suppresses background_review and non-Tier-0 crons
+    # Tier 2: Daily Soft Cap (€150/day net) or 15m Burst (€8/15m on non-interactive pool) suppresses background_review and non-Tier-0 crons
     if src in ("background_review", "cron") and (
-        estate_today >= TIER2_DAILY_SOFT_CAP_EUR or estate_15m >= TIER2_ESTATE_15M_BURST_EUR
+        non_interactive_today >= TIER2_DAILY_SOFT_CAP_EUR or non_interactive_15m >= TIER2_ESTATE_15M_BURST_EUR
     ):
         return {
             "allowed": False,
             "reason": (
-                f"tier2_daily_soft_cap (estate today €{estate_today:.2f} / 15m €{estate_15m:.2f})"
+                f"tier2_daily_soft_cap (non-interactive today €{non_interactive_today:.2f} / 15m €{non_interactive_15m:.2f})"
             ),
             "estate_net_eur_today": estate_today,
+            "non_interactive_net_eur_today": non_interactive_today,
         }
 
     return {
