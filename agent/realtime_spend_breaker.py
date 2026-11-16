@@ -554,11 +554,31 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
     }
 
 
+_PRESERVED_WATCHDOG_KEYS: tuple[str, ...] = (
+    "bq_mtd",
+    "log_tail_ingest",
+    "openrouter_credits_remaining_usd",
+    "may_2027_sparplan_targets",
+    "gcp_anomaly_detector_credit_treatment_audit",
+    "gcp_budgets_sync",
+    "ha_60s_sync",
+)
+
+
 def write_realtime_status_snapshot(now: float | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     summary = get_realtime_spend_summary(now=now)
+    spath = _status_path()
+    if extra is None and spath.exists():
+        try:
+            prev = json.loads(spath.read_text(encoding="utf-8"))
+            if isinstance(prev, dict):
+                for k in _PRESERVED_WATCHDOG_KEYS:
+                    if k in prev and k not in summary:
+                        summary[k] = prev[k]
+        except Exception:
+            pass
     if extra:
         summary.update(extra)
-    spath = _status_path()
     try:
         spath.parent.mkdir(parents=True, exist_ok=True)
         tmp = spath.with_suffix(".tmp")

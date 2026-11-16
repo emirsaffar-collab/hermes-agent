@@ -356,3 +356,16 @@ def test_ew2_macro_clusters_sustained_cold_cache_and_compression_rotation_lineag
     assert verdict_rot["allowed"] is False
     assert "tier1_session_15m_cap" in verdict_rot["reason"]
 
+    # 4) 10s write_realtime_status_snapshot(extra=None) preserves watchdog-enriched bq_mtd
+    rsb.write_realtime_status_snapshot(
+        extra={
+            "bq_mtd": {"ok": True, "true_mtd_vertex_net_eur": 11078.32},
+            "may_2027_sparplan_targets": {"gcp_vertex_ai_daily_target_eur": 250.0},
+        }
+    )
+    snap_after = rsb.write_realtime_status_snapshot(extra=None)
+    assert snap_after.get("bq_mtd", {}).get("ok") is True
+    assert snap_after["bq_mtd"]["true_mtd_vertex_net_eur"] == 11078.32
+    assert snap_after.get("may_2027_sparplan_targets", {}).get("gcp_vertex_ai_daily_target_eur") == 250.0
+
+
