@@ -421,7 +421,10 @@ def begin_iteration(
         return _verdict("break")
 
     with suppress(Exception):
-        from agent.realtime_spend_breaker import evaluate_realtime_spend_breaker
+        from agent.realtime_spend_breaker import (
+            evaluate_realtime_spend_breaker,
+            is_tier0_critical_cron,
+        )
         from agent.session_source import session_source_for
 
         _rt_src = (
@@ -457,29 +460,9 @@ def begin_iteration(
             or getattr(agent, "_turn_route_task", "")
             or ""
         )
-        _tier0_extra_prefixes = (
-            "chat247-",
-            "nw-chat-",
-            "newintra-",
-            "medius-",
-            "lager-",
-            "2izii-",
-            "post-deploy-verify-",
-            "emir-morning-routine",
-            "morning-preemptive-audit",
-            "daily-retrospective",
-            "night-driver",
-            "saffar-inbox-brief",
-            "decision-log-pipeline",
-            "daily-db-backup-drill",
-            "alerts-digest",
-            "svea-",
-            "cart-",
-            "store-support-",
-        )
         _rt_eval_job = (
             f"chat-247:{_rt_job}"
-            if _rt_job.lower().startswith(_tier0_extra_prefixes)
+            if is_tier0_critical_cron(_rt_job)
             else _rt_job
         )
         _rot_sids = getattr(agent, "_rotated_from_session_ids", None)

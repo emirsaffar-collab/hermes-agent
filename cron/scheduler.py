@@ -2698,7 +2698,11 @@ def run_job(
             # agent-declared failure marker keep their first-line/whole-response contract.
             final_response = f"{setup.fallback_notice}\n\n{final_response}"
         # Keep final_response clean for delivery logic (empty = no delivery).
+        _exit_reason = str(result.get("turn_exit_reason") or "")
         logged_response = final_response if final_response else "(No response generated)"
+        if _exit_reason.startswith("realtime_spend_breaker"):
+            logger.warning("Job '%s' (ID: %s) suppressed by %s", job_name, job_id, _exit_reason)
+            logged_response = f"{logged_response}\n\n[Suppressed by {_exit_reason}]"
         # Text-file reads normalize newlines; count the same characters the
         # context_from reader sees so quoted markers can never become boundaries.
         framed_prompt = _normalize_newlines(prompt)

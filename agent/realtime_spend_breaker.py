@@ -124,7 +124,23 @@ _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "morning-preemptive-audit",
     "daily-retrospective",
     "night-driver",
-    "saffar-inbox-brief",
+    "saffar-",
+    "atlas-",
+    "hiss-",
+    "archive-done-jobs",
+    "iz-",
+    "label-hygiene",
+    "monthly-orphaned-access-reconciliation",
+    "itsupport-digest-",
+    "ops-triage",
+    "delta-sweep",
+    "subagent-selfheal",
+    "one-dev-freshness",
+    "optimize-measure-after",
+    "workspace-policy-snapshot",
+    "quarterly-db-acl-sweep",
+    "memory-hygiene",
+    "wiki-weekly-lint",
     "decision-log-pipeline",
     "daily-db-backup-drill",
     "alert-triage",
@@ -275,6 +291,36 @@ def compute_call_net_eur(
     return 0.0
 
 
+_HC_JOBS_CACHE: tuple[float, frozenset[str]] = (0.0, frozenset())
+
+
+def _hc_monitored_job_names() -> frozenset[str]:
+    """Auto-discover cron job names/IDs from ~/.hermes/cron/jobs.json that reference
+    hc-ping.sh or hc.uropenn.se, cached by file mtime so no deadman-monitored job can
+    ever drift out of Tier-0 protection."""
+    global _HC_JOBS_CACHE
+    try:
+        jobs_path = Path.home() / ".hermes" / "cron" / "jobs.json"
+        if not jobs_path.exists():
+            return _HC_JOBS_CACHE[1]
+        mtime = jobs_path.stat().st_mtime
+        if mtime == _HC_JOBS_CACHE[0] and _HC_JOBS_CACHE[1]:
+            return _HC_JOBS_CACHE[1]
+        data = json.loads(jobs_path.read_text(encoding="utf-8"))
+        names: set[str] = set()
+        for j in data.get("jobs", []):
+            blob = " ".join(str(j.get(k) or "") for k in ("prompt", "script", "monitor_script"))
+            if "hc-ping.sh" in blob or "hc.uropenn.se" in blob:
+                for key in ("name", "id"):
+                    val = str(j.get(key) or "").strip().lower()
+                    if val:
+                        names.add(val)
+        _HC_JOBS_CACHE = (mtime, frozenset(names))
+        return _HC_JOBS_CACHE[1]
+    except Exception:
+        return _HC_JOBS_CACHE[1]
+
+
 def is_tier0_critical_cron(job_name: str | None, session_id: str | None = None) -> bool:
     ctx_name = ""
     if not job_name:
@@ -287,9 +333,14 @@ def is_tier0_critical_cron(job_name: str | None, session_id: str | None = None) 
                 ctx_name = str(getattr(ctx, "job_name", "") or "")
         except Exception:
             pass
+    hc_names = _hc_monitored_job_names()
     for candidate in (job_name or "", ctx_name, session_id or ""):
         low = candidate.strip().lower()
-        if low and any(low.startswith(p) or p in low for p in _TIER0_CRITICAL_PREFIXES):
+        if not low:
+            continue
+        if low in hc_names:
+            return True
+        if any(low.startswith(p) or p in low for p in _TIER0_CRITICAL_PREFIXES):
             return True
     return False
 
