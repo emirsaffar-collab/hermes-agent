@@ -52,8 +52,8 @@ _LINEAGE_CTE_SQL = f"""
                 UNION
                 SELECT parent.id
                 FROM ancestors a
-                JOIN sessions child ON child.id = a.id
-                JOIN sessions parent ON parent.id = child.parent_session_id
+                CROSS JOIN sessions child ON child.id = a.id
+                CROSS JOIN sessions parent ON parent.id = child.parent_session_id
                 WHERE parent.end_reason = 'compression'
 {_non_continuation_child_sql('child.', 'parent.id')}
               ),
@@ -62,8 +62,8 @@ _LINEAGE_CTE_SQL = f"""
                 UNION
                 SELECT child.id
                 FROM descendants d
-                JOIN sessions parent ON parent.id = d.id
-                JOIN sessions child ON child.parent_session_id = parent.id
+                CROSS JOIN sessions parent ON parent.id = d.id
+                CROSS JOIN sessions child ON child.parent_session_id = parent.id
                 WHERE parent.end_reason = 'compression'
 {_non_continuation_child_sql('child.', 'parent.id')}
               ),
@@ -1223,8 +1223,8 @@ class SessionSessionsMixin:
                 UNION
                 SELECT c.root_id, child.id
                 FROM chain c
-                JOIN sessions parent ON parent.id = c.cur_id
-                JOIN sessions child ON {compression_parent_edge}
+                CROSS JOIN sessions parent ON parent.id = c.cur_id
+                CROSS JOIN sessions child ON {compression_parent_edge}
                 LIMIT ?
             ),
             chain_rows AS (
@@ -1399,8 +1399,8 @@ class SessionSessionsMixin:
                     UNION ALL
                     SELECT c.root_id, child.id
                     FROM chain c
-                    JOIN sessions parent ON parent.id = c.cur_id
-                    JOIN sessions child ON child.parent_session_id = c.cur_id
+                    CROSS JOIN sessions parent ON parent.id = c.cur_id
+                    CROSS JOIN sessions child ON child.parent_session_id = c.cur_id
                     WHERE parent.end_reason = 'compression'
                       AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
                       AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL

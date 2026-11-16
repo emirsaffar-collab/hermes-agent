@@ -11,9 +11,9 @@ from agent.message_metadata import stamp_message_uid
 
 # Rows of a session and of the parents it was compressed from; a detached result's match condition follows.
 _LINEAGE_MATCH_SQL = """WITH RECURSIVE lineage(id) AS (SELECT ? UNION
-    SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
-    JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
-) SELECT m.id FROM messages m JOIN lineage l ON m.session_id = l.id WHERE """
+    SELECT s.parent_session_id FROM lineage l CROSS JOIN sessions s ON s.id = l.id
+    CROSS JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
+) SELECT m.id FROM lineage l CROSS JOIN messages m ON m.session_id = l.id WHERE """
 _DELEGATION_DELIVERY_MATCH = ("m.display_kind IN ('async_delegation_complete', 'hidden') AND json_extract(m.display_metadata, "
                               "'$.delegation_id') = ? AND coalesce(json_extract(m.display_metadata, '$.delivery_notice'), '') = ?")
 

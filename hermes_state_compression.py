@@ -126,7 +126,7 @@ _UNSET_ANCESTOR_SQL = """
     WITH RECURSIVE up(pid, n) AS (
         SELECT parent_session_id, 1 FROM sessions WHERE id = ?
         UNION ALL
-        SELECT s.parent_session_id, up.n + 1 FROM up JOIN sessions s ON s.id = up.pid
+        SELECT s.parent_session_id, up.n + 1 FROM up CROSS JOIN sessions s ON s.id = up.pid
         WHERE s.end_reason = 'compression' AND s.created_source = ? AND up.n < ?
     )
     SELECT 1 FROM up CROSS JOIN sessions s ON s.id = up.pid

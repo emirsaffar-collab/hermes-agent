@@ -201,11 +201,47 @@ def test_unset_ancestor_probe_reads_only_the_walked_rows(tmp_path):
     """The fast path runs on every usage write of a stamped compression child: its final lookup
     must join the walked ids to sessions by key, never scan the table (ms per write at 30k rows)."""
     from hermes_state_compression import _CHAIN_CAP, _UNSET_ANCESTOR_SQL
+    from hermes_state_detached_results import _DELEGATION_DELIVERY_MATCH, _LINEAGE_MATCH_SQL
+    from hermes_state_maintenance import _PINNED_TAIL_SQL
+    from hermes_state_sessions import _LINEAGE_CTE_SQL
 
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
+        # Populate sqlite_stat1 with production-scale cardinalities so SQLite's cost-based
+        # planner tries to invert recursive CTE joins unless CROSS JOIN pins the outer loop.
+        db._conn.execute("ANALYZE")
+        db._conn.executemany(
+            "INSERT OR REPLACE INTO sqlite_stat1 (tbl, idx, stat) VALUES (?, ?, ?)",
+            [
+                ("sessions", "idx_sessions_end_reason", "30000 1900 1"),
+                ("sessions", "idx_sessions_parent", "30000 2"),
+                ("sessions", "sqlite_autoindex_sessions_1", "30000 1"),
+                ("messages", "idx_messages_session_role", "420000 25 12"),
+            ],
+        )
+        db._conn.execute("ANALYZE sqlite_master")
+
         plan = [row[3] for row in db._conn.execute(
             "EXPLAIN QUERY PLAN " + _UNSET_ANCESTOR_SQL, ("tip", "cli", _CHAIN_CAP))]
         assert not [step for step in plan if step.startswith("SCAN") and "up" not in step.split()], plan
+        assert not [step for step in plan if "idx_sessions_end_reason (end_reason=?)" in step], plan
+
+        lineage_plan = [row[3] for row in db._conn.execute(
+            "EXPLAIN QUERY PLAN " + _LINEAGE_CTE_SQL + " SELECT id FROM lineage", ("tip", "tip"))]
+        assert not [step for step in lineage_plan if "idx_sessions_end_reason (end_reason=?)" in step], lineage_plan
+
+        detached_plan = [row[3] for row in db._conn.execute(
+            "EXPLAIN QUERY PLAN " + _LINEAGE_MATCH_SQL + _DELEGATION_DELIVERY_MATCH + " LIMIT 1",
+            ("tip", "deleg_1", ""),
+        )]
+        assert not [step for step in detached_plan if step.startswith("SCAN m")], detached_plan
+        assert any(step.startswith("SEARCH m USING INDEX ") and "(session_id=?" in step for step in detached_plan), detached_plan
+
+        pinned_plan = [row[3] for row in db._conn.execute("EXPLAIN QUERY PLAN " + _PINNED_TAIL_SQL)]
+        # The recursive step (after SCAN t) must bind both end_reason=? and id=? on p.
+        rec_idx = next(i for i, row in enumerate(pinned_plan) if row == "RECURSIVE STEP")
+        rec_steps = pinned_plan[rec_idx + 1 :]
+        assert rec_steps[0] == "SCAN t", rec_steps
+        assert any("idx_sessions_end_reason (end_reason=? AND id=?)" in step for step in rec_steps), rec_steps
     finally:
         db.close()

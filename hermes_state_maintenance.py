@@ -86,7 +86,7 @@ def _continued_ancestors_sql(candidates_where: str) -> str:
             f" WHERE {_CONTINUATION_EDGE_SQL}"
             f" AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = c.id AND {candidates_where})"
             " UNION"
-            " SELECT p.id FROM kept k JOIN sessions c ON c.id = k.id JOIN sessions p ON p.id = c.parent_session_id"
+            " SELECT p.id FROM kept k CROSS JOIN sessions c ON c.id = k.id CROSS JOIN sessions p ON p.id = c.parent_session_id"
             f" WHERE {_CONTINUATION_EDGE_SQL}"
             ") SELECT id FROM kept")
 
@@ -97,7 +97,7 @@ _PINNED_TAIL_SQL = ("WITH RECURSIVE tail(id) AS ("
                     " SELECT c.id FROM sessions c JOIN sessions p ON p.id = c.parent_session_id"
                     f" WHERE COALESCE(p.pinned, 0) = 1 AND {_CONTINUATION_EDGE_SQL}"
                     " UNION"
-                    " SELECT c.id FROM tail t JOIN sessions p ON p.id = t.id JOIN sessions c ON c.parent_session_id = p.id"
+                    " SELECT c.id FROM tail t CROSS JOIN sessions p ON p.id = t.id CROSS JOIN sessions c ON c.parent_session_id = p.id"
                     f" WHERE {_CONTINUATION_EDGE_SQL}"
                     ") SELECT id FROM tail")
 
