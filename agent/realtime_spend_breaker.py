@@ -39,6 +39,10 @@ _STOCKHOLM_TZ = ZoneInfo("Europe/Stockholm")
 VERTEX_ARGON_UNCACHED_IN_EUR_PER_M = 1.796200
 VERTEX_ARGON_CACHED_IN_EUR_PER_M = 0.089810
 VERTEX_ARGON_OUT_EUR_PER_M = 8.981000
+VERTEX_ARGON_LIST_UNCACHED_IN_EUR_PER_M = 3.592400
+VERTEX_ARGON_LIST_CACHED_IN_EUR_PER_M = 0.179620
+VERTEX_ARGON_LIST_OUT_EUR_PER_M = 17.962000
+ARGON_PROMO_EXPIRY_EPOCH_UTC = 1796112000.0  # 2026-12-01T08:00:00Z (2026-11-30 23:59:59 PT)
 
 # Regional europe-west2 SKUs (A891-E7A5-FDA5, F61C-57E6-DBE0, EA0E-13A1-6B07) carry 1.10x multiplier
 VERTEX_EU_WEST2_REGIONAL_MULTIPLIER = 1.10
@@ -50,6 +54,38 @@ _EU_WEST2_MACRO_CLUSTERS: frozenset[str] = frozenset(
 VERTEX_FLASH_UNCACHED_IN_EUR_PER_M = 0.673573
 VERTEX_FLASH_CACHED_IN_EUR_PER_M = 0.067357
 VERTEX_FLASH_OUT_EUR_PER_M = 3.367844
+VERTEX_FLASH_LIST_UNCACHED_IN_EUR_PER_M = 1.347146
+VERTEX_FLASH_LIST_CACHED_IN_EUR_PER_M = 0.134714
+VERTEX_FLASH_LIST_OUT_EUR_PER_M = 6.735688
+FLASH_PROMO_EXPIRY_EPOCH_UTC = 1798790400.0  # 2027-01-01T08:00:00Z (2026-12-31 23:59:59 PT)
+
+
+def resolve_vertex_rates(model: str, ts: float | None = None) -> tuple[float, float, float]:
+    now_ts = float(ts if ts is not None else time.time())
+    mod = (model or "").lower()
+    if "argon" in mod:
+        if now_ts >= ARGON_PROMO_EXPIRY_EPOCH_UTC:
+            return (
+                VERTEX_ARGON_LIST_UNCACHED_IN_EUR_PER_M,
+                VERTEX_ARGON_LIST_CACHED_IN_EUR_PER_M,
+                VERTEX_ARGON_LIST_OUT_EUR_PER_M,
+            )
+        return (
+            VERTEX_ARGON_UNCACHED_IN_EUR_PER_M,
+            VERTEX_ARGON_CACHED_IN_EUR_PER_M,
+            VERTEX_ARGON_OUT_EUR_PER_M,
+        )
+    if now_ts >= FLASH_PROMO_EXPIRY_EPOCH_UTC:
+        return (
+            VERTEX_FLASH_LIST_UNCACHED_IN_EUR_PER_M,
+            VERTEX_FLASH_LIST_CACHED_IN_EUR_PER_M,
+            VERTEX_FLASH_LIST_OUT_EUR_PER_M,
+        )
+    return (
+        VERTEX_FLASH_UNCACHED_IN_EUR_PER_M,
+        VERTEX_FLASH_CACHED_IN_EUR_PER_M,
+        VERTEX_FLASH_OUT_EUR_PER_M,
+    )
 
 USD_TO_EUR = 0.92
 
@@ -85,6 +121,12 @@ _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "post-deploy-verify-",
     "evelina-",
     "emir-morning-routine",
+    "morning-preemptive-audit",
+    "daily-retrospective",
+    "night-driver",
+    "saffar-inbox-brief",
+    "decision-log-pipeline",
+    "daily-db-backup-drill",
     "alert-triage",
     "alerts-digest",
     "pos-sentinel",
@@ -202,6 +244,7 @@ def compute_call_net_eur(
     output_tokens: int,
     estimated_cost_usd: float | None = None,
     cluster_id: str | None = None,
+    ts: float | None = None,
 ) -> float:
     prov = (provider or "").lower()
     mod = (model or "").lower()
@@ -213,23 +256,17 @@ def compute_call_net_eur(
     reg_mult = VERTEX_EU_WEST2_REGIONAL_MULTIPLIER if macro in _EU_WEST2_MACRO_CLUSTERS else 1.0
 
     if "argon" in mod and (prov in ("vertex", "", "google") or estimated_cost_usd is None):
+        in_r, cache_r, out_r = resolve_vertex_rates(mod, ts=ts)
         return round(
             reg_mult
-            * (
-                uncached * VERTEX_ARGON_UNCACHED_IN_EUR_PER_M
-                + cached * VERTEX_ARGON_CACHED_IN_EUR_PER_M
-                + out * VERTEX_ARGON_OUT_EUR_PER_M
-            )
+            * (uncached * in_r + cached * cache_r + out * out_r)
             / 1_000_000.0,
             6,
         )
     if "flash" in mod and ("gemini" in mod or prov in ("vertex", "google")):
+        in_r, cache_r, out_r = resolve_vertex_rates(mod, ts=ts)
         return round(
-            (
-                uncached * VERTEX_FLASH_UNCACHED_IN_EUR_PER_M
-                + cached * VERTEX_FLASH_CACHED_IN_EUR_PER_M
-                + out * VERTEX_FLASH_OUT_EUR_PER_M
-            )
+            (uncached * in_r + cached * cache_r + out * out_r)
             / 1_000_000.0,
             6,
         )
@@ -302,6 +339,7 @@ def record_realtime_llm_call(
         output_tokens=out,
         estimated_cost_usd=estimated_cost_usd,
         cluster_id=cluster_id,
+        ts=now,
     )
     req_key = request_id or f"{session_id}:{now:.6f}:{prompt}:{out}"
 
@@ -833,11 +871,19 @@ def evaluate_realtime_spend_breaker(
             "estate_net_eur_today": estate_today,
         }
 
-    # Tier 3: Daily Hard Cap (€195/day net on non-interactive pool) blocks non-Tier-0 non-interactive sessions
-    if non_interactive_today >= TIER3_DAILY_HARD_CAP_EUR:
+    # Tier 3: Daily Hard Cap (€195/day net)
+    # - cron and background_review evaluate against non_interactive_today so interactive Desktop spikes never starve crons.
+    # - non-exempt subagents (unparented/non-Tier-0 cron subagents or stalled Desktop subagents that fell past line 825)
+    #   evaluate against max(non_interactive_today, estate_today).
+    tier3_pool_today = (
+        non_interactive_today
+        if src in ("cron", "background_review")
+        else max(non_interactive_today, estate_today)
+    )
+    if tier3_pool_today >= TIER3_DAILY_HARD_CAP_EUR:
         return {
             "allowed": False,
-            "reason": f"tier3_daily_hard_cap (non-interactive today €{non_interactive_today:.2f} >= €{TIER3_DAILY_HARD_CAP_EUR:.2f})",
+            "reason": f"tier3_daily_hard_cap (pool today €{tier3_pool_today:.2f} >= €{TIER3_DAILY_HARD_CAP_EUR:.2f})",
             "estate_net_eur_today": estate_today,
             "non_interactive_net_eur_today": non_interactive_today,
         }
@@ -859,5 +905,6 @@ def evaluate_realtime_spend_breaker(
         "allowed": True,
         "reason": "ok",
         "session_net_eur_15m": s_eur_15m,
+        "estate_net_eur_15m": estate_15m,
         "estate_net_eur_today": estate_today,
     }

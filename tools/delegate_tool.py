@@ -364,6 +364,8 @@ def _build_child_agent(
                 _srow = _sdb.get_session(parent_sid)
                 if isinstance(_srow, dict):
                     _p_db_src = str(_srow.get("source") or "").strip().lower()
+    if getattr(parent_agent, "cron_job_name", None) and not getattr(child, "cron_job_name", None):
+        child.cron_job_name = str(getattr(parent_agent, "cron_job_name", "") or "")  # type: ignore[attr-defined]
     child._parent_session_source = (  # type: ignore[attr-defined]
         getattr(parent_agent, "_parent_session_source", None)
         or (

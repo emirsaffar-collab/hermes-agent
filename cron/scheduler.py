@@ -2596,6 +2596,7 @@ class _FireAudit:
             "completion_tokens": result.get("completion_tokens"),
             "total_tokens": result.get("total_tokens"),
             "response_silent": bool(result.get("response_silent")),
+            "turn_exit_reason": result.get("turn_exit_reason") or None,
             "deliver_target": self.job.get("deliver"),
             "model": self.model or None,
             "duration_ms": int((time.monotonic() - self.t_start) * 1000),

@@ -45,6 +45,12 @@ def test_tier0_prefixes_and_cron_spend_cap_silent_deferral(tmp_path, monkeypatch
     assert rsb.is_tier0_critical_cron("chat247-responder", "local-abc") is True
     assert rsb.is_tier0_critical_cron("chat247-owner", "local-abc") is True
     assert rsb.is_tier0_critical_cron("newintra-builder-owner", "local-abc") is True
+    assert rsb.is_tier0_critical_cron("morning-preemptive-audit", "local-abc") is True
+    assert rsb.is_tier0_critical_cron("daily-retrospective", "local-abc") is True
+    assert rsb.is_tier0_critical_cron("night-driver", "local-abc") is True
+    assert rsb.is_tier0_critical_cron("saffar-inbox-brief", "local-abc") is True
+    assert rsb.is_tier0_critical_cron("decision-log-pipeline", "local-abc") is True
+    assert rsb.is_tier0_critical_cron("daily-db-backup-drill", "local-abc") is True
     assert rsb.is_tier0_critical_cron("atlas-watchdog", "local-abc") is False
 
     ef = exit_reason_failure("realtime_spend_breaker:tier3_daily_hard_cap")
@@ -369,3 +375,49 @@ def test_ew2_macro_clusters_sustained_cold_cache_and_compression_rotation_lineag
     assert snap_after.get("may_2027_sparplan_targets", {}).get("gcp_vertex_ai_daily_target_eur") == 250.0
 
 
+def test_tier0_cron_subagent_lineage_and_promo_cliff(tmp_path, monkeypatch):
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+
+    # 1) Promo-cliff rate switch verification
+    assert rsb.resolve_vertex_rates("google/gemini-4-argon", ts=1796111999.0) == (1.7962, 0.08981, 8.981)
+    assert rsb.resolve_vertex_rates("google/gemini-4-argon", ts=1796112000.0) == (3.5924, 0.17962, 17.962)
+    assert rsb.resolve_vertex_rates("google/gemini-3.8-flash", ts=1798790399.0) == (0.673573, 0.067357, 3.367844)
+    assert rsb.resolve_vertex_rates("google/gemini-3.8-flash", ts=1798790400.0) == (1.347146, 0.134714, 6.735688)
+
+    # Seed estate desktop spend above €195/day Tier 3 cap
+    rsb.record_realtime_llm_call(
+        session_id="desktop_heavy_1",
+        source="desktop",
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=120_000_000,
+        uncached_input_tokens=120_000_000,
+        cache_read_tokens=0,
+        output_tokens=100_000,
+        request_id="req_desktop_heavy_1",
+    )
+
+    # 2) Subagent spawned by Tier-0 cron (daily-retrospective) inherits cron_job_name and passes Tier 3
+    v_t0_sub = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_retro_1",
+        source="subagent",
+        job_name="daily-retrospective",
+        parent_session_id="cron_retro_parent",
+        parent_source="cron",
+    )
+    assert v_t0_sub["allowed"] is True
+    assert v_t0_sub["reason"] == "tier0_critical_cron_exempt"
+
+    # 3) Subagent spawned by non-Tier-0 cron is blocked when estate_today >= €195
+    v_nont0_sub = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_other_1",
+        source="subagent",
+        job_name="atlas-watchdog",
+        parent_session_id="cron_other_parent",
+        parent_source="cron",
+    )
+    assert v_nont0_sub["allowed"] is False
+    assert v_nont0_sub["reason"].startswith("tier3_daily_hard_cap")
