@@ -498,6 +498,18 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        try:
+            from cron.execution_identity import current_cron_execution
+            _ctx = current_cron_execution()
+            if _ctx is not None:
+                if getattr(_ctx, "job_id", None):
+                    env["HERMES_CRON_JOB_ID"] = str(_ctx.job_id)
+                if getattr(_ctx, "job_name", None):
+                    env["HERMES_CRON_JOB_NAME"] = str(_ctx.job_name)
+                if getattr(_ctx, "execution_id", None):
+                    env["HERMES_CRON_EXECUTION_ID"] = str(_ctx.execution_id)
+        except Exception:
+            pass
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent

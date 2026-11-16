@@ -37,9 +37,10 @@ def _validate_job_mode_invariants(
             "based on source changes. Use a plain no_agent script job instead.")
     if no_agent and not script:
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
-    if script and _script_is_command_line(script):
-        raise ValueError(SCRIPT_IS_COMMAND_LINE_ERROR.format(
-            scripts_dir=display_hermes_home() + "/scripts/", script=script))
+    for _s in (script, monitor_script):
+        if _s and _script_is_command_line(_s):
+            raise ValueError(SCRIPT_IS_COMMAND_LINE_ERROR.format(
+                scripts_dir=display_hermes_home() + "/scripts/", script=_s))
 
 
 def validate_schedule_knobs(

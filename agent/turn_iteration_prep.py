@@ -460,9 +460,10 @@ def begin_iteration(
             or getattr(agent, "_turn_route_task", "")
             or ""
         )
+        _rt_sess = str(getattr(agent, "session_id", "") or "unknown")
         _rt_eval_job = (
-            f"chat-247:{_rt_job}"
-            if is_tier0_critical_cron(_rt_job)
+            f"chat-247:{_rt_job or _rt_sess}"
+            if is_tier0_critical_cron(_rt_job, _rt_sess)
             else _rt_job
         )
         _rot_sids = getattr(agent, "_rotated_from_session_ids", None)

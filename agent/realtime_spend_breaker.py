@@ -23,6 +23,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -139,7 +140,12 @@ _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "optimize-measure-after",
     "workspace-policy-snapshot",
     "quarterly-db-acl-sweep",
-    "memory-hygiene",
+    "memory-",
+    "gauth-",
+    "secret-leak-",
+    "cert-expiry-",
+    "prod-smoke",
+    "solidpos-",
     "wiki-weekly-lint",
     "decision-log-pipeline",
     "daily-db-backup-drill",
@@ -307,14 +313,43 @@ def _hc_monitored_job_names() -> frozenset[str]:
         if mtime == _HC_JOBS_CACHE[0] and _HC_JOBS_CACHE[1]:
             return _HC_JOBS_CACHE[1]
         data = json.loads(jobs_path.read_text(encoding="utf-8"))
+        scripts_dir = Path.home() / ".hermes" / "scripts"
         names: set[str] = set()
         for j in data.get("jobs", []):
             blob = " ".join(str(j.get(k) or "") for k in ("prompt", "script", "monitor_script"))
-            if "hc-ping.sh" in blob or "hc.uropenn.se" in blob:
+            if "hc-ping.sh" not in blob and "hc.uropenn.se" not in blob:
+                cand_files: set[Path] = set()
+                for m in re.findall(r"(?:~/\.hermes/scripts/|/Users/emirsaffar/\.hermes/scripts/)([A-Za-z0-9_.-]+)", blob):
+                    cand_files.add(scripts_dir / m)
+                for sk in ("script", "monitor_script"):
+                    sv = str(j.get(sk) or "").strip()
+                    if not sv:
+                        continue
+                    for tok in sv.split():
+                        if tok.startswith("-") or tok.endswith(("python", "python3", "python3.11", "bash", "sh")):
+                            continue
+                        cand_files.add(
+                            Path(os.path.expanduser(tok)) if ("/" in tok or tok.startswith("~")) else (scripts_dir / tok)
+                        )
+                for sp in cand_files:
+                    if sp.is_file():
+                        try:
+                            blob += " " + sp.read_text(encoding="utf-8", errors="ignore")
+                        except Exception:
+                            pass
+            jname_low = str(j.get("name") or "").strip().lower()
+            if "builder-owner" in jname_low:
+                continue
+            is_prefix_tier0 = bool(
+                jname_low and any(jname_low.startswith(p) or p in jname_low for p in _TIER0_CRITICAL_PREFIXES)
+            )
+            if "hc-ping.sh" in blob or "hc.uropenn.se" in blob or is_prefix_tier0:
                 for key in ("name", "id"):
                     val = str(j.get(key) or "").strip().lower()
                     if val:
                         names.add(val)
+                        if key == "id":
+                            names.add(f"cron_{val}")
         _HC_JOBS_CACHE = (mtime, frozenset(names))
         return _HC_JOBS_CACHE[1]
     except Exception:
@@ -338,6 +373,8 @@ def is_tier0_critical_cron(job_name: str | None, session_id: str | None = None) 
         low = candidate.strip().lower()
         if not low:
             continue
+        if "builder-owner" in low:
+            return False
         if low in hc_names:
             return True
         if any(low.startswith(p) or p in low for p in _TIER0_CRITICAL_PREFIXES):
