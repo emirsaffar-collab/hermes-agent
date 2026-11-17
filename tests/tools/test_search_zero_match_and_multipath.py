@@ -202,6 +202,22 @@ class TestZeroMatchProbeEngineParity:
         r = ops.search("TOKEN_ALPHA\\nother", path=str(proj / "proj"), target="content")
         assert "line-oriented" not in (r.warning or "")
 
+    def test_hint_skipped_on_search_timeout(self, proj, monkeypatch):
+        from tools.file_operations import SearchResult
+        from tools.file_tools import _get_file_ops
+
+        ops = _get_file_ops(task_id="t-parity-timeout")
+        called = []
+        monkeypatch.setattr(
+            ops,
+            "_search_with_rg",
+            lambda *a, **k: SearchResult(total_count=0, truncated=True, limit_reason="search_timeout"),
+        )
+        monkeypatch.setattr(ops, "_zero_match_probe", lambda *a, **k: (called.append(True) or "SENTINEL_HINT"))
+        r = ops.search("token_alpha", path=str(proj / "proj"), target="content")
+        assert r.limit_reason == "search_timeout"
+        assert not called, "zero-match probe must not run after primary search timeout"
+
 
 class TestSymlinkedRootOnTheFilesLane:
     """A symlinked root must be searched on the files lane, on every engine (#116270).

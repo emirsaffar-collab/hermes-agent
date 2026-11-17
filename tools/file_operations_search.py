@@ -912,7 +912,7 @@ class SearchMixin:
                 glob_expr_probe = glob_expr
             probe_words = [rg, flags, "--count-matches", glob_expr_probe,
                            "-e", self._escape_shell_arg(pattern, translate_path=False), "--", self._escape_native_tool_arg(path)]
-            probe = self._run_rg_bounded(probe_words, 50, timeout=30)
+            probe = self._run_rg_bounded(probe_words, 50, timeout=5)
             total, per_file = 0, []
             for line in (probe.stdout or "").strip().splitlines():
                 p, _sep, n = line.rpartition(":")
@@ -1300,6 +1300,7 @@ class SearchMixin:
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Content search: rg, else grep; attaches zero-match steering hints."""
+        started = time.monotonic()
         used_rg = self._has_command('rg')
         if used_rg:
             result = self._search_with_rg(pattern, path, file_glob, limit, offset, output_mode, context,
@@ -1310,8 +1311,11 @@ class SearchMixin:
             return SearchResult(
                 error="Content search requires ripgrep (rg) or grep. "
                       "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation")
+        primary_elapsed = time.monotonic() - started
         if (not result.error and result.total_count == 0
-                and not result.matches and not result.files and not result.counts):
+                and not result.matches and not result.files and not result.counts
+                and result.limit_reason != "search_timeout"
+                and primary_elapsed < 3.0):
             try:
                 hint = self._zero_match_probe(pattern, path, file_glob)
             except Exception:
