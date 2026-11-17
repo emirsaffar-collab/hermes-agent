@@ -875,6 +875,15 @@ class SessionDB(
             # Existing WAL/SHM files may predate the main-file hardening;
             # normalize any sidecars that became visible during WAL setup.
             _secure_state_db_files(self.db_path)
+            if self._wal_active:
+                # SessionDB runs periodic non-blocking PASSIVE checkpoints outside the write
+                # transaction via maintain_after_commit() + close(). Leaving SQLite's built-in
+                # wal_autocheckpoint=1000 active triggers synchronous checkpoints + F_FULLFSYNC
+                # inside random self._conn.commit() calls (holding self._lock for 5-28s).
+                # Placed before apply_database_pragmas() so explicit database.wal_autocheckpoint
+                # in config.yaml still overrides when configured.
+                with suppress(sqlite3.OperationalError):
+                    conn.execute("PRAGMA wal_autocheckpoint=0")
             apply_database_pragmas(conn, db_label="state.db")
             conn.execute("PRAGMA foreign_keys=ON")
         except BaseException:

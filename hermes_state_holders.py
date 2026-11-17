@@ -442,7 +442,12 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
     # realpath, not abspath: psutil/libproc report the kernel-resolved pathname, so a symlinked
     # HERMES_HOME would otherwise make every holder invisible and let maintenance proceed.
     db_path_str = os.path.realpath(os.fspath(db_path))
-    watched = {canonical_sqlite_path(candidate) for candidate in _sqlite_family(db_path_str)}
+    db_path_abs = os.path.abspath(os.fspath(db_path))
+    watched = {
+        canonical_sqlite_path(candidate)
+        for base in (db_path_str, db_path_abs)
+        for candidate in _sqlite_family(base)
+    }
     holders: list[tuple[int, str]] = []
     watched_ids: set[tuple[int, int]] = set()
     db_dev: Optional[int] = None
@@ -546,14 +551,20 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
     if psutil is None:
         return [(-1, "open-file scan unavailable")]
     try:
-        for process in psutil.process_iter(["pid", "open_files"]):
-            info = process.info
+        for process in psutil.process_iter(["pid"]):
+            info = getattr(process, "info", None) or {}
             pid = int(info["pid"])
             if pid == os.getpid():
                 continue
-            for opened in info.get("open_files") or ():
+            opened_files = info.get("open_files")
+            if opened_files is None and hasattr(process, "open_files"):
+                try:
+                    opened_files = process.open_files()
+                except (psutil.Error, OSError, AssertionError):
+                    continue
+            for opened in opened_files or ():
                 path = getattr(opened, "path", "")
-                if path and canonical_sqlite_path(os.path.realpath(path)) in watched:
+                if path and canonical_sqlite_path(path) in watched:
                     if (pid, path) not in holders:
                         holders.append((pid, path))
     except Exception as exc:

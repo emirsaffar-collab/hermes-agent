@@ -32,7 +32,7 @@ logger = logging.getLogger("hermes_state")
 # number of short retries makes the open succeed instead of 500-ing the whole /api/sessions poll (or any
 # other read-only opener). Deliberately NOT attempted on writable opens: a writer owns the transition, so an
 # IOERR there means a real storage/fd problem.
-_READ_POOL_MAX = 8
+_READ_POOL_MAX = 24
 
 # Ceiling ALIVE in this PROCESS across every state.db (a multiplexed gateway
 # opens one per profile); three profiles' worth, then readers degrade likewise.
@@ -41,7 +41,7 @@ _READ_POOL_MAX = 8
 # the same shape as the per-instance bug, one level out (#98573). Past it, readers on the (N+1)th file
 # degrade to their writer connection instead of opening descriptors, which is the same trade _READ_POOL_MAX
 # makes and for the same reason: a slow read path is recoverable, a process-wide EMFILE is not.
-_READ_POOL_PROCESS_MAX = 24
+_READ_POOL_PROCESS_MAX = 72
 
 # Warn past this many SessionDB handles on one file in one process (diagnostic:
 # writer connections cannot be rationed the way read connections can).

@@ -223,3 +223,26 @@ class TestCheckpointFrequency:
         assert call_count[0] == 1, (
             f"Expected 1 checkpoint after {n} writes, got {call_count[0]}"
         )
+
+    @pytest.mark.requires_wal
+    def test_writer_disables_synchronous_wal_autocheckpoint_by_default(self, db):
+        """SessionDB disables SQLite's synchronous in-COMMIT wal_autocheckpoint=1000 by default
+        so checkpoints run outside the write transaction via maintain_after_commit()."""
+        val = db._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+        assert val == 0, f"Expected wal_autocheckpoint=0 on WAL writer conn, got {val}"
+
+    @pytest.mark.requires_wal
+    def test_writer_honors_explicit_wal_autocheckpoint_override(self, tmp_path, monkeypatch):
+        """Explicit database.wal_autocheckpoint in config.yaml still overrides the 0 default."""
+        from hermes_state import SessionDB
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"database": {"wal_autocheckpoint": 2000}},
+        )
+        custom_db = SessionDB(db_path=tmp_path / "custom_autockpt.db")
+        try:
+            assert custom_db._conn is not None
+            val = custom_db._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+            assert val == 2000, f"Expected explicit wal_autocheckpoint=2000 override, got {val}"
+        finally:
+            custom_db.close()
