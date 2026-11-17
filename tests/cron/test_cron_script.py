@@ -873,3 +873,64 @@ class TestHcDeadmanSlugs:
         sched._ping_hc_deadman_slugs(job)
         assert calls == [["bash", str(hc_script), "setup-steward", "ok"]]
 
+    def test_execute_job_pings_hc_deadman_on_max_iteration_handoff_polarity(self, cron_env, monkeypatch):
+        from unittest.mock import MagicMock, patch
+        from cron import scheduler as sched
+        from tests.cron.test_scheduler import _run_owned_job
+
+        job = {
+            "id": "b4619b69d218",
+            "name": "Ops Triage",
+            "prompt": "Run ~/.hermes/scripts/hc-ping.sh ops-triage start and ~/.hermes/scripts/hc-ping.sh ops-triage ok",
+        }
+        fake_db = MagicMock()
+        pinged = []
+        monkeypatch.setattr(sched, "_ping_hc_deadman_slugs", lambda j: pinged.append(j["id"]))
+
+        def _drive(agent_result):
+            with patch("cron.scheduler._hermes_home", cron_env), \
+                 patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+                 patch("hermes_state_registry.acquire", return_value=fake_db), \
+                 patch(
+                     "hermes_cli.runtime_provider.resolve_runtime_provider",
+                     return_value={
+                         "api_key": "***",
+                         "base_url": "https://example.invalid/v1",
+                         "provider": "openrouter",
+                         "api_mode": "chat_completions",
+                     },
+                 ), \
+                 patch("run_agent.AIAgent") as mock_agent_cls:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = agent_result
+                mock_agent_cls.return_value = mock_agent
+                return _run_owned_job(job, cron_env, fake_db)
+
+        # Positive control: max_iteration_handoff (completed=False, failed=False, turn_exit_reason=max_iterations_reached)
+        # must still fire _ping_hc_deadman_slugs because tools were disabled on the final summary turn.
+        success, _out, _final, err = _drive(
+            {
+                "final_response": "### Done",
+                "completed": False,
+                "failed": False,
+                "partial": True,
+                "turn_exit_reason": "max_iterations_reached(25/25)",
+            }
+        )
+        assert success is True and err is None
+        assert pinged == ["b4619b69d218"]
+
+        # Negative control: explicit [CRON_FAILURE] marker on max-iteration handoff must NOT fire _ping_hc_deadman_slugs.
+        pinged.clear()
+        _drive(
+            {
+                "final_response": "[CRON_FAILURE]\nupstream timeout",
+                "completed": False,
+                "failed": False,
+                "partial": True,
+                "turn_exit_reason": "max_iterations_reached(25/25)",
+            }
+        )
+        assert pinged == []
+
+

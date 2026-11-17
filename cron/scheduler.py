@@ -2743,7 +2743,7 @@ def run_job(
             logged_response = f"{logged_response}\n\n[Suppressed by {_exit_reason}]"
         elif (
             not result.get("interrupted")
-            and result.get("completed", True) is not False
+            and (result.get("completed", True) is not False or is_max_iteration_handoff(result))
             and _cron_failure_marker_error(final_response) is None
         ):
             _ping_hc_deadman_slugs(job)
