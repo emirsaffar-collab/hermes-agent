@@ -152,6 +152,42 @@ _COMPLETION_INSTRUCTIONS = (
     "whole process. Your response is returned to the parent agent as a summary, and overlong summaries crowd out the "
     "parent's context window."
 )
+_SUBAGENT_BOUNDARY_FLOOR = (
+    "\n## Subagent Safety & Verification Boundaries\n"
+    "- Control-plane & coordination state (`~/.hermes/config.yaml`, `MEMORY.md`, `USER.md`, `SOUL.md`, `AGENTS.md`, "
+    "`ACTIVE-WORKSTREAMS.md`, `blackboard.db`, and Plane ticket state transitions) are parent-owned: never mutate them.\n"
+    "- Default to read-only investigation unless your assigned TASK explicitly instructs you to edit files or commit.\n"
+    "- Every claim in your final summary must cite a verifiable handle (`abs_path:line`, commit SHA, row count, or "
+    "command exit code); never extrapolate or fabricate output."
+)
+
+
+def _load_active_estate_vetoes() -> str:
+    """Best-effort read of active estate_vetoes from blackboard.db so subagents inherit standing vetoes without
+    loading full MEMORY.md/USER.md. Deterministic order preserves byte-identical sibling system prompts."""
+    hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    db_path = os.path.join(hermes_home, "state", "blackboard.db")
+    if not os.path.isfile(db_path):
+        return ""
+    rows: list[tuple[str, str]] = []
+    with _quiet("subagent: blackboard estate_vetoes read failed"):
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.2)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COALESCE(scope, 'global'), COALESCE(rule, '') FROM estate_vetoes "
+                "WHERE active = 1 ORDER BY id ASC LIMIT 8"
+            )
+            rows = [(str(s).strip(), str(r).strip()) for s, r in cur.fetchall() if str(r or "").strip()]
+        finally:
+            conn.close()
+    if not rows:
+        return ""
+    lines = ["\nActive Estate Vetoes (blackboard.db):"]
+    for scope, rule in rows:
+        lines.append(f"- [{scope}] {rule}")
+    return "\n".join(lines)
 _ORCHESTRATOR_BLOCK = (
     "\n## Subagent Spawning (Orchestrator Role)\n"
     "You have access to the `delegate_task` tool and CAN spawn your own subagents to parallelize independent work.\n\n"
@@ -203,6 +239,7 @@ def _build_child_system_prompt(
         if _ctx_files.strip():
             parts.append(_CONTEXT_FILES_INTRO + _ctx_files.strip())
     parts.append(_COMPLETION_INSTRUCTIONS)
+    parts.append(_SUBAGENT_BOUNDARY_FLOOR + _load_active_estate_vetoes())
     if role == "orchestrator":
         child_note = _LEAF_CHILDREN_NOTE if child_depth + 1 >= max_spawn_depth else _NESTED_CHILDREN_NOTE
         parts.append(

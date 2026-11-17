@@ -88,3 +88,34 @@ def test_stacked_skill_and_bundle_skip_already_loaded_bodies_in_same_task(tmp_pa
     assert "User instruction: run pass 2" in msg2
     assert "# Alpha Body" not in msg2 and "# Beta Body" not in msg2
     assert len(msg2) < len(msg1) // 3
+
+
+def test_child_system_prompt_injects_boundary_floor_and_active_blackboard_vetoes(tmp_path, monkeypatch):
+    import sqlite3
+    from tools.delegate_tool_progress import _build_child_system_prompt
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / "blackboard.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE estate_vetoes (id INTEGER PRIMARY KEY, scope TEXT, rule TEXT, active INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO estate_vetoes (id, scope, rule, active) VALUES (1, 'global', 'Never use --allow-unauthenticated without GO', 1)"
+    )
+    conn.execute(
+        "INSERT INTO estate_vetoes (id, scope, rule, active) VALUES (2, 'legacy', 'Retired rule', 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    prompt_a = _build_child_system_prompt(workspace_path=str(tmp_path))
+    prompt_b = _build_child_system_prompt(workspace_path=str(tmp_path))
+    assert prompt_a == prompt_b
+    assert "Subagent Safety & Verification Boundaries" in prompt_a
+    assert "Active Estate Vetoes (blackboard.db):" in prompt_a
+    assert "[global] Never use --allow-unauthenticated without GO" in prompt_a
+    assert "Retired rule" not in prompt_a
+
