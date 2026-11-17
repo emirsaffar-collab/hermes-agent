@@ -64,14 +64,15 @@ def describe_site(site) -> str:
 
 
 @contextmanager
-def writer_mutex_until(lock, deadline, *, db=None, site=None):
+def writer_mutex_until(lock, deadline, *, db=None, site=None, quiet: bool = False):
     """Do not let an observation or lease renewal queue forever behind another writer.
 
     With ``db``, the holder (thread name, write callback, acquire time) is recorded on
     ``db._writer_owner`` while held, so a refused waiter can name it. Only code locations are
-    recorded: no SQL, parameters or frame locals."""
+    recorded: no SQL, parameters or frame locals. Observation-only callers with ``quiet=True``
+    yield on their sub-second patience without emitting a WARNING log."""
     if not lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-        if db is not None:
+        if db is not None and not quiet:
             _log_writer_owner(db, site)
         raise WriterMutexTimeout(
             "database is locked (in-process state.db writer mutex exceeded write patience)"

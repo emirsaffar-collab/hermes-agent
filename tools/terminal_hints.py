@@ -70,6 +70,11 @@ _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
     _regex_hint(r"Permission denied|EACCES",
                 "Permission denied. Check ownership/mode of the target path (`ls -la`); prefer a "
                 "user-writable location. Only escalate to sudo if the task genuinely requires it."),
+    _regex_hint(r"SyntaxError: f-string: ([^\n]+)",
+                "Python f-string SyntaxError ({0}): Python <=3.11 forbids reusing the f-string quote "
+                "character or backslashes inside `{{...}}`, and double-quoted `python3 -c \"...\"` "
+                "strips `\\\"` before Python parses it. Precompute the expression in a variable "
+                "before the f-string, or use a single-quoted heredoc (`python3 - <<'PY'`)."),
 ]
 
 # Exit-code-only hints for codes the terminal_tool semantics table does not

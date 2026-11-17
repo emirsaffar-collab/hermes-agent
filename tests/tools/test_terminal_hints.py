@@ -84,6 +84,16 @@ class TestPermissionDenied:
         assert "Permission denied" in hint
 
 
+class TestFStringSyntaxError:
+    def test_fstring_expecting_closing_brace(self):
+        out = '  File "<string>", line 10\n    return f"({", "\n                  ^\nSyntaxError: f-string: expecting \'}\''
+        hint = annotate_failure('python3 -c "..."', 1, out)
+        assert hint is not None
+        assert "f-string SyntaxError" in hint
+        assert "expecting '}'" in hint
+        assert "heredoc" in hint
+
+
 class TestBoundedScan:
     def test_pattern_beyond_scan_window_ignored(self):
         out = "x" * 5000 + "\npython: command not found"

@@ -206,6 +206,9 @@ _FAILURE_HINT_RULES = (
     (r"TypeError: string indices must be integers|AttributeError: 'str' object has no attribute 'get'",
      lambda m, _: "Tool functions in the sandbox return DICTS (already parsed) — "
                   "do not json.loads() them or index them like strings. Example: read_file(path)['content']."),
+    (r"KeyError: '(output|content|matches|results|data|exit_code)'",
+     lambda m, _: f"Dict did not contain '{m.group(1)}' (often because a tool call returned an "
+                  f"{{'error': ...}} dict). Use .get('{m.group(1)}', '') and check result.get('error') first."),
 )
 
 
@@ -277,6 +280,34 @@ def retry(fn, max_attempts=3, delay=2):
                 time.sleep(delay * (2 ** attempt))
     raise last_err
 
+
+class _ToolResultDict(dict):
+    """Dict subclass preventing KeyError on documented tool keys when a tool
+    returns an {'error': ...} payload (e.g. pre_tool_call hook block or refusal),
+    or aliases 'stdout' <-> 'output', while preserving exact dict equality and keys."""
+    def __missing__(self, key):
+        if key == "output" and "stdout" in self:
+            return self["stdout"]
+        if key == "stdout" and "output" in self:
+            return self["output"]
+        if "error" in self:
+            if key in ("output", "stdout", "stderr"):
+                return str(self.get("error") or "")
+            if key in ("exit_code", "returncode"):
+                return -1
+            if key == "content":
+                return ""
+            if key == "total_lines":
+                return 0
+            if key in ("matches", "results"):
+                return []
+            if key == "data":
+                return {"web": []}
+        raise KeyError(key)
+
+
+def _wrap_result(val):
+    return _ToolResultDict(val) if isinstance(val, dict) else val
 '''
 
 # ---- UDS transport (local backend) ---------------------------------------
@@ -357,10 +388,10 @@ def _call(tool_name, args):
     result = json.loads(raw)
     if isinstance(result, str):
         try:
-            return json.loads(result)
+            return _wrap_result(json.loads(result))
         except (json.JSONDecodeError, TypeError):
             return result
-    return result
+    return _wrap_result(result)
 
 '''
 
@@ -426,10 +457,10 @@ def _call(tool_name, args):
     result = json.loads(raw)
     if isinstance(result, str):
         try:
-            return json.loads(result)
+            return _wrap_result(json.loads(result))
         except (json.JSONDecodeError, TypeError):
             return result
-    return result
+    return _wrap_result(result)
 
 '''
 

@@ -824,6 +824,29 @@ class TestSandboxFailureHints(unittest.TestCase):
         self.assertIn("Importable tools here: terminal.", hint)
         self.assertNotIn("write_file", hint)
 
+    def test_keyerror_output_hint(self):
+        hint = _sandbox_failure_hint("KeyError: 'output'", enabled_tools=["terminal"])
+        assert hint is not None
+        self.assertIn(".get('output'", hint)
+
+    def test_tool_result_dict_error_fallback_prevents_keyerror_output(self):
+        from typing import Any
+        for transport in ("uds", "file"):
+            src = generate_hermes_tools_module(["terminal", "read_file", "search_files"], transport=transport)
+            ns: dict[str, Any] = {"__name__": "hermes_tools"}
+            exec(compile(src, "hermes_tools.py", "exec"), ns)
+            wrap = ns["_wrap_result"]
+            err_dict = wrap({"error": "BLOCKED by pre_tool_call guard"})
+            self.assertEqual(err_dict, {"error": "BLOCKED by pre_tool_call guard"})
+            self.assertEqual(list(err_dict.keys()), ["error"])
+            self.assertEqual(err_dict["output"], "BLOCKED by pre_tool_call guard")
+            self.assertEqual(err_dict["exit_code"], -1)
+            self.assertEqual(err_dict["content"], "")
+            self.assertEqual(err_dict["total_lines"], 0)
+            self.assertEqual(err_dict["matches"], [])
+            with self.assertRaises(KeyError):
+                _ = err_dict["nonexistent_custom_key"]
+
 
 # ---------------------------------------------------------------------------
 # _load_config

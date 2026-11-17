@@ -1108,7 +1108,9 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with writer_mutex_until(self._lock, deadline, db=self, site=write_site(fn)):
+                with writer_mutex_until(
+                    self._lock, deadline, db=self, site=write_site(fn), quiet=quiet_lock_timeout
+                ):
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
@@ -1639,17 +1641,26 @@ class SessionDB(
         """
         if self._quarantine_reason() is not None:
             return
+        if not self._lock.acquire(blocking=False):
+            return
+        self._writer_owner = (
+            threading.current_thread().name,
+            (None, self._try_wal_checkpoint.__code__),
+            time.monotonic(),
+        )
         try:
-            with self._lock:
-                if self._conn is None:
-                    return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
-                if self._wal_lock_guard:
-                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
-                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-                if result and result[1] > 0:
-                    logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
+            if self._conn is None:
+                return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
+            if self._wal_lock_guard:
+                _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
+            result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            if result and result[1] > 0:
+                logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+        finally:
+            self._writer_owner = None
+            self._lock.release()
 
     def __enter__(self) -> "SessionDB":
         """``with SessionDB(path) as db:`` closes on exit; owners must release deterministically.

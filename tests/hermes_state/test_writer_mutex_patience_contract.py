@@ -117,3 +117,21 @@ def test_queued_token_delta_survives_a_mutex_refusal(db, monkeypatch, caplog):
     assert db.flush_token_counts(timeout=10.0)
     row = db.get_session("owned")
     assert (row["input_tokens"], row["output_tokens"]) == (7, 3), "queued token delta was lost"
+
+
+def test_quiet_activity_write_suppresses_in_process_mutex_warning(db, monkeypatch, caplog):
+    """Observation-only activity writes (quiet_lock_timeout=True) yield on their sub-second
+    patience without emitting the in-process writer mutex WARNING log."""
+    from hermes_state_write import WriterMutexTimeout
+
+    monkeypatch.setattr(SessionDB, "_ACTIVITY_WRITE_PATIENCE_S", 0.05)
+    holder, release = _hold_writer_mutex(db, hold_s=5)
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_state"), pytest.raises(WriterMutexTimeout):
+            db.touch_session_activity("owned", description="executing tool", provenance="tool")
+    finally:
+        release.set()
+        holder.join(5)
+    lines = [r.getMessage() for r in caplog.records if "writer mutex" in r.getMessage()]
+    assert lines == [], f"quiet activity write logged unexpected writer mutex warning: {lines}"
+
