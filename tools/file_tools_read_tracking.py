@@ -204,16 +204,17 @@ def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str)
 # Set while an ``execute_code`` cell dispatches a tool. The cell consumes the result in code, so
 # the "you already have this" stub only breaks it (``result["content"]`` raises), and the read
 # shows the model nothing, so it must not count as content the conversation has seen.
-_programmatic_read: contextvars.ContextVar[bool] = contextvars.ContextVar("programmatic_file_read", default=False)
+_programmatic_read: contextvars.ContextVar[bool] = globals().get("_programmatic_read") or contextvars.ContextVar("programmatic_file_read", default=False)
 
 
 @contextlib.contextmanager
 def programmatic_file_read():
-    token = _programmatic_read.set(True)
+    var = _programmatic_read
+    token = var.set(True)
     try:
         yield
     finally:
-        _programmatic_read.reset(token)
+        var.reset(token)
 
 
 def _dedup_lookup(task_id: str, dedup_key: tuple) -> tuple[dict, object, bool]:
