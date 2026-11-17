@@ -146,3 +146,24 @@ def test_property_access_before_setup_raises():
         _ = br.device_name
     with pytest.raises(RuntimeError):
         _ = br.write_target
+
+
+def test_classify_voice_control_multi_sentence_and_whisper_phonetics():
+    from plugins.google_meet.meet_bot import _classify_voice_control
+
+    multi_text = "Ja, precis. Alltså det är en ny vy. Mr. Agent, du kan lämna mötet."
+    assert _classify_voice_control(multi_text) == "leave_call"
+    assert _classify_voice_control("Tack. Mr. Egent lämnar mattet.") == "leave_call"
+    assert _classify_voice_control("Vi pratade om hur agenten fungerar i projektet igår.") is None
+
+
+def test_caption_observer_and_liveness_guards_present():
+    from pathlib import Path
+    import plugins.google_meet.meet_bot as mb
+
+    src = Path(mb.__file__).read_text(encoding="utf-8")
+    assert "context.add_init_script(_CAPTION_OBSERVER_JS)" in src
+    assert "if len(self.speaker_timeline) > 40000:" in src
+    assert "if recent_audio:" in src
+
+
