@@ -832,3 +832,44 @@ class TestScriptTimeoutTreeKill:
                     psutil.Process(gpid).kill()
                 except psutil.NoSuchProcess:
                     pass
+
+
+class TestHcDeadmanSlugs:
+    """Verify deterministic hc-ping.sh deadman extraction and completion pinging."""
+
+    def test_extract_hc_ping_slugs(self):
+        from cron.scheduler import _extract_hc_ping_slugs
+
+        job = {
+            "id": "ead6a5c5b1a0",
+            "name": "setup-steward (v1 dry-run)",
+            "prompt": (
+                "Start: ~/.hermes/scripts/hc-ping.sh setup-steward start\n"
+                "Done: bash ~/.hermes/scripts/hc-ping.sh 'setup-steward' ok\n"
+                "Other: ~/.hermes/scripts/hc-ping.sh one-dev-freshness ok"
+            ),
+        }
+        assert _extract_hc_ping_slugs(job) == ["one-dev-freshness", "setup-steward"]
+        assert _extract_hc_ping_slugs({"prompt": "no ping here"}) == []
+
+    def test_ping_hc_deadman_slugs_invokes_hc_ping(self, cron_env, monkeypatch):
+        from cron import scheduler as sched
+
+        hc_script = cron_env / "scripts" / "hc-ping.sh"
+        hc_script.write_text("#!/bin/sh\nexit 0\n")
+        hc_script.chmod(0o755)
+        monkeypatch.setattr(sched, "_get_hermes_home", lambda: cron_env)
+
+        calls = []
+        monkeypatch.setattr(
+            sched.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(cmd),
+        )
+        job = {
+            "id": "ead6a5c5b1a0",
+            "prompt": "Run and finish with ~/.hermes/scripts/hc-ping.sh setup-steward ok",
+        }
+        sched._ping_hc_deadman_slugs(job)
+        assert calls == [["bash", str(hc_script), "setup-steward", "ok"]]
+

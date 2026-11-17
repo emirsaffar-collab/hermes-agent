@@ -1593,6 +1593,42 @@ def _run_no_agent_job(
     return True, f"{header}\n---\n\n{output}\n", output, None
 
 
+_HC_PING_SLUG_RE = re.compile(
+    r"hc-ping\.sh\s+[\'\"]?([a-zA-Z0-9_-]+)[\'\"]?\s+(?:ok|start)\b"
+)
+
+
+def _extract_hc_ping_slugs(job: dict) -> list[str]:
+    """Extract Healthchecks deadman check slugs referenced via hc-ping.sh in job['prompt']."""
+    if not isinstance(job, dict):
+        return []
+    prompt = str(job.get("prompt") or "")
+    if "hc-ping.sh" not in prompt:
+        return []
+    return sorted(set(_HC_PING_SLUG_RE.findall(prompt)))
+
+
+def _ping_hc_deadman_slugs(job: dict) -> None:
+    """Best-effort deadman 'ok' ping for any hc-ping.sh slug declared in job['prompt']."""
+    slugs = _extract_hc_ping_slugs(job)
+    if not slugs:
+        return
+    hc_script = _get_hermes_home() / "scripts" / "hc-ping.sh"
+    if not hc_script.is_file():
+        return
+    for slug in slugs:
+        try:
+            subprocess.run(
+                ["bash", str(hc_script), slug, "ok"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except Exception as exc:
+            logger.debug("Job '%s': hc-ping.sh %s ok failed: %s", job.get("id"), slug, exc)
+
+
 def _apply_monitor_gate(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str],
 ) -> tuple[Optional[tuple], Optional[str], Optional[str]]:
@@ -1623,6 +1659,7 @@ def _apply_monitor_gate(
     if not _mon.changed:
         # Unchanged: silent no_change tick (ledger doc kept; SILENT_MARKER blocks delivery).
         logger.info("Job '%s': monitor output unchanged — suppressing agent run", job_id)
+        _ping_hc_deadman_slugs(job)
         return (
             True, f"{header}**Status:** no_change (agent run suppressed)\n", SILENT_MARKER, None,
         ), extra_prompt, None
@@ -2315,6 +2352,7 @@ def _prepare_job_prompt(
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             note_cron_skipped(job)
+            _ping_hc_deadman_slugs(job)
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
@@ -2703,6 +2741,12 @@ def run_job(
         if _exit_reason.startswith("realtime_spend_breaker"):
             logger.warning("Job '%s' (ID: %s) suppressed by %s", job_name, job_id, _exit_reason)
             logged_response = f"{logged_response}\n\n[Suppressed by {_exit_reason}]"
+        elif (
+            not result.get("interrupted")
+            and result.get("completed", True) is not False
+            and _cron_failure_marker_error(final_response) is None
+        ):
+            _ping_hc_deadman_slugs(job)
         # Text-file reads normalize newlines; count the same characters the
         # context_from reader sees so quoted markers can never become boundaries.
         framed_prompt = _normalize_newlines(prompt)
