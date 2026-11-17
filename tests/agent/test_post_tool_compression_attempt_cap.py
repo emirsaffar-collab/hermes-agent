@@ -207,3 +207,34 @@ class TestPostToolCompressionAttemptCap:
 
         assert len(first) == agent.max_compression_attempts
         assert len(second) == agent.max_compression_attempts
+
+    def test_child_session_rotation_capped_per_turn(self, agent):
+        """Even when _compress_context rotates agent.session_id (compression.in_place=false),
+        a single user turn cannot rotate more than max_compression_attempts times."""
+        agent.max_iterations = 25
+        responses = [_tool_response(i) for i in range(15)] + [_stop_response()]
+        agent.client.chat.completions.create.side_effect = responses
+
+        rotated_sids = []
+
+        def _fake_rotating_compress(messages, system_message, **_kwargs):
+            new_sid = f"child_seg_{len(rotated_sids) + 1}"
+            agent.session_id = new_sid
+            rotated_sids.append(new_sid)
+            return messages, "compressed prompt"
+
+        with (
+            patch.object(agent, "_compress_context", side_effect=_fake_rotating_compress),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch(
+                "model_tools.handle_function_call",
+                lambda name, args, task_id=None, **kwargs: json.dumps({"ok": True}),
+            ),
+        ):
+            agent.run_conversation("deep research with child session rotation")
+
+        assert len(rotated_sids) == agent.max_compression_attempts
+        assert agent._turn_compaction_rotations == agent.max_compression_attempts
+

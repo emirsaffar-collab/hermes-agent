@@ -296,7 +296,7 @@ def test_ew2_macro_clusters_sustained_cold_cache_and_compression_rotation_lineag
         output_tokens=1_000,
         cluster_id="Kyg7QP",
     )
-    for macro in ("0L8P", "9_oP", "6-wP", "6_gP", "08QP", "4ATb", "7bQP", "7PIP", "9wMP"):
+    for macro in ("0L8P", "l-oP", "9_oP", "6-wP", "6_gP", "08QP", "4ATb", "9wMP"):
         eur_reg = rsb.compute_call_net_eur(
             provider="vertex",
             model="google/gemini-4-argon",
@@ -425,3 +425,254 @@ def test_tier0_cron_subagent_lineage_and_promo_cliff(tmp_path, monkeypatch):
     # 4) Summary breaker_state stays ARMED_OK when only interactive Desktop spend exceeds €195
     summary_after_desktop = rsb.get_realtime_spend_summary()
     assert summary_after_desktop["breaker_state"] == "ARMED_OK"
+
+
+def test_manual_ui_pause_throttle_and_hourly_budget_cap(tmp_path, monkeypatch):
+    import json
+    import time
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    cap_file = tmp_path / "ai-budget-cap.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+    monkeypatch.setenv("HERMES_AI_BUDGET_CAP_PATH", str(cap_file))
+
+    now = time.time()
+
+    # 1) Manual UI pause blocks even productive interactive Desktop sessions (positive polarity)
+    rsb.quarantine_session("sess_paused_ui", "manual_ui_pause:Pausad manuellt av Emir (45m)", 0.0, ttl_s=600.0, now=now)
+    v_paused = rsb.evaluate_realtime_spend_breaker(
+        session_id="sess_paused_ui",
+        source="desktop",
+        making_productive_progress=True,
+        consecutive_calls_since_user=1,
+        now=now + 1.0,
+    )
+    assert v_paused["allowed"] is False
+    assert "manual_ui_pause:" in v_paused["reason"]
+
+    # Negative polarity: automatic tier1 quarantine still allows productive interactive Desktop session
+    rsb.quarantine_session("sess_auto_q", "tier1_stalled_desktop_loop", 3.5, ttl_s=600.0, now=now)
+    v_auto_q = rsb.evaluate_realtime_spend_breaker(
+        session_id="sess_auto_q",
+        source="desktop",
+        making_productive_progress=True,
+        consecutive_calls_since_user=2,
+        now=now + 1.0,
+    )
+    assert v_auto_q["allowed"] is True
+
+    # 2) Manual UI throttle allows interactive session below €1.50/15m, blocks once >= €1.50/15m
+    rsb.quarantine_session("sess_throttled_ui", "manual_ui_throttle:Strypt manuellt av Emir", 0.0, ttl_s=600.0, now=now)
+    v_th_ok = rsb.evaluate_realtime_spend_breaker(
+        session_id="sess_throttled_ui",
+        source="desktop",
+        making_productive_progress=True,
+        consecutive_calls_since_user=3,
+        now=now + 1.0,
+    )
+    assert v_th_ok["allowed"] is True
+
+    rsb.record_realtime_llm_call(
+        session_id="sess_throttled_ui",
+        source="desktop",
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=1_000_000,
+        uncached_input_tokens=1_000_000,  # ~€1.80 >= €1.50 throttle limit
+        cache_read_tokens=0,
+        output_tokens=1_000,
+        request_id="req_th_1",
+    )
+    v_th_blocked = rsb.evaluate_realtime_spend_breaker(
+        session_id="sess_throttled_ui",
+        source="desktop",
+        making_productive_progress=True,
+        consecutive_calls_since_user=4,
+        now=now + 3.0,
+    )
+    assert v_th_blocked["allowed"] is False
+    assert v_th_blocked["reason"].startswith("throttled:manual_ui_throttle:")
+
+    # 3) Manual UI hourly budget cap ($15/h -> €13.50/h -> €3.38/15m)
+    cap_file.write_text(
+        json.dumps(
+            {
+                "ts": now,
+                "expires_at": now + 3600.0,
+                "cap_usd_hr": 15.0,
+                "cap_eur_hr": 13.50,
+                "cap_eur_15m": 3.38,
+                "operator": "Emir",
+                "active": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Seed estate 15m spend above €3.38
+    rsb.record_realtime_llm_call(
+        session_id="sess_heavy_loop",
+        source="desktop",
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=2_000_000,
+        uncached_input_tokens=2_000_000,  # ~€3.59 in 15m
+        cache_read_tokens=0,
+        output_tokens=1_000,
+        request_id="req_cap_1",
+    )
+    # Non-Tier-0 cron is throttled under the $15/h UI cap
+    v_cron_capped = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_non_t0",
+        source="cron",
+        job_name="atlas-watchdog",
+        now=now + 5.0,
+    )
+    assert v_cron_capped["allowed"] is False
+    assert "manual_budget_cap_15m" in v_cron_capped["reason"]
+
+    # Tier-0 critical cron remains exempt
+    v_t0_exempt = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_t0",
+        source="cron",
+        job_name="chat247-responder",
+        now=now + 5.0,
+    )
+    assert v_t0_exempt["allowed"] is True
+
+    # Runaway multi-call interactive loop (calls=8, session €3.59/15m) is throttled under $15/h UI cap
+    v_loop_capped = rsb.evaluate_realtime_spend_breaker(
+        session_id="sess_heavy_loop",
+        source="desktop",
+        making_productive_progress=True,
+        consecutive_calls_since_user=8,
+        now=now + 5.0,
+    )
+    assert v_loop_capped["allowed"] is False
+    assert "manual_budget_cap_interactive_throttle" in v_loop_capped["reason"]
+
+    # Immediate user turn (consecutive_calls_since_user=1) on the same session is NEVER blocked
+    v_user_turn = rsb.evaluate_realtime_spend_breaker(
+        session_id="sess_heavy_loop",
+        source="desktop",
+        making_productive_progress=True,
+        consecutive_calls_since_user=1,
+        now=now + 5.0,
+    )
+    assert v_user_turn["allowed"] is True
+
+
+def test_compaction_storm_long_term_fixes_guardrails_budget_and_lineage(tmp_path, monkeypatch):
+    import time
+
+    from agent.iteration_budget import IterationBudget
+    from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    cap_file = tmp_path / "ai-budget-cap.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+    monkeypatch.setenv("HERMES_AI_BUDGET_CAP_PATH", str(cap_file))
+
+    # 1) Cross-compaction guardrail memory: 1x reload forgiven, 3rd unchanged reload across compactions warns
+    # and clears productive progress, 4th blocks, and file mutation resets cross-compaction memory.
+    ctrl = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    d1 = ctrl.after_call("read_file", {"path": "/repo/app.py"}, '{"content": "x = 1\\n"}', failed=False)
+    assert d1.action == "allow"
+    assert ctrl.is_making_productive_progress() is True
+
+    # Compaction #1: resets _turn_productive_calls to 0; 1st post-compaction reload is forgiven
+    ctrl.reset_after_compaction()
+    assert ctrl.is_making_productive_progress() is False
+    d2 = ctrl.after_call("read_file", {"path": "/repo/app.py"}, '{"content": "x = 1\\n"}', failed=False)
+    assert d2.action == "allow"
+    assert ctrl.is_making_productive_progress() is True
+
+    # Compaction #2: 3rd unchanged read across compactions triggers idempotent_no_progress_warning
+    # and flips is_making_productive_progress() to False!
+    ctrl.reset_after_compaction()
+    assert ctrl.is_making_productive_progress() is False
+    d3 = ctrl.after_call("read_file", {"path": "/repo/app.py"}, '{"content": "x = 1\\n"}', failed=False)
+    assert d3.action == "warn"
+    assert d3.code == "idempotent_no_progress_warning"
+    assert ctrl.is_making_productive_progress() is False
+
+    # Compaction #3: 4th unchanged read is blocked by before_call once count reaches cross_block_after
+    ctrl.reset_after_compaction()
+    ctrl.after_call("read_file", {"path": "/repo/app.py"}, '{"content": "x = 1\\n"}', failed=False)
+    d_block = ctrl.before_call("read_file", {"path": "/repo/app.py"})
+    assert d_block.action == "block"
+    assert d_block.code == "idempotent_no_progress_block"
+
+    # Landing a file mutation clears cross-compaction read blocks so verification reads succeed
+    ctrl.after_call("patch", {"path": "/repo/app.py"}, '{"success": true}', failed=False)
+    assert ctrl.before_call("read_file", {"path": "/repo/app.py"}).action == "allow"
+    assert ctrl.is_making_productive_progress() is True
+
+    # 2) IterationBudget: capped execute_code refunds stop at max_refunds=20; extend_on_progress caps at 2x
+    budget = IterationBudget(20)
+    assert budget.consume() is True
+    for _ in range(20):
+        assert budget.refund(capped=True, max_refunds=20) is True
+        assert budget.consume() is True
+    # 21st capped refund is denied
+    assert budget.refund(capped=True, max_refunds=20) is False
+    # Uncapped refund (for cancelled/restarted API requests) still works
+    assert budget.refund(capped=False) is True
+
+    # extend_on_progress caps at 2x (40 for initial 20), not 4x (80)
+    budget._used = 18
+    for _ in range(20):
+        assert budget.extend_on_progress(1) is True
+        budget._used = budget.max_total - 2
+    assert budget.max_total == 40
+    assert budget.extend_on_progress(1) is False
+
+    # 3) Multi-hop compaction lineage (s0 -> s1 -> s2 -> s3) sums 15m spend across all 4 segments
+    # and trips tier1_runaway_autonomous_turn at >=90 calls and >=€10.00 in 15m even if productive
+    now = time.time()
+    for seg_idx, (sid, p_sid) in enumerate(
+        [("seg_0", ""), ("seg_1", "seg_0"), ("seg_2", "seg_1"), ("seg_3", "seg_2")]
+    ):
+        if p_sid:
+            rsb.record_session_parent(sid, p_sid)
+        rsb.record_realtime_llm_call(
+            session_id=sid,
+            source="desktop",
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=1_500_000,
+            uncached_input_tokens=1_500_000,  # ~€2.69 per segment -> ~€10.78 across 4 segments
+            cache_read_tokens=0,
+            output_tokens=1_000,
+            request_id=f"req_seg_{seg_idx}",
+        )
+
+    # At 40 calls (below 90 runaway ceiling) with making_productive_progress=True -> allowed,
+    # and session_net_eur_15m reflects all 4 segments (> €10.00, not just last 2 segments €5.39)
+    v_mid = rsb.evaluate_realtime_spend_breaker(
+        session_id="seg_3",
+        source="desktop",
+        making_productive_progress=True,
+        consecutive_calls_since_user=40,
+        parent_session_id="seg_2",
+        now=now + 5.0,
+    )
+    assert v_mid["allowed"] is True
+    assert v_mid["session_net_eur_15m"] > 10.0
+
+    # At 90 calls without user input and >€10.00 across the compaction chain -> halted!
+    v_runaway = rsb.evaluate_realtime_spend_breaker(
+        session_id="seg_3",
+        source="desktop",
+        making_productive_progress=True,
+        consecutive_calls_since_user=90,
+        parent_session_id="seg_2",
+        now=now + 5.0,
+    )
+    assert v_runaway["allowed"] is False
+    assert "tier1_runaway_autonomous_turn" in v_runaway["reason"]
+
+

@@ -62,10 +62,14 @@ def run_preflight_gate(
     # them. Mirror the turn-prologue guard chain: defer on noisy estimate, skip in
     # failure cooldown, then should_compress().
     _compressor = agent.context_compressor
-    if (
-        int(getattr(_compressor, "_force_rotate_restore_threshold", 0) or 0) > 0
+    _restore_thr = getattr(_compressor, "_force_rotate_restore_threshold", 0)
+    _was_force_rotate = bool(
+        isinstance(_restore_thr, int)
+        and not isinstance(_restore_thr, bool)
+        and _restore_thr > 0
         and not getattr(agent, "_rotated_to_child_session", False)
-    ):
+    )
+    if _was_force_rotate:
         v.compression_attempts = 0
         v._preflight_compression_blocked = False
     _preflight_threshold = int(getattr(_compressor, "threshold_tokens", 0) or 0)
@@ -107,6 +111,18 @@ def run_preflight_gate(
         user_message=user_message, max_compression_attempts=max_compression_attempts,
         effective_task_id=effective_task_id,
     )
-    if getattr(agent, "session_id", None) != _pre_gate_sid:
+    if _was_force_rotate and getattr(agent, "_rotated_to_child_session", False):
         _res.compression_attempts = 0
+    elif getattr(agent, "session_id", None) != _pre_gate_sid:
+        _rotations = int(getattr(agent, "_turn_compaction_rotations", 0) or 0) + 1
+        agent._turn_compaction_rotations = _rotations
+        _max_turn_rotations = max(3, int(max_compression_attempts or 3))
+        if _rotations >= _max_turn_rotations:
+            _res.compression_attempts = max_compression_attempts
+            _budget = getattr(agent, "iteration_budget", None)
+            if _budget is not None and getattr(_budget, "remaining", 0) > 4:
+                with suppress(Exception):
+                    _budget.max_total = _budget.used + 4
+        else:
+            _res.compression_attempts = 0
     return _res

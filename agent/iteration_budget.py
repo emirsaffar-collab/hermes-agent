@@ -27,6 +27,7 @@ class IterationBudget:
     iterations are refunded via :meth:`refund` so they don't eat into the budget."""
 
     _extensions_granted: int = 0
+    _refunds_used: int = 0
 
     def __init__(self, max_total: int):
         self.max_total = max_total
@@ -34,6 +35,7 @@ class IterationBudget:
         self._initial_max_total = max_total
         self._used = 0
         self._extensions_granted = 0
+        self._refunds_used = 0
         self._lock = threading.Lock()
 
     def consume(self) -> bool:
@@ -44,11 +46,22 @@ class IterationBudget:
             self._used += 1
             return True
 
-    def refund(self) -> None:
-        """Give back one iteration (e.g. for execute_code turns)."""
+    def refund(self, *, capped: bool = False, max_refunds: int = 20) -> bool:
+        """Give back one iteration (e.g. for execute_code turns or cancelled requests).
+
+        When ``capped=True`` (used for ``execute_code`` tool rounds), refunds are bounded
+        by ``max_refunds`` per turn so a loop of ``execute_code`` calls cannot run forever.
+        """
         with self._lock:
-            if self._used > 0:
-                self._used -= 1
+            if self._used <= 0:
+                return False
+            if capped:
+                refunds_used = getattr(self, "_refunds_used", 0)
+                if refunds_used >= max_refunds:
+                    return False
+                self._refunds_used = refunds_used + 1
+            self._used -= 1
+            return True
 
     def extend_on_progress(
         self,
@@ -56,7 +69,7 @@ class IterationBudget:
         *,
         min_initial_max: int = 20,
         low_watermark: int = 5,
-        max_multiplier: int = 4,
+        max_multiplier: int = 2,
     ) -> bool:
         """Extend ``max_total`` by ``amount`` when a real session (``initial_max_total >= min_initial_max``)
         is making verified progress and within ``low_watermark`` iterations of exhaustion."""

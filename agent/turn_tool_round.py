@@ -253,11 +253,18 @@ def run_tool_round(
     # text arrives, so tool iterations don't stack blank lines.
     agent._stream_needs_break = True
     # Refund the iteration when the ONLY tool was execute_code (programmatic tool
-    # calling) — cheap RPC-style calls shouldn't eat the budget.
+    # calling) — cheap RPC-style calls shouldn't eat the budget, up to 20 per turn.
+    _turn_rotations = int(getattr(agent, "_turn_compaction_rotations", 0) or 0)
+    _max_turn_rotations = max(3, int(max_compression_attempts or 3))
     if {tc.function.name for tc in assistant_message.tool_calls} == {"execute_code"}:
-        agent.iteration_budget.refund()
+        if _turn_rotations < _max_turn_rotations:
+            try:
+                agent.iteration_budget.refund(capped=True, max_refunds=20)
+            except TypeError:
+                agent.iteration_budget.refund()
     elif (
-        getattr(agent, "_tool_guardrails", None) is not None
+        _turn_rotations < _max_turn_rotations
+        and getattr(agent, "_tool_guardrails", None) is not None
         and hasattr(agent._tool_guardrails, "is_making_productive_progress")
         and hasattr(agent.iteration_budget, "extend_on_progress")
     ):
@@ -268,10 +275,14 @@ def run_tool_round(
             logger.debug("iteration_budget extend_on_progress check failed: %s", _prog_exc)
 
     _cc_tr = getattr(agent, "context_compressor", None)
-    if (
-        int(getattr(_cc_tr, "_force_rotate_restore_threshold", 0) or 0) > 0
+    _restore_thr = getattr(_cc_tr, "_force_rotate_restore_threshold", 0)
+    _was_force_rotate = bool(
+        isinstance(_restore_thr, int)
+        and not isinstance(_restore_thr, bool)
+        and _restore_thr > 0
         and not getattr(agent, "_rotated_to_child_session", False)
-    ):
+    )
+    if _was_force_rotate:
         compression_attempts = 0
     _pre_ptc_sid = getattr(agent, "session_id", None)
     _ptc = compress_after_tool_results(
@@ -285,7 +296,21 @@ def run_tool_round(
     messages = _ptc.messages
     active_system_prompt = _ptc.active_system_prompt
     conversation_history = _ptc.conversation_history
-    compression_attempts = 0 if getattr(agent, "session_id", None) != _pre_ptc_sid else _ptc.compression_attempts
+    if _was_force_rotate and getattr(agent, "_rotated_to_child_session", False):
+        compression_attempts = 0
+    elif getattr(agent, "session_id", None) != _pre_ptc_sid:
+        _rotations = int(getattr(agent, "_turn_compaction_rotations", 0) or 0) + 1
+        agent._turn_compaction_rotations = _rotations
+        if _rotations >= _max_turn_rotations:
+            compression_attempts = max_compression_attempts
+            _budget = getattr(agent, "iteration_budget", None)
+            if _budget is not None and getattr(_budget, "remaining", 0) > 4:
+                with suppress(Exception):
+                    _budget.max_total = _budget.used + 4
+        else:
+            compression_attempts = 0
+    else:
+        compression_attempts = _ptc.compression_attempts
     final_response = _ptc.final_response
     _turn_exit_reason = _ptc.turn_exit_reason
     current_turn_user_idx = _ptc.current_turn_user_idx

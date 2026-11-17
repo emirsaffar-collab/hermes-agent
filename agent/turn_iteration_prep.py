@@ -486,6 +486,7 @@ def begin_iteration(
             consecutive_calls_since_user=int(api_call_count or 0),
             parent_session_id=_rt_parent_sid,
             parent_source=_rt_parent_src,
+            lineage_session_ids=tuple(_rot_sids) if isinstance(_rot_sids, set) and _rot_sids else (),
         )
         if not _rt_verdict.get("allowed", True):
             _turn_exit_reason = f"realtime_spend_breaker:{_rt_verdict.get('reason', 'cap_exceeded')}"

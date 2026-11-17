@@ -370,14 +370,19 @@ class ToolCallGuardrailController:
         self._auth_wall_failure_count = 0
         self._turn_productive_calls = 0
         self._consecutive_failure_count = 0
+        self._cross_compaction_no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._compaction_epoch = 0
+        self._last_idempotent_repeat_count = 0
 
     def reset_after_compaction(self) -> None:
-        """Clear no-progress, identical-streak, and cycle history across a compaction boundary.
+        """Clear single-epoch no-progress, identical-streak, and cycle history across a compaction boundary,
+        while resetting ``_turn_productive_calls`` and retaining ``_cross_compaction_no_progress`` so repeated
+        unchanged reloads across 3+ compaction cycles still trip the no-progress detector.
 
         Context compression prunes prior ``skill_view``, ``read_file``, ``search_files``,
         and other read tool bodies out of the transcript and explicitly instructs the model
         to reload pruned context on demand. Retaining pre-compaction ``_no_progress`` or
-        ``_call_history`` state across compactions causes legitimate post-compaction reloads
+        ``_call_history`` state across a single compaction causes legitimate 1x post-compaction reloads
         of unchanged files/skills to hit ``idempotent_no_progress_block`` (#156580).
         """
         self._no_progress.clear()
@@ -386,6 +391,9 @@ class ToolCallGuardrailController:
         self._identical_streak_count = 0
         self._identical_streak_first_call_id = ""
         self._call_history.clear()
+        self._turn_productive_calls = 0
+        self._last_idempotent_repeat_count = 0
+        self._compaction_epoch = getattr(self, "_compaction_epoch", 0) + 1
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -419,6 +427,17 @@ class ToolCallGuardrailController:
         record = self._no_progress.get(signature) if self._is_idempotent(tool_name) else None
         if record is not None and record[1] >= self.config.no_progress_block_after:
             return self._decide("block", "idempotent_no_progress_block", tool_name, record[1], signature)
+        cross_map = getattr(self, "_cross_compaction_no_progress", None)
+        cross_rec = (
+            cross_map.get(signature)
+            if isinstance(cross_map, dict)
+            and self._is_idempotent(tool_name)
+            and getattr(self, "_compaction_epoch", 0) > 0
+            else None
+        )
+        cross_block_after = min(4, int(getattr(self.config, "no_progress_block_after", 4) or 4))
+        if cross_rec is not None and cross_rec[1] >= cross_block_after:
+            return self._decide("block", "idempotent_no_progress_block", tool_name, cross_rec[1], signature)
         return allow
 
     def after_call(
@@ -488,11 +507,23 @@ class ToolCallGuardrailController:
         self._consecutive_failure_count = 0
         # A successful mutation is progress for every failing signature still counted
         # this turn. Pure loops never mutate between attempts, so the replay detector keeps its teeth.
-        if tool_name in PROGRESS_RESET_TOOL_NAMES or file_mutation_result_landed(tool_name, result):
+        mutation_landed = file_mutation_result_landed(tool_name, result)
+        if tool_name in PROGRESS_RESET_TOOL_NAMES or mutation_landed:
             self._progress_since_failure.update(dict.fromkeys(self._exact_failure_counts, True))
             self._same_tool_failure_counts.clear()
+        if mutation_landed:
+            cross_map_mut = getattr(self, "_cross_compaction_no_progress", None)
+            if isinstance(cross_map_mut, dict):
+                cross_map_mut.clear()
+            self._last_idempotent_repeat_count = 0
+            if getattr(self._halt_decision, "action", None) == "block":
+                self._halt_decision = None
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
+            cross_map_non_id = getattr(self, "_cross_compaction_no_progress", None)
+            if isinstance(cross_map_non_id, dict):
+                cross_map_non_id.pop(signature, None)
+            self._last_idempotent_repeat_count = 0
             self._turn_productive_calls = getattr(self, '_turn_productive_calls', 0) + 1
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -500,16 +531,28 @@ class ToolCallGuardrailController:
         previous = self._no_progress.get(signature)
         repeat_count = previous[1] + 1 if previous is not None and previous[0] == result_hash else 1
         self._no_progress[signature] = (result_hash, repeat_count)
-        if repeat_count == 1:
+        cross_map = getattr(self, "_cross_compaction_no_progress", None)
+        if not isinstance(cross_map, dict):
+            cross_map = {}
+            self._cross_compaction_no_progress = cross_map
+        prev_cross = cross_map.get(signature)
+        cross_count = prev_cross[1] + 1 if prev_cross is not None and prev_cross[0] == result_hash else 1
+        cross_map[signature] = (result_hash, cross_count)
+        effective_repeat = repeat_count
+        if getattr(self, "_compaction_epoch", 0) > 0 and cross_count >= 3:
+            effective_repeat = max(repeat_count, cross_count)
+        self._last_idempotent_repeat_count = effective_repeat
+        if repeat_count == 1 and effective_repeat < 3:
             self._turn_productive_calls = getattr(self, '_turn_productive_calls', 0) + 1
-        if warnings and repeat_count >= self.config.no_progress_warn_after:
-            return self._decide("warn", "idempotent_no_progress_warning", tool_name, repeat_count, signature)
-        return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
+        if warnings and effective_repeat >= self.config.no_progress_warn_after:
+            return self._decide("warn", "idempotent_no_progress_warning", tool_name, effective_repeat, signature)
+        return ToolGuardrailDecision(tool_name=tool_name, count=effective_repeat, signature=signature)
 
     def is_making_productive_progress(self) -> bool:
         """True when this turn has executed productive calls without active failure/stall streaks."""
         exact_warn = getattr(self.config, "exact_failure_warn_after", 2)
         same_warn = getattr(self.config, "same_tool_failure_warn_after", 3)
+        no_prog_warn = getattr(self.config, "no_progress_warn_after", 2)
         active_exact_streak = any(
             count >= exact_warn
             and sig.tool_name in self._same_tool_failure_counts
@@ -520,6 +563,7 @@ class ToolCallGuardrailController:
             self._halt_decision is None
             and getattr(self, '_turn_productive_calls', 0) > 0
             and getattr(self, '_consecutive_failure_count', 0) == 0
+            and getattr(self, '_last_idempotent_repeat_count', 0) < no_prog_warn
             and not active_exact_streak
             and getattr(self, '_auth_wall_failure_count', 0) == 0
             and self._identical_streak_count < STALL_GUARD_IDENTICAL_CALL_THRESHOLD

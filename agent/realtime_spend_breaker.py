@@ -103,6 +103,38 @@ TIER1_NON_INTERACTIVE_CACHE_RESET_MIN_EUR = 2.50
 
 TIER1_STALLED_DESKTOP_MIN_CALLS = 35
 TIER1_STALLED_DESKTOP_15M_CAP_EUR = 6.00
+TIER1_RUNAWAY_DESKTOP_TURN_MAX_CALLS = 90
+TIER1_RUNAWAY_DESKTOP_15M_CAP_EUR = 10.00
+
+_SESSION_PARENT_MAP: dict[str, str] = {}
+
+
+def record_session_parent(child_session_id: str, parent_session_id: str) -> None:
+    if child_session_id and parent_session_id and child_session_id != parent_session_id:
+        _SESSION_PARENT_MAP[child_session_id] = parent_session_id
+
+
+def _resolve_lineage_session_ids(
+    session_id: str,
+    parent_session_id: str = "",
+    lineage_session_ids: tuple[str, ...] | list[str] | set[str] = (),
+    max_depth: int = 16,
+) -> tuple[str, ...]:
+    if parent_session_id and session_id and session_id != parent_session_id:
+        _SESSION_PARENT_MAP[session_id] = parent_session_id
+    sids: list[str] = [session_id] if session_id else []
+    seen = set(sids)
+    cur_sid = parent_session_id or _SESSION_PARENT_MAP.get(session_id, "")
+    while cur_sid and cur_sid not in seen and len(sids) < max_depth:
+        sids.append(cur_sid)
+        seen.add(cur_sid)
+        cur_sid = _SESSION_PARENT_MAP.get(cur_sid, "")
+    for extra in lineage_session_ids or ():
+        es = str(extra or "").strip()
+        if es and es not in seen and len(sids) < max_depth:
+            sids.append(es)
+            seen.add(es)
+    return tuple(sids) or (session_id,)
 
 TIER0_CRITICAL_CRON_15M_SAFETY_CAP_EUR = 12.00
 
@@ -189,6 +221,39 @@ def _emergency_brake_flag_path() -> Path:
     if env_p:
         return Path(env_p)
     return Path.home() / ".hermes" / "state" / "ai-emergency-brake-override.flag"
+
+
+def _budget_cap_path() -> Path:
+    env_p = os.environ.get("HERMES_AI_BUDGET_CAP_PATH")
+    if env_p:
+        return Path(env_p)
+    return Path.home() / ".hermes" / "state" / "ai-budget-cap.json"
+
+
+def get_active_budget_cap(now: float | None = None) -> dict[str, Any] | None:
+    ts_now = float(now if now is not None else time.time())
+    try:
+        cpath = _budget_cap_path()
+        if not cpath.exists():
+            return None
+        data = json.loads(cpath.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not data.get("active", True):
+            return None
+        exp = float(data.get("expires_at") or (float(data.get("ts") or 0.0) + 4 * 3600.0))
+        if exp > 0 and ts_now >= exp:
+            return None
+        cap_usd_hr = float(data.get("cap_usd_hr") or data.get("cap_usd") or 15.0)
+        cap_eur_hr = float(data.get("cap_eur_hr") or round(cap_usd_hr * 0.90, 2))
+        cap_eur_15m = float(data.get("cap_eur_15m") or round(cap_eur_hr / 4.0, 2))
+        return {
+            "cap_usd_hr": cap_usd_hr,
+            "cap_eur_hr": cap_eur_hr,
+            "cap_eur_15m": cap_eur_15m,
+            "expires_at": exp,
+            "operator": str(data.get("operator") or "ui"),
+        }
+    except Exception:
+        return None
 
 
 def is_manual_emergency_brake_active() -> bool:
@@ -755,6 +820,7 @@ def evaluate_realtime_spend_breaker(
     consecutive_calls_since_user: int = 0,
     parent_session_id: str = "",
     parent_source: str = "",
+    lineage_session_ids: tuple[str, ...] | list[str] | set[str] = (),
     now: float | None = None,
 ) -> dict[str, Any]:
     ts_now = float(now if now is not None else time.time())
@@ -771,89 +837,52 @@ def evaluate_realtime_spend_breaker(
     )
     is_tier0 = is_tier0_critical_cron(job_name, session_id)
     family_job_tag = f"parent:{p_sid}" if (src == "subagent" and p_sid) else ""
+    all_lineage_sids = _resolve_lineage_session_ids(session_id, p_sid, lineage_session_ids)
+    spend_sids = (session_id,) if is_interactive_subagent else all_lineage_sids
 
     try:
         con = _connect()
         try:
             cur = con.cursor()
-            # 1) Check explicit quarantine table (including parent lineage for subagents / compression rotation)
-            if p_sid:
-                cur.execute(
-                    "SELECT reason, net_eur_window FROM quarantined_sessions WHERE session_id IN (?, ?) AND expires_at > ? ORDER BY expires_at DESC LIMIT 1",
-                    (session_id, p_sid, ts_now),
-                )
-            else:
-                cur.execute(
-                    "SELECT reason, net_eur_window FROM quarantined_sessions WHERE session_id = ? AND expires_at > ?",
-                    (session_id, ts_now),
-                )
+            # 1) Check explicit quarantine table (including full parent/compaction lineage)
+            q_placeholders = ",".join("?" for _ in all_lineage_sids)
+            cur.execute(
+                f"SELECT reason, net_eur_window FROM quarantined_sessions WHERE session_id IN ({q_placeholders}) AND expires_at > ? ORDER BY expires_at DESC LIMIT 1",
+                (*all_lineage_sids, ts_now),
+            )
             q_row = cur.fetchone()
-            if q_row is not None:
-                if not is_interactive or not making_productive_progress:
-                    return {
-                        "allowed": False,
-                        "reason": f"quarantined:{q_row[0]}",
-                        "session_net_eur_15m": float(q_row[1]),
-                    }
-
-            # 2) Per-session (and subagent-family / compression-rotation parent) 15m and 1h spend + cache resets
-            if family_job_tag and not is_interactive_subagent:
+            # 2) Per-session (and subagent-family / compression-rotation lineage) 15m and 1h spend + cache resets
+            s_placeholders = ",".join("?" for _ in spend_sids)
+            if family_job_tag:
                 cur.execute(
-                    """
+                    f"""
                     SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
                     FROM llm_call_ledger
-                    WHERE (session_id IN (?, ?) OR job_name = ?) AND ts >= ?
+                    WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND ts >= ?
                     """,
-                    (session_id, p_sid, family_job_tag, ts_now - 900.0),
-                )
-            elif family_job_tag:
-                cur.execute(
-                    """
-                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
-                    FROM llm_call_ledger
-                    WHERE (session_id = ? OR job_name = ?) AND ts >= ?
-                    """,
-                    (session_id, family_job_tag, ts_now - 900.0),
-                )
-            elif p_sid:
-                cur.execute(
-                    """
-                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
-                    FROM llm_call_ledger WHERE session_id IN (?, ?) AND ts >= ?
-                    """,
-                    (session_id, p_sid, ts_now - 900.0),
+                    (*spend_sids, family_job_tag, ts_now - 900.0),
                 )
             else:
                 cur.execute(
-                    """
+                    f"""
                     SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
-                    FROM llm_call_ledger WHERE session_id = ? AND ts >= ?
+                    FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND ts >= ?
                     """,
-                    (session_id, ts_now - 900.0),
+                    (*spend_sids, ts_now - 900.0),
                 )
             s_eur_15m, s_resets_15m = cur.fetchone()
             s_eur_15m = float(s_eur_15m or 0.0)
             s_resets_15m = int(s_resets_15m or 0)
 
-            if family_job_tag and not is_interactive_subagent:
+            if family_job_tag:
                 cur.execute(
-                    "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE (session_id IN (?, ?) OR job_name = ?) AND ts >= ?",
-                    (session_id, p_sid, family_job_tag, ts_now - 3600.0),
-                )
-            elif family_job_tag:
-                cur.execute(
-                    "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE (session_id = ? OR job_name = ?) AND ts >= ?",
-                    (session_id, family_job_tag, ts_now - 3600.0),
-                )
-            elif p_sid:
-                cur.execute(
-                    "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE session_id IN (?, ?) AND ts >= ?",
-                    (session_id, p_sid, ts_now - 3600.0),
+                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND ts >= ?",
+                    (*spend_sids, family_job_tag, ts_now - 3600.0),
                 )
             else:
                 cur.execute(
-                    "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE session_id = ? AND ts >= ?",
-                    (session_id, ts_now - 3600.0),
+                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND ts >= ?",
+                    (*spend_sids, ts_now - 3600.0),
                 )
             s_eur_1h = float(cur.fetchone()[0] or 0.0)
 
@@ -887,6 +916,60 @@ def evaluate_realtime_spend_breaker(
         logger.debug("evaluate_realtime_spend_breaker failed open: %s", exc)
         return {"allowed": True, "reason": "fail_open_db_error"}
 
+    # 0A) Explicit UI Quarantine / Pause / Throttle & Active Quarantine Check
+    if q_row is not None:
+        q_reason = str(q_row[0] or "")
+        q_net_eur = float(q_row[1] or 0.0)
+        if q_reason.startswith("manual_ui_pause:") or "Pausad manuellt" in q_reason:
+            return {
+                "allowed": False,
+                "reason": f"quarantined:{q_reason}",
+                "session_net_eur_15m": max(s_eur_15m, q_net_eur),
+            }
+        if q_reason.startswith("manual_ui_throttle:") or "Strypt manuellt" in q_reason:
+            if s_eur_15m >= 1.50 or s_eur_1h >= 4.00 or s_resets_15m >= 1:
+                return {
+                    "allowed": False,
+                    "reason": f"throttled:{q_reason} (€{s_eur_15m:.2f}/15m, €{s_eur_1h:.2f}/1h)",
+                    "session_net_eur_15m": s_eur_15m,
+                }
+        elif not is_interactive or not making_productive_progress:
+            return {
+                "allowed": False,
+                "reason": f"quarantined:{q_reason}",
+                "session_net_eur_15m": max(s_eur_15m, q_net_eur),
+            }
+
+    # 0B) Manual UI Hourly Spend Cap (e.g. $15/h -> €13.50/h -> €3.38/15m via ai-budget-cap.json)
+    active_cap = get_active_budget_cap(ts_now)
+    if active_cap is not None and not is_tier0:
+        cap_15m_eur = float(active_cap["cap_eur_15m"])
+        cap_usd_hr = float(active_cap["cap_usd_hr"])
+        if not is_interactive:
+            if estate_15m >= cap_15m_eur:
+                return {
+                    "allowed": False,
+                    "reason": (
+                        f"manual_budget_cap_15m (estate €{estate_15m:.2f} >= €{cap_15m_eur:.2f} "
+                        f"under ${cap_usd_hr:.0f}/h UI cap)"
+                    ),
+                    "session_net_eur_15m": s_eur_15m,
+                    "estate_net_eur_15m": estate_15m,
+                }
+        elif (
+            int(consecutive_calls_since_user or 0) >= 6
+            and s_eur_15m >= max(2.00, round(cap_15m_eur * 0.75, 2))
+        ):
+            return {
+                "allowed": False,
+                "reason": (
+                    f"manual_budget_cap_interactive_throttle (calls={consecutive_calls_since_user}, "
+                    f"session €{s_eur_15m:.2f}/15m under ${cap_usd_hr:.0f}/h UI cap)"
+                ),
+                "session_net_eur_15m": s_eur_15m,
+                "estate_net_eur_15m": estate_15m,
+            }
+
     # Tier 1A: Non-interactive per-session (and subagent-family) runaway breaker
     if not is_interactive:
         cap_15m = TIER0_CRITICAL_CRON_15M_SAFETY_CAP_EUR if is_tier0 else TIER1_NON_INTERACTIVE_15M_CAP_EUR
@@ -913,7 +996,7 @@ def evaluate_realtime_spend_breaker(
                 quarantine_session(p_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
 
-    # Tier 1B: Progress-aware Desktop stalled loop breaker
+    # Tier 1B: Progress-aware Desktop stalled loop breaker + hard single-turn runaway ceiling
     if is_interactive:
         if (
             not making_productive_progress
@@ -923,6 +1006,16 @@ def evaluate_realtime_spend_breaker(
             reason = (
                 f"tier1_stalled_desktop_loop (calls={consecutive_calls_since_user}, "
                 f"€{s_eur_15m:.2f} in 15m with no productive progress)"
+            )
+            quarantine_session(session_id, reason, s_eur_15m, ttl_s=900.0, now=ts_now)
+            return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
+        if (
+            consecutive_calls_since_user >= TIER1_RUNAWAY_DESKTOP_TURN_MAX_CALLS
+            and s_eur_15m >= TIER1_RUNAWAY_DESKTOP_15M_CAP_EUR
+        ):
+            reason = (
+                f"tier1_runaway_autonomous_turn (calls={consecutive_calls_since_user} without user input, "
+                f"€{s_eur_15m:.2f} in 15m)"
             )
             quarantine_session(session_id, reason, s_eur_15m, ttl_s=900.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
