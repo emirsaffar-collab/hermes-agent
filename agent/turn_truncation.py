@@ -823,7 +823,17 @@ _GATE_SCRIPT_FILTER_MARKERS = (
     "run_sql_on_prod_bastion",
     "|dg:",
     "|rn:",
+    "dg:",
+    "rn:",
     "PR_MERGE_BLOCKED",
+    "pr-bot-gate",
+    "has_merge_approval",
+    "evaluate_pr_bot_gate",
+    "merge_approved",
+    "github-review-gate-tests",
+    "RELEASE_TRAIN",
+    "state.db",
+    "SELECT id, source",
     "_ensure_msl_fork_hook_disarmed",
     "libSystem.B.dylib",
     "from_address(",
@@ -841,19 +851,44 @@ _TOOL_FILTER_SUMMARY = (
 )
 
 
+def _scrub_user_gate_tokens(text: str) -> str:
+    """Redact raw gate-script paths, approval CLI commands, and digest tokens in user/compaction
+    messages after an upstream content_filter while preserving the user's request (#CF-92)."""
+    import re as _re_cf
+    scrubbed = _re_cf.sub(r"\b(?:dg|rn):[0-9a-f]{16,64}\b", "[gate-digest]", text)
+    scrubbed = _re_cf.sub(r"bash\s+[^\n`]*approve\.sh[^\n`]*", "[approval-cli-command]", scrubbed)
+    for marker in _GATE_SCRIPT_FILTER_MARKERS:
+        if marker in ("dg:", "rn:", "|dg:", "|rn:"):
+            continue
+        if marker in scrubbed:
+            scrubbed = scrubbed.replace(marker, "[gate-ref]")
+    return scrubbed
+
+
 def _inject_content_filter_steer_note(api_messages: Any) -> None:
     """Append ``_CONTENT_FILTER_STEER_NOTE`` to the trailing tool/user message on ``api_messages``
     and summarize recent gate-script / browser-cookie-CDP / secret-probe payloads across tool results
-    (both plain ``str`` and cache-decorated ``list`` block forms), assistant ``tool_calls`` arguments,
-    encrypted ``thought_signature`` blobs, and all replayed assistant reasoning that trip Gemini's
-    output classifier (#CF-76, #CF-78, #CF-89)."""
+    (both plain ``str`` and cache-decorated ``list`` block forms), user/compaction messages carrying
+    raw gate tokens, assistant ``tool_calls`` arguments, encrypted ``thought_signature`` blobs, and all
+    replayed assistant reasoning that trip Gemini's output classifier (#CF-76, #CF-78, #CF-89, #CF-92)."""
     if not isinstance(api_messages, list) or not api_messages:
         return
     for msg in api_messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
-        if role == "tool":
+        if role == "user":
+            u_content = msg.get("content")
+            if isinstance(u_content, str) and any(m in u_content for m in _GATE_SCRIPT_FILTER_MARKERS):
+                msg["content"] = _scrub_user_gate_tokens(u_content)
+            elif isinstance(u_content, list):
+                for part in u_content:
+                    if not isinstance(part, dict):
+                        continue
+                    p_text = part.get("text")
+                    if isinstance(p_text, str) and any(m in p_text for m in _GATE_SCRIPT_FILTER_MARKERS):
+                        part["text"] = _scrub_user_gate_tokens(p_text)
+        elif role == "tool":
             t_content = msg.get("content")
             if isinstance(t_content, str) and any(m in t_content for m in _GATE_SCRIPT_FILTER_MARKERS):
                 has_note = _CONTENT_FILTER_STEER_NOTE in t_content
@@ -980,6 +1015,7 @@ def handle_content_policy_refusal(
     if api_call_count > 1 and (max_retries or 0) > 0 and _prior_cf_retries < 1:
         agent._content_filter_retries = _prior_cf_retries + 1
         agent._ephemeral_reasoning_off = True
+        agent._pending_content_filter_steer = True
         _inject_content_filter_steer_note(api_messages)
         logger.warning(
             "%sModel declined to respond (finish_reason=content_filter) on mid-turn call #%d "

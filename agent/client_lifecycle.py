@@ -75,6 +75,9 @@ def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb
     # The SDK exposes an empty/stale api_key when a rotating source is installed.
     key_provider = vars(fb_client).get("_api_key_provider")
     credential = key_provider if callable(key_provider) else fb_client.api_key
+    # Clear Vertex dynamic regional routing state so fallback logs and _should_skip_fallback_candidate
+    # never attribute the old Vertex URL to the fallback provider (#CF-92).
+    agent._last_routed_base_url = None
     if fb_api_mode == "anthropic_messages":
         from agent.anthropic_adapter import build_anthropic_client
         from agent.anthropic_credentials import native_anthropic_fallback_token, anthropic_route_is_oauth

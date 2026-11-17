@@ -135,6 +135,7 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
         _apply_primary_runtime_fields, _rebuild_primary_client, _restore_runtime_capabilities,
     )
     _apply_primary_runtime_fields(agent, rt)
+    agent._last_routed_base_url = None
     from agent.route_verdicts import reset_route_verdicts
     reset_route_verdicts(agent)
     _restore_runtime_capabilities(agent, rt)

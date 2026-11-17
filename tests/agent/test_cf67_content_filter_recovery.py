@@ -942,3 +942,95 @@ def test_cf89_thought_signature_commentary_and_reasoning_leak_two_way_polarity(m
     assert "**Executing Hot Reload**" in caplog.text
 
 
+def test_cf92_same_route_continue_sets_pending_steer_and_clears_vertex_routed_url():
+    """#CF-92 two-way polarity:
+    1. Same-route mid-turn content_filter retry (action='continue') MUST set agent._pending_content_filter_steer=True
+       so assemble_api_request re-injects _inject_content_filter_steer_note when rebuilding api_messages on the next
+       retry-loop iteration.
+    2. _inject_content_filter_steer_note scrubs pr-bot-gate / state.db / RELEASE_TRAIN tool & assistant payloads and
+       redacts raw dg:/rn:/approve.sh tokens inside user/compaction messages while preserving the user's request text.
+    3. _swap_fallback_clients clears agent._last_routed_base_url so fallback from Vertex to OpenRouter never logs or
+       compares against the stale Vertex URL.
+    """
+    import agent.turn_truncation as tt
+    from agent.client_lifecycle import _swap_fallback_clients
+
+    ag = _make_mock_agent(has_fallback=True)
+    ag._pending_content_filter_steer = False
+    msgs = [
+        {
+            "role": "user",
+            "content": (
+                "3. What I Have NOT Verified\n"
+                "[needs-human: merge:SaffarIT/API:#5405] SaffarIT/API#5405 post-merge into dev "
+                "(merge:SaffarIT/API:#5405, dg:d03251a28e59ff52b29687477fb4be64e1206fa68188ffcce34b393cdbd2673c) "
+                "until bash ~/.hermes/hooks-hermes/approve.sh 'merge:SaffarIT/API:#5405' is run."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "c_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "patch",
+                        "arguments": '{"path":"/Users/test/.hermes/scripts/pr-bot-gate.py","new_string":"def has_merge_approval"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c_patch",
+            "content": '{"diff": "--- a/pr-bot-gate.py\\n+++ b/pr-bot-gate.py\\n+SELECT id, source FROM sessions"}',
+        },
+        {"role": "user", "content": "Plain user follow-up with no gate tokens."},
+    ]
+    api_msgs = [dict(m) for m in msgs]
+    v1 = handle_content_policy_refusal(
+        ag,
+        _chat_refusal_response(),
+        TurnRetryState(),
+        thinking_spinner=None,
+        messages=msgs,
+        api_messages=api_msgs,
+        api_kwargs={},
+        active_system_prompt="sys",
+        conversation_history=list(msgs),
+        api_call_count=26,
+        effective_task_id="t1",
+        turn_id="u1",
+        api_request_id="r1",
+        api_start_time=0.0,
+        retry_count=0,
+        max_retries=3,
+        current_turn_user_idx=0,
+    )
+    assert v1.action == "continue"
+    assert ag._pending_content_filter_steer is True
+
+    # Simulate assemble_api_request rebuilding api_messages from msgs on the 'continue' retry:
+    rebuilt = [dict(m) for m in msgs]
+    tt._inject_content_filter_steer_note(rebuilt)
+    # Positive polarity: user message retains [needs-human: merge:SaffarIT/API:#5405] but drops raw dg: and approve.sh CLI
+    assert "[needs-human: merge:SaffarIT/API:#5405]" in rebuilt[0]["content"]
+    assert "dg:d03251a28e59ff52b29687477fb4be64e1206fa68188ffcce34b393cdbd2673c" not in rebuilt[0]["content"]
+    assert "approve.sh" not in rebuilt[0]["content"]
+    assert "pr-bot-gate" not in rebuilt[1]["tool_calls"][0]["function"]["arguments"]
+    assert "SELECT id, source" not in rebuilt[2]["content"]
+    assert "summarized after upstream content_filter" in rebuilt[2]["content"]
+    # Negative polarity: plain user message preserved (with trailing steer note appended on last message)
+    assert rebuilt[3]["content"].startswith("Plain user follow-up with no gate tokens.")
+    assert tt._CONTENT_FILTER_STEER_NOTE in rebuilt[3]["content"]
+
+    # _swap_fallback_clients clears _last_routed_base_url:
+    ag._last_routed_base_url = "https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi"
+    fb_client = SimpleNamespace(api_key="or-key", base_url="https://openrouter.ai/api/v1", _custom_headers={"HTTP-Referer": "https://nousresearch.com"})
+    _swap_fallback_clients(ag, fb_client, "openrouter", "google/gemini-4-argon", "https://openrouter.ai/api/v1", "chat_completions")
+    assert ag._last_routed_base_url is None
+    assert ag._client_kwargs["base_url"] == "https://openrouter.ai/api/v1"
+
+
+
