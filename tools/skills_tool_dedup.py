@@ -21,7 +21,8 @@ _skill_view_epoch_history: dict[str, dict[tuple, tuple[str, int, str]]] = (
 )
 _skill_view_tracker_lock = globals().get("_skill_view_tracker_lock") or threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
-_SKILL_VIEW_CROSS_EPOCH_FULL_LOAD_LIMIT = 2
+import os as _os_svd
+_SKILL_VIEW_CROSS_EPOCH_FULL_LOAD_LIMIT = int(_os_svd.environ.get("HERMES_SKILL_VIEW_CROSS_EPOCH_LIMIT", "2") or 2)
 
 _SKILL_VIEW_DEDUP_MESSAGE = (
     "Skill content unchanged since it was loaded earlier in this "

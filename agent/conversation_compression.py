@@ -1652,13 +1652,8 @@ def _adopt_live_compression_child(
     if parent_session_id:
         _rot_hist.add(parent_session_id)
     with contextlib.suppress(Exception):
-        from agent.vertex_adapter import (
-            EUROPE_WEST2_VERTEX_REGION,
-            _record_session_vertex_region_affinity,
-            reset_vertex_sticky_region,
-        )
-        reset_vertex_sticky_region(parent_session_id)
-        _record_session_vertex_region_affinity(child_session_id, EUROPE_WEST2_VERTEX_REGION)
+        from agent.vertex_adapter import migrate_vertex_sticky_region
+        migrate_vertex_sticky_region(parent_session_id, child_session_id)
     with contextlib.suppress(Exception):
         from tools.file_tools import migrate_file_ops_state
         from tools.skills_tool_dedup import migrate_skill_view_state
@@ -3451,13 +3446,8 @@ def _publish_rotated_compaction(
         _cc_rot.threshold_tokens = int(_cc_rot._force_rotate_restore_threshold)
         _cc_rot._force_rotate_restore_threshold = 0
     with contextlib.suppress(Exception):
-        from agent.vertex_adapter import (
-            EUROPE_WEST2_VERTEX_REGION,
-            _record_session_vertex_region_affinity,
-            reset_vertex_sticky_region,
-        )
-        reset_vertex_sticky_region(old_session_id)
-        _record_session_vertex_region_affinity(new_session_id, EUROPE_WEST2_VERTEX_REGION)
+        from agent.vertex_adapter import migrate_vertex_sticky_region
+        migrate_vertex_sticky_region(old_session_id, new_session_id)
     agent._db_flush_scan_prefix = None
     _rebind_session_context(agent.session_id)
     agent._session_db_created = True
@@ -3491,7 +3481,7 @@ def _warn_summary_or_aux_fallback(agent: Any) -> None:
 
 
 def _reset_read_dedup_caches(
-    task_id: str, *, session_id: str = "", surviving_messages: Optional[list] = None
+    task_id: str, *, session_id: str = "", old_session_id: Optional[str] = None, surviving_messages: Optional[list] = None
 ) -> None:
     """Advance the file-read and skill_view repeat-read dedup to a fresh generation after a boundary.
     The mtime map is kept: the first read of each unchanged key returns full content compaction may have
@@ -3500,9 +3490,12 @@ def _reset_read_dedup_caches(
     """
     with contextlib.suppress(Exception):
         from tools.file_tools_read_tracking import migrate_file_read_state, reset_file_dedup
-        reset_file_dedup(task_id, surviving_messages=surviving_messages)
+        if old_session_id and session_id and old_session_id != session_id:
+            migrate_file_read_state(old_session_id, session_id)
         if session_id and session_id != task_id:
             migrate_file_read_state(task_id, session_id)
+        reset_file_dedup(task_id, surviving_messages=surviving_messages)
+        if session_id and session_id != task_id:
             reset_file_dedup(session_id, surviving_messages=surviving_messages)
     if session_id:
         with contextlib.suppress(Exception):
@@ -3514,9 +3507,12 @@ def _reset_read_dedup_caches(
     with contextlib.suppress(Exception):
         from tools.skills_tool import reset_skill_view_dedup
         from tools.skills_tool_dedup import migrate_skill_view_state
-        reset_skill_view_dedup(task_id, surviving_messages=surviving_messages)
+        if old_session_id and session_id and old_session_id != session_id:
+            migrate_skill_view_state(old_session_id, session_id)
         if session_id and session_id != task_id:
             migrate_skill_view_state(task_id, session_id)
+        reset_skill_view_dedup(task_id, surviving_messages=surviving_messages)
+        if session_id and session_id != task_id:
             reset_skill_view_dedup(session_id, surviving_messages=surviving_messages)
 
 
@@ -3610,7 +3606,7 @@ def _finish_compaction_boundary(
         else:
             compressor._verify_compaction_cleared_threshold = True
     _reset_read_dedup_caches(
-        task_id, session_id=agent.session_id or "", surviving_messages=compressed
+        task_id, session_id=agent.session_id or "", old_session_id=_old_sid, surviving_messages=compressed
     )
     _guardrails = getattr(agent, "_tool_guardrails", None)
     if callable(_reset_guardrails := getattr(_guardrails, "reset_after_compaction", None)):
