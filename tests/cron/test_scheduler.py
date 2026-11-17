@@ -445,7 +445,7 @@ class TestDeliverResultWrapping:
             patch("gateway.config.load_gateway_config", return_value=config),
             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
-            patch("tools.send_message_tool._send_to_platform", new=standalone_send),
+            patch("gateway.outbound.send._send_to_platform", new=standalone_send),
         ):
             result = _deliver_result(
                 job,
@@ -1827,7 +1827,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         standalone_send = AsyncMock(return_value={"success": True})
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+             patch("gateway.outbound.send._send_to_platform", new=standalone_send):
             result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
         return result, standalone_send
 
@@ -1901,7 +1901,7 @@ class TestDeliverResultPartialSplitDelivery:
         try:
             with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
                  patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-                 patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+                 patch("gateway.outbound.send._send_to_platform", new=standalone_send):
                 result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
         finally:
             loop.call_soon_threadsafe(loop.stop)
@@ -1956,7 +1956,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
-             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+             patch("gateway.outbound.send._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -2250,7 +2250,7 @@ class TestCronDeliveryMirror:
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.outbound.send._send_to_platform", new=AsyncMock(return_value={"success": True})), \
              patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
             job = {
                 "id": "test-job",
