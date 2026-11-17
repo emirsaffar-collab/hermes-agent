@@ -46,9 +46,10 @@ VERTEX_ARGON_LIST_OUT_EUR_PER_M = 17.962000
 ARGON_PROMO_EXPIRY_EPOCH_UTC = 1796112000.0  # 2026-12-01T08:00:00Z (2026-11-30 23:59:59 PT)
 
 # Regional europe-west2 SKUs (A891-E7A5-FDA5, F61C-57E6-DBE0, EA0E-13A1-6B07) carry 1.10x multiplier
+# Verified via bipartite KV-cache sharing graph on llm_call_ledger (7bQP/7PIP are global; l-oP is ew2)
 VERTEX_EU_WEST2_REGIONAL_MULTIPLIER = 1.10
 _EU_WEST2_MACRO_CLUSTERS: frozenset[str] = frozenset(
-    {"0L8P", "9_oP", "6-wP", "6_gP", "08QP", "4ATb", "7bQP", "7PIP", "9wMP"}
+    {"0L8P", "9_oP", "6-wP", "6_gP", "08QP", "4ATb", "l-oP", "9wMP"}
 )
 
 # Global Flash SKUs: 2A35-AC68-14D6 (in), 8658-6939-8BEC (cache), 90FD-DC5F-DC55 (out)

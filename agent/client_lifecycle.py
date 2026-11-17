@@ -489,14 +489,22 @@ class ClientLifecycleMixin:
                 is_vertex_global_only_model,
                 parse_vertex_base_url,
             )
+            import os as _os_cl
             raw_base_url = str(request_kwargs.get("base_url") or getattr(self, "base_url", "") or "")
             req_model = (api_kwargs or {}).get("model") or getattr(self, "model", None)
+            _plat_str = str(getattr(self, "platform", "") or "").strip().lower()
+            _sid_str = str(getattr(self, "session_id", "") or "")
             is_interactive = (
                 getattr(self, "_write_origin", None) != "background_review"
                 and getattr(self, "_memory_write_origin", None) != "background_review"
                 and getattr(self, "_turn_origin", None) != "background_review"
-                and ":bg-review:" not in str(getattr(self, "session_id", "") or "")
-                and getattr(self, "platform", None) != "cron"
+                and ":bg-review:" not in _sid_str
+                and _plat_str not in ("cron", "subagent")
+                and int(getattr(self, "_delegate_depth", 0) or 0) <= 0
+                and not bool(getattr(self, "cron_job_name", None))
+                and not _sid_str.startswith("cron_")
+                and not bool(_os_cl.environ.get("HERMES_CRON_JOB_ID") or _os_cl.environ.get("HERMES_CRON_JOB_NAME"))
+                and str(_os_cl.environ.get("HERMES_SESSION_SOURCE", "") or "").strip().lower() != "cron"
             )
             parsed_vertex = parse_vertex_base_url(raw_base_url)
             if parsed_vertex is not None:

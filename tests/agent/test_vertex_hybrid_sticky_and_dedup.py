@@ -371,3 +371,29 @@ def test_turn1_interactive_session_waits_for_europe_west2_slot():
         vertex_adapter.reset_vertex_hybrid_router_state()
 
 
+def test_eu_west2_macro_clusters_and_guardrail_reset_after_compaction():
+    from agent import realtime_spend_breaker as rsb
+    from agent.tool_guardrails import ToolCallGuardrailController, ToolCallSignature
+
+    assert "0L8P" in rsb._EU_WEST2_MACRO_CLUSTERS
+    assert "l-oP" in rsb._EU_WEST2_MACRO_CLUSTERS
+    assert "7bQP" not in rsb._EU_WEST2_MACRO_CLUSTERS
+    assert "7PIP" not in rsb._EU_WEST2_MACRO_CLUSTERS
+    assert vertex_adapter.EUROPE_WEST2_INITIAL_WAIT_SECONDS == 8.0
+    assert vertex_adapter.EUROPE_WEST2_STICKY_WAIT_SECONDS == 15.0
+    assert vertex_adapter.EUROPE_WEST2_DEEP_EPOCH_WAIT_SECONDS == 30.0
+
+    ctrl = ToolCallGuardrailController()
+    sig = ToolCallSignature("search_files", '{"pattern":"foo"}')
+    ctrl._no_progress[sig] = ("hash1", 5)
+    ctrl._identical_streak_sig = sig
+    ctrl._identical_streak_count = 5
+    ctrl._call_history.append((sig, "hash1", False))
+    ctrl.reset_after_compaction()
+    assert len(ctrl._no_progress) == 0
+    assert ctrl._identical_streak_sig is None
+    assert ctrl._identical_streak_count == 0
+    assert len(ctrl._call_history) == 0
+
+
+
