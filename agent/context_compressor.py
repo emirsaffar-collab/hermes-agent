@@ -482,6 +482,7 @@ def _strip_persistence_markers(messages: list[dict[str, Any]]) -> None:
         if isinstance(msg, dict):
             msg.pop(_DB_PERSISTED_MARKER, None)
             msg.pop("_anchor_urls", None)
+            msg.pop("_anchor_tokens", None)
 
 
 _prev_stale_held_history = globals().get("StaleHeldHistory")
@@ -1161,35 +1162,86 @@ _SUMMARY_PAREN_ID_SUFFIX_RE = re.compile(
 _SUMMARY_LABELED_ID_RE = re.compile(
     r"(?i)\b(id|kf_id|repnr|repnrid|butik|butiknr|store_no|order_id|ticket_id)(\s*(?:=|:|\s)\s*`?#?)(\d{3,10})(`?)\b"
 )
+_SUMMARY_HEX_TOKEN_RE = re.compile(r"(?i)\b[0-9a-f]{7,64}\b")
+_SUMMARY_HEX40_RE = re.compile(r"(?i)(?<![0-9a-f:])\b([0-9a-f]{40})\b(?![0-9a-f])")
+_SUMMARY_LABELED_SHA_RE = re.compile(
+    r"(?i)\b(commit|merge_commit_sha|head_sha|sha)(\s*(?:=|:|\s)\s*`?)([0-9a-f]{7,40})(`?)\b"
+)
+_SUMMARY_CLOUD_RUN_REV_RE = re.compile(r"\b([a-z][a-z0-9-]+-\d{5}-[a-z0-9]{3})\b")
 
 
 def _scrub_ungrounded_summary_id_labels(summary: str, *source_texts: Optional[str]) -> str:
-    """Strip or tag explicit entity ID numbers in LLM summary prose that never appeared in the source turns."""
+    """Strip or tag explicit entity ID numbers, git commit SHAs, and Cloud Run revision IDs in LLM summary prose that never appeared in the source turns."""
     if not summary:
         return summary
-    grounded_digits: set[str] = set()
-    for src in source_texts:
-        if isinstance(src, str) and src:
-            grounded_digits.update(_SUMMARY_DIGIT_TOKEN_RE.findall(src))
-    if not grounded_digits:
+    non_empty_sources = [src for src in source_texts if isinstance(src, str) and src.strip()]
+    if not non_empty_sources:
         return summary
+    grounded_digits: set[str] = set()
+    grounded_hex: set[str] = set()
+    grounded_revs: set[str] = set()
+    for src in non_empty_sources:
+        grounded_digits.update(_SUMMARY_DIGIT_TOKEN_RE.findall(src))
+        for h in _SUMMARY_HEX_TOKEN_RE.findall(src):
+            hl = h.lower()
+            grounded_hex.add(hl)
+            if len(hl) >= 7:
+                grounded_hex.add(hl[:7])
+        for rev in _SUMMARY_CLOUD_RUN_REV_RE.findall(src):
+            grounded_revs.add(rev.lower())
 
-    def _sub_paren_suffix(m: re.Match) -> str:
-        num = m.group(1)
-        if num in grounded_digits:
+    cleaned = summary
+    if grounded_digits:
+        def _sub_paren_suffix(m: re.Match) -> str:
+            num = m.group(1)
+            if num in grounded_digits:
+                return m.group(0)
+            return "(" if m.group(0).lstrip().startswith("(") else ""
+
+        cleaned = _SUMMARY_PAREN_ID_SUFFIX_RE.sub(_sub_paren_suffix, cleaned)
+        cleaned = re.sub(r"\s*\(\s*\)", "", cleaned)
+
+        def _sub_labeled_id(m: re.Match) -> str:
+            label, sep, num, tail_bt = m.group(1), m.group(2), m.group(3), m.group(4)
+            if num in grounded_digits:
+                return m.group(0)
+            return f"{label}{sep}[UNGROUNDED_ID]{tail_bt}"
+
+        cleaned = _SUMMARY_LABELED_ID_RE.sub(_sub_labeled_id, cleaned)
+
+    def _is_grounded_sha(candidate: str) -> bool:
+        cl = candidate.lower()
+        if cl in grounded_hex or cl[:7] in grounded_hex:
+            return True
+        return any(h.startswith(cl) or cl.startswith(h) for h in grounded_hex if len(h) >= 7)
+
+    def _sub_hex40(m: re.Match) -> str:
+        tok = m.group(1)
+        if not (re.search(r"[0-9]", tok) and re.search(r"[a-fA-F]", tok)):
             return m.group(0)
-        return "(" if m.group(0).lstrip().startswith("(") else ""
-
-    cleaned = _SUMMARY_PAREN_ID_SUFFIX_RE.sub(_sub_paren_suffix, summary)
-    cleaned = re.sub(r"\s*\(\s*\)", "", cleaned)
-
-    def _sub_labeled_id(m: re.Match) -> str:
-        label, sep, num, tail_bt = m.group(1), m.group(2), m.group(3), m.group(4)
-        if num in grounded_digits:
+        if _is_grounded_sha(tok):
             return m.group(0)
-        return f"{label}{sep}[UNGROUNDED_ID]{tail_bt}"
+        return "[UNGROUNDED_SHA]"
 
-    return _SUMMARY_LABELED_ID_RE.sub(_sub_labeled_id, cleaned)
+    cleaned = _SUMMARY_HEX40_RE.sub(_sub_hex40, cleaned)
+
+    def _sub_labeled_sha(m: re.Match) -> str:
+        label, sep, sha_val, tail_bt = m.group(1), m.group(2), m.group(3), m.group(4)
+        if not re.search(r"[0-9]", sha_val):
+            return m.group(0)
+        if _is_grounded_sha(sha_val):
+            return m.group(0)
+        return f"{label}{sep}[UNGROUNDED_SHA]{tail_bt}"
+
+    cleaned = _SUMMARY_LABELED_SHA_RE.sub(_sub_labeled_sha, cleaned)
+
+    def _sub_cloud_run_rev(m: re.Match) -> str:
+        rev = m.group(1)
+        if rev.lower() in grounded_revs:
+            return m.group(0)
+        return "[UNGROUNDED_REVISION]"
+
+    return _SUMMARY_CLOUD_RUN_REV_RE.sub(_sub_cloud_run_rev, cleaned)
 
 
 def _compact_previous_summary_lists(
@@ -1401,8 +1453,9 @@ _LEAN_ANCHOR_BUDGET_CHARS = 7_000
 _ANCHOR_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
     ("PRs/issues", re.compile(r"#\d{3,6}\b"), 120),
     ("commits", re.compile(r"\b[0-9a-f]{9,40}\b"), 40),
+    ("revisions", re.compile(r"\b[a-z][a-z0-9-]+-\d{5}-[a-z0-9]{3}\b"), 30),
     ("branches", re.compile(r"\b(?:fix|feat|docs|refactor|chore|salvage|ent)/[A-Za-z0-9._/-]{3,60}"), 40),
-    ("files", re.compile(r"\b[\w./-]+/[\w.-]+\.(?:py|ts|tsx|js|rs|md|yaml|yml|json|toml|sh)\b"), 80),
+    ("files", re.compile(r"\b[\w./-]+/[\w.-]+\.(?:py|ts|tsx|js|rs|md|yaml|yml|json|toml|sh|php)\b"), 80),
     ("urls", re.compile(r"https?://[^\s)\"'\\]{10,110}"), 40),
     ("errors", re.compile(r"\b(?:[A-Z][a-zA-Z]*Error|Exception|ENOSPC|EACCES|SIGKILL|Traceback)\b[^\n]{0,90}"), 40),
     ("handles", re.compile(r"@[A-Za-z0-9-]{3,30}\b"), 40),
@@ -1417,6 +1470,7 @@ def _build_anchor_index(turns: list[dict[str, Any]]) -> str:
     contents = (
         (_typed_user_text(m["content"]) if m.get("role") == "user" and isinstance(m.get("content"), str) else (m.get("content") if isinstance(m.get("content"), str) else ""))
         + ("\n" + "\n".join(m["_anchor_urls"]) if m.get("_anchor_urls") else "")
+        + ("\n" + "\n".join(m["_anchor_tokens"]) if m.get("_anchor_tokens") else "")
         for m in turns
     )
     text = "\n".join(c for c in contents if isinstance(c, str) and c)
@@ -3761,9 +3815,23 @@ class ContextCompressor(
                 for m in re.finditer(r"https?://[^\s)\"'\\]{10,110}", content[:65536])
             ]
         ))[:10]
+        raw_tokens: list[str] = []
+        if tool_name != "skill_view":
+            _slice = content[:65536]
+            for _pat, _cap in (
+                (re.compile(r"\b[0-9a-f]{9,40}\b"), 25),
+                (re.compile(r"\b[a-z][a-z0-9-]+-\d{5}-[a-z0-9]{3}\b"), 15),
+                (re.compile(r"#\d{3,6}\b"), 20),
+                (re.compile(r"\b[\w./-]+/[\w.-]+\.(?:py|ts|tsx|js|rs|md|yaml|yml|json|toml|sh|php)\b"), 15),
+            ):
+                raw_tokens.extend(
+                    list(dict.fromkeys(m.group(0).strip().rstrip(".,;:") for m in _pat.finditer(_slice)))[:_cap]
+                )
         updated = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
         if raw_urls:
             updated["_anchor_urls"] = raw_urls
+        if raw_tokens:
+            updated["_anchor_tokens"] = list(dict.fromkeys(raw_tokens))
         result[idx] = updated
         return True
 
@@ -4438,9 +4506,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 self._render_tool_args_for_summary,
             )
             content_to_summarize = TYPED_TURNS_POINTER
+            grounding_transcript = "\n".join(records)
         else:
             typed_turns = []
             content_to_summarize = self._bound_summary_input(self._serialize_for_summary(turns_to_summarize))
+            grounding_transcript = content_to_summarize
+        anchor_grounding = "\n".join(
+            "\n".join((m.get("_anchor_urls") or []) + (m.get("_anchor_tokens") or []))
+            for m in turns_to_summarize
+            if isinstance(m, dict) and (m.get("_anchor_urls") or m.get("_anchor_tokens"))
+        )
         has_user_turn = getattr(self, "_summary_has_user_turn", None)
         if has_user_turn is None:
             has_user_turn = self._transcript_has_real_user_turn(turns_to_summarize)
@@ -4460,7 +4535,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = _scrub_ungrounded_summary_id_labels(
-                summary, content_to_summarize, self._previous_summary, memory_context, focus_topic
+                summary, grounding_transcript, anchor_grounding, self._previous_summary, memory_context, focus_topic
             )
             summary = self._augment_summary_lean(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)

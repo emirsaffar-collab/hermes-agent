@@ -117,3 +117,32 @@ class TestExtractContentOrReasoning:
         assert "`repnr 512734`" in scrubbed
         assert "`butik 612`" in scrubbed
         assert "`butik [UNGROUNDED_ID]`" in scrubbed
+
+    def test_scrub_ungrounded_summary_shas_and_cloud_run_revisions(self):
+        """Regression for 2026-11-18 RCA (msg 7836230): ungrounded 40-char git SHAs,
+        labelled commit SHAs, and Cloud Run revisions must be scrubbed while grounded ones survive."""
+        from agent.context_compressor import _scrub_ungrounded_summary_id_labels
+
+        source = (
+            "Merged SaffarIT/uop-return#58 as 3c51615c1b962bd8e2ea641f641e2bf0962caf90 "
+            "and deployed Cloud Run revision uop-returns-00034-fb6 and react-frontend-00019-s48."
+        )
+        raw_summary = (
+            "PR #58 merged as 3c51615c1b962bd8e2ea641f641e2bf0962caf90 (commit: 3c51615) "
+            "on uop-returns-00034-fb6, while PR #289 merged as f90c309f44c48972bba52efcb27bf6eb9db61e6d "
+            "(commit: cfa5d4c) and deployed uop-returns-00057-zcf / uop-returns-00049-bcx."
+        )
+        scrubbed = _scrub_ungrounded_summary_id_labels(raw_summary, source)
+
+        assert "3c51615c1b962bd8e2ea641f641e2bf0962caf90" in scrubbed
+        assert "commit: 3c51615" in scrubbed
+        assert "uop-returns-00034-fb6" in scrubbed
+
+        assert "f90c309f44c48972bba52efcb27bf6eb9db61e6d" not in scrubbed
+        assert "cfa5d4c" not in scrubbed
+        assert "uop-returns-00057-zcf" not in scrubbed
+        assert "uop-returns-00049-bcx" not in scrubbed
+        assert "[UNGROUNDED_SHA]" in scrubbed
+        assert "commit: [UNGROUNDED_SHA]" in scrubbed
+        assert "[UNGROUNDED_REVISION]" in scrubbed
+

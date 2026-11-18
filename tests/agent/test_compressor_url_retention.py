@@ -148,3 +148,45 @@ def test_collect_protected_skill_names_ignores_synthetic_compaction_rows():
 
     protected = _collect_protected_skill_names(messages, prune_boundary=len(messages) - 4)
     assert "impeccable" not in protected
+
+
+def test_demote_tool_result_preserves_anchor_tokens_for_anchor_index():
+    tool_output = (
+        "PR #289 merged as 00c494ad9603fb6438fda233164f3e4faece5885 touching "
+        "classes/POS/Repositories/ItemPriceRepository.php and deployed uop-returns-00034-fb6\n"
+        + ("line padding for prune threshold\n" * 15)
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_gh_1",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": json.dumps({"command": "gh api ..."}),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_gh_1",
+            "content": tool_output,
+        },
+    ]
+    ContextCompressor._demote_tool_result_at(
+        messages,
+        1,
+        {"call_gh_1": ("terminal", json.dumps({"command": "gh api ..."}))},
+        200,
+    )
+    assert messages[1]["content"].startswith("[terminal]")
+    assert "00c494ad9603fb6438fda233164f3e4faece5885" in messages[1].get("_anchor_tokens", [])
+    assert "uop-returns-00034-fb6" in messages[1].get("_anchor_tokens", [])
+    idx = _build_anchor_index(messages)
+    assert "00c494ad9603fb6438fda233164f3e4faece5885" in idx
+    assert "uop-returns-00034-fb6" in idx
+    assert "classes/POS/Repositories/ItemPriceRepository.php" in idx
+
