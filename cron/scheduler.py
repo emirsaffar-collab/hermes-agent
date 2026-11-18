@@ -2741,6 +2741,10 @@ def run_job(
         if _exit_reason.startswith("realtime_spend_breaker"):
             logger.warning("Job '%s' (ID: %s) suppressed by %s", job_name, job_id, _exit_reason)
             logged_response = f"{logged_response}\n\n[Suppressed by {_exit_reason}]"
+            with contextlib.suppress(Exception):
+                from cron.monitor import rollback_monitor_state
+                rollback_monitor_state(job)
+            _ping_hc_deadman_slugs(job)
         elif (
             not result.get("interrupted")
             and (result.get("completed", True) is not False or is_max_iteration_handoff(result))

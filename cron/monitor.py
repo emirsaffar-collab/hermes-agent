@@ -209,6 +209,7 @@ def check_monitor(job: dict) -> MonitorOutcome:
 
     first_run = last_hash is None
     old_output = "" if first_run else _read_last_output(job_id)
+    prev_state = dict(raw_state) if isinstance(raw_state, dict) else None
 
     shown_output = output
     if len(shown_output) > MAX_OUTPUT_CHARS:
@@ -229,8 +230,35 @@ def check_monitor(job: dict) -> MonitorOutcome:
             f"### Diff (previous → current)\n\n```diff\n{diff}\n```\n\n" + current
         )
 
+    job["_monitor_rollback"] = (prev_state, old_output, first_run)
     _persist_monitor_state(job_id, new_hash, output)
     return MonitorOutcome(ok=True, changed=True, first_run=first_run, context_block=context_block)
+
+
+def rollback_monitor_state(job: dict) -> None:
+    """Restore pre-tick monitor_state and snapshot when an LLM cron turn is suppressed
+    (e.g. by realtime_spend_breaker) so the detected diff is re-evaluated on the next tick."""
+    if not isinstance(job, dict):
+        return
+    rb = job.pop("_monitor_rollback", None)
+    if not rb:
+        return
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return
+    prev_state, old_output, first_run = rb
+    try:
+        if first_run:
+            path = _snapshot_path(job_id)
+            if path.exists():
+                path.unlink()
+        else:
+            _write_last_output(job_id, old_output)
+        from cron.jobs import update_job
+
+        update_job(job_id, {"monitor_state": prev_state})
+    except Exception as exc:
+        logger.warning("Monitor: failed to roll back state for %r: %s", job_id, exc)
 
 
 def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:

@@ -44,7 +44,9 @@ def test_tier0_prefixes_and_cron_spend_cap_silent_deferral(tmp_path, monkeypatch
     assert rsb.is_tier0_critical_cron("nw-chat-responder", "local-abc") is True
     assert rsb.is_tier0_critical_cron("chat247-responder", "local-abc") is True
     assert rsb.is_tier0_critical_cron("chat247-owner", "local-abc") is True
-    assert rsb.is_tier0_critical_cron("newintra-builder-owner", "local-abc") is True
+    assert rsb.is_tier0_critical_cron("newintra-builder-owner", "local-abc") is False
+    assert rsb.is_tier0_critical_cron("lager-builder-owner", "local-abc") is False
+    assert rsb.is_tier0_critical_cron("workos-builder-owner", "local-abc") is False
     assert rsb.is_tier0_critical_cron("morning-preemptive-audit", "local-abc") is True
     assert rsb.is_tier0_critical_cron("daily-retrospective", "local-abc") is True
     assert rsb.is_tier0_critical_cron("night-driver", "local-abc") is True
@@ -176,6 +178,11 @@ def test_manual_ha_emergency_brake_override_blocks_non_interactive_only(tmp_path
     summary = rsb.get_realtime_spend_summary()
     assert summary["manual_emergency_brake_active"] is True
     assert summary["breaker_state"] == "MANUAL_EMERGENCY_BRAKE"
+
+    brake_flag.write_text('{"ts": 1.0, "active": false}\n')
+    assert rsb.is_manual_emergency_brake_active() is False
+    brake_flag.write_text('{"ts": 1.0, "active": true}\n')
+    assert rsb.is_manual_emergency_brake_active() is True
 
     v_blocked = rsb.evaluate_realtime_spend_breaker(
         session_id="cron_normal",
@@ -793,6 +800,39 @@ def test_spend_breaker_progress_survives_compaction_and_single_diagnostic_exit(t
     )
     assert v_storm["allowed"] is False
     assert "tier1_cache_reset_storm" in v_storm["reason"]
+
+
+def test_monitor_rollback_on_spend_breaker_suppression(tmp_path, monkeypatch):
+    import cron.jobs as cjobs
+    import cron.monitor as cmon
+
+    snap_file = tmp_path / "monitor_last_output.txt"
+    saved_updates = []
+
+    monkeypatch.setattr(cmon, "_snapshot_path", lambda jid: snap_file)
+    monkeypatch.setattr(cmon, "_run_monitor_source", lambda job: (True, "line-2-changed\n"))
+    monkeypatch.setattr(cjobs, "update_job", lambda jid, patch: saved_updates.append((jid, patch)))
+
+    snap_file.write_text("line-1-old\n", encoding="utf-8")
+    old_hash = cmon.hash_monitor_output("line-1-old\n")
+    job = {
+        "id": "job_rb_1",
+        "monitor_script": "echo hi",
+        "monitor_state": {"last_output_hash": old_hash, "last_changed_at": "2026-11-18T20:00:00"},
+    }
+
+    out = cmon.check_monitor(job)
+    assert out.ok is True and out.changed is True
+    assert snap_file.read_text(encoding="utf-8") == "line-2-changed\n"
+    assert "_monitor_rollback" in job
+
+    cmon.rollback_monitor_state(job)
+    assert snap_file.read_text(encoding="utf-8") == "line-1-old\n"
+    assert saved_updates[-1] == (
+        "job_rb_1",
+        {"monitor_state": {"last_output_hash": old_hash, "last_changed_at": "2026-11-18T20:00:00"}},
+    )
+
 
 
 

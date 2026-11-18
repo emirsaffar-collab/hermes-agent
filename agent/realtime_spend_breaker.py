@@ -224,6 +224,31 @@ def _emergency_brake_flag_path() -> Path:
     return Path.home() / ".hermes" / "state" / "ai-emergency-brake-override.flag"
 
 
+def _spend_handbrake_flag_path() -> Path:
+    env_p = os.environ.get("HERMES_AI_SPEND_HANDBRAKE_FLAG_PATH")
+    if env_p:
+        return Path(env_p)
+    return Path.home() / ".hermes" / "state" / "ai-spend-handbrake.flag"
+
+
+def _is_flag_file_active(fpath: Path) -> bool:
+    try:
+        if not fpath.exists():
+            return False
+        raw = fpath.read_text(encoding="utf-8", errors="ignore").strip()
+        if not raw:
+            return False
+        if raw.lower() in ("off", "false", "0", "no"):
+            return False
+        if raw.startswith("{"):
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return bool(data.get("active", True))
+        return True
+    except Exception:
+        return False
+
+
 def _budget_cap_path() -> Path:
     env_p = os.environ.get("HERMES_AI_BUDGET_CAP_PATH")
     if env_p:
@@ -259,7 +284,11 @@ def get_active_budget_cap(now: float | None = None) -> dict[str, Any] | None:
 
 def is_manual_emergency_brake_active() -> bool:
     try:
-        return _emergency_brake_flag_path().exists()
+        if os.environ.get("HERMES_AI_EMERGENCY_BRAKE_FLAG_PATH"):
+            return _is_flag_file_active(_emergency_brake_flag_path())
+        return _is_flag_file_active(_emergency_brake_flag_path()) or _is_flag_file_active(
+            _spend_handbrake_flag_path()
+        )
     except Exception:
         return False
 
@@ -424,6 +453,8 @@ def _hc_monitored_job_names() -> frozenset[str]:
                         except Exception:
                             pass
             jname_low = str(j.get("name") or "").strip().lower()
+            if "builder-owner" in jname_low:
+                continue
             is_prefix_tier0 = bool(
                 jname_low and any(jname_low.startswith(p) or p in jname_low for p in _TIER0_CRITICAL_PREFIXES)
             )
@@ -457,6 +488,8 @@ def is_tier0_critical_cron(job_name: str | None, session_id: str | None = None) 
         low = candidate.strip().lower()
         if not low:
             continue
+        if "builder-owner" in low:
+            return False
         if low in hc_names:
             return True
         if any(low.startswith(p) or p in low for p in _TIER0_CRITICAL_PREFIXES):
