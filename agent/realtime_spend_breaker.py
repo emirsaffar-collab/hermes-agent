@@ -19,6 +19,7 @@ Enforces quality-neutral multi-tier leak stopping:
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import logging
@@ -323,6 +324,13 @@ def extract_vertex_cluster_id(request_id: str | None) -> str:
     if not request_id or not isinstance(request_id, str):
         return ""
     rid = request_id.strip()
+    if len(rid) == 22 and not rid.startswith("*"):
+        try:
+            raw = base64.urlsafe_b64decode(rid + "==")
+            if len(raw) == 16 and raw[11] != 0x0f and raw[10] == 0x0f:
+                return base64.urlsafe_b64encode(b"\x00" + raw).decode("ascii")[10:16]
+        except Exception:
+            pass
     if len(rid) >= 16:
         return rid[10:16]
     return rid[:16]

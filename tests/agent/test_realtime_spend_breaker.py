@@ -676,3 +676,15 @@ def test_compaction_storm_long_term_fixes_guardrails_budget_and_lineage(tmp_path
     assert "tier1_runaway_autonomous_turn" in v_runaway["reason"]
 
 
+def test_extract_vertex_cluster_id_aligns_22_char_borg_request_id():
+    # 23-char (17-byte, raw[11]==0x0f) Borg request_id slices rid[10:16] directly
+    assert rsb.extract_vertex_cluster_id("K3P8aqzEB_Cxg7QP5O6x-AI") == "Cxg7QP"
+    # 22-char (16-byte, raw[10]==0x0f) Borg request_id aligns byte 10 -> 11 to recover canonical TPU pod & cell
+    assert rsb.extract_vertex_cluster_id("WnX8aqJ4_7iDtA_u76WoDw") == "-4g7QP"
+    assert rsb.extract_vertex_cluster_id("tqr3apZd-q_r7A_q_abgCA") == "qv6-wP"
+    assert rsb.extract_vertex_cluster_id("s7T3ar4cgfSy0w_Oq6HpAg") == "H0stMP"
+    # 22-char 4ATb (raw[10]!=0x0f) preserves rid[10:16]
+    assert rsb.extract_vertex_cluster_id("pjb5auGeHoHW4ATbg5OYAg") == "HW4ATb"
+
+
+
