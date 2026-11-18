@@ -78,6 +78,7 @@ _STATUS_FIELDS = (
     ("leaveReason", "leave_reason", None), ("micState", "mic_state", None),
     # rtc capture telemetry
     ("rtcCapturing", "rtc_capturing", False), ("audioFragments", "audio_fragments", 0),
+    ("lastAudioActivityAt", "last_audio_activity_at", None),
     ("whisperModel", "whisper_model", None), ("pausedCapture", "paused_capture", False))
 
 
@@ -314,6 +315,9 @@ _RTC_HOOK_JS = r"""
       });
       const id = window.__hermesRtcStreams.size + 1;
       const mr = new MediaRecorder(audioStream, {mimeType: 'audio/webm;codecs=opus'});
+      track.addEventListener('ended', () => {
+        try { if (mr.state !== 'inactive') mr.stop(); } catch (e) {}
+      });
       mr.ondataavailable = e => {
         if (!e.data || e.data.size === 0) return;
         const r = new FileReader();
@@ -860,8 +864,6 @@ class _RtcTranscriber:
             self.state.stream_meta[s_key]["chunks"] = int(self.state.stream_meta[s_key].get("chunks", 0)) + 1
             self.state.stream_meta[s_key]["bytes"] = int(self.state.stream_meta[s_key].get("bytes", 0)) + len(data)
             self.state.stream_meta[s_key]["lastChunkEpoch"] = round(now_ts, 3)
-            if len(data) > 25_000:
-                self.state.last_audio_activity_at = now_ts
             if data.startswith(self._EBML_MAGIC):
                 cluster = data.find(self._CLUSTER_ID)
                 if cluster > 0 and stream_id not in self._webm_headers:
@@ -1714,7 +1716,8 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             if _probe(page, _DENIED_PROBE_JS):
                 state.set(leave_reason="kicked_or_ended")
                 return
-            pcount = _quiet(page.evaluate, _PARTICIPANT_COUNT_JS) or 2
+            raw_pcount = _quiet(page.evaluate, _PARTICIPANT_COUNT_JS)
+            pcount = raw_pcount if isinstance(raw_pcount, int) else 2
             if isinstance(pcount, int) and pcount >= 2:
                 had_other_participants = True
                 alone_since = None

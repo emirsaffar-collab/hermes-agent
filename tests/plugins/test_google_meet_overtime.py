@@ -126,4 +126,19 @@ def test_chromium_drain_loop_overtime_extension_and_expiry(tmp_path: Path, capsy
         page.set_content("<html><body><div>Du har lämnat mötet</div><button>Återgå till startskärmen</button></body></html>")
         assert page.evaluate(meet_bot._DENIED_PROBE_JS) is True
 
+        # 7. VG-08 regression: >25KB silent WebM fragment merge must NOT advance last_audio_activity_at
+        frag_dir = tmp_path / "frag_vg08"
+        state_vg08 = meet_bot._BotState(frag_dir, "mtg_vg08", "https://meet.google.com/aoi-ztij-cts")
+        state_vg08.set(in_call=True, last_audio_activity_at=1000.0)
+        cfg_vg08 = SimpleNamespace(out_dir=frag_dir, whisper_model="small")
+        transcriber = meet_bot._RtcTranscriber(cfg_vg08, state_vg08, {"stop": True})  # type: ignore[arg-type]
+        frag_file = frag_dir / "audio" / "s1_f0001.webm"
+        frag_file.parent.mkdir(parents=True, exist_ok=True)
+        frag_file.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 40_000)
+        nbytes = transcriber._merge_fragment_immediately(1, frag_file)
+        assert nbytes == 40_004
+        assert getattr(state_vg08, "last_audio_activity_at", None) == 1000.0
+        status_vg08 = json.loads((frag_dir / "status.json").read_text(encoding="utf-8"))
+        assert status_vg08["lastAudioActivityAt"] == 1000.0
+
         browser.close()
