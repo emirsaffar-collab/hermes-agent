@@ -868,11 +868,17 @@ def evaluate_realtime_spend_breaker(
             if family_job_tag:
                 cur.execute(
                     f"""
-                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
+                    SELECT COALESCE(SUM(net_eur), 0.0),
+                           COALESCE(SUM(CASE WHEN session_id IN ({s_placeholders}) THEN cache_reset ELSE 0 END), 0)
                     FROM llm_call_ledger
                     WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND ts >= ?
                     """,
-                    (*spend_sids, family_job_tag, ts_now - 900.0),
+                    (
+                        *spend_sids,
+                        *spend_sids,
+                        family_job_tag,
+                        ts_now - 900.0,
+                    ),
                 )
             else:
                 cur.execute(
@@ -945,7 +951,10 @@ def evaluate_realtime_spend_breaker(
                     "reason": f"throttled:{q_reason} (€{s_eur_15m:.2f}/15m, €{s_eur_1h:.2f}/1h)",
                     "session_net_eur_15m": s_eur_15m,
                 }
-        elif not is_interactive or not making_productive_progress:
+        elif not is_interactive or (
+            not making_productive_progress
+            and int(consecutive_calls_since_user or 0) > 2
+        ):
             return {
                 "allowed": False,
                 "reason": f"quarantined:{q_reason}",

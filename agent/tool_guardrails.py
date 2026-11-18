@@ -373,6 +373,7 @@ class ToolCallGuardrailController:
         self._cross_compaction_no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._compaction_epoch = 0
         self._last_idempotent_repeat_count = 0
+        self._awaiting_first_post_compaction_call = False
 
     def reset_after_compaction(self) -> None:
         """Clear single-epoch no-progress, identical-streak, and cycle history across a compaction boundary,
@@ -385,6 +386,12 @@ class ToolCallGuardrailController:
         ``_call_history`` state across a single compaction causes legitimate 1x post-compaction reloads
         of unchanged files/skills to hit ``idempotent_no_progress_block`` (#156580).
         """
+        self._awaiting_first_post_compaction_call = (
+            self._halt_decision is None
+            and getattr(self, "_turn_productive_calls", 0) > 0
+            and getattr(self, "_consecutive_failure_count", 0) < 2
+            and getattr(self, "_auth_wall_failure_count", 0) == 0
+        )
         self._no_progress.clear()
         self._identical_streak_sig = None
         self._identical_streak_result_hash = ""
@@ -446,6 +453,7 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
+        self._awaiting_first_post_compaction_call = False
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
         warnings = self.config.warnings_enabled
@@ -566,6 +574,43 @@ class ToolCallGuardrailController:
             and getattr(self, '_last_idempotent_repeat_count', 0) < no_prog_warn
             and not active_exact_streak
             and getattr(self, '_auth_wall_failure_count', 0) == 0
+            and self._identical_streak_count < STALL_GUARD_IDENTICAL_CALL_THRESHOLD
+            and max(self._same_tool_failure_counts.values(), default=0) < same_warn
+        )
+
+    def is_making_spend_breaker_progress(self) -> bool:
+        """True when the turn is progressing normally for spend-breaker evaluation.
+
+        Unlike ``is_making_productive_progress`` (which gates +1 IterationBudget extensions and
+        requires the most recent tool call to have succeeded in the current compaction epoch),
+        spend-breaker progress remains True:
+        1. Immediately after mid-turn compaction (before the first post-compaction tool call runs)
+           when the turn was progressing prior to compaction.
+        2. After a single one-off non-auth-wall tool failure (``_consecutive_failure_count == 1``
+           such as ``diff -u`` exit 1, a failing test/gate check, or a first file probe) when no
+           halt/repeat-failure/no-progress streak is active, so the model gets one LLM call to
+           inspect the tool output instead of aborting with ``pending_tool_result``.
+        """
+        if self.is_making_productive_progress():
+            return True
+        if self._halt_decision is not None:
+            return False
+        if getattr(self, "_awaiting_first_post_compaction_call", False):
+            return True
+        exact_warn = getattr(self.config, "exact_failure_warn_after", 2)
+        same_warn = getattr(self.config, "same_tool_failure_warn_after", 3)
+        no_prog_warn = getattr(self.config, "no_progress_warn_after", 2)
+        active_exact_streak = any(
+            count >= exact_warn
+            and sig.tool_name in self._same_tool_failure_counts
+            and not self._progress_since_failure.get(sig)
+            for sig, count in self._exact_failure_counts.items()
+        )
+        return (
+            getattr(self, "_consecutive_failure_count", 0) == 1
+            and getattr(self, "_last_idempotent_repeat_count", 0) < no_prog_warn
+            and not active_exact_streak
+            and getattr(self, "_auth_wall_failure_count", 0) == 0
             and self._identical_streak_count < STALL_GUARD_IDENTICAL_CALL_THRESHOLD
             and max(self._same_tool_failure_counts.values(), default=0) < same_warn
         )
