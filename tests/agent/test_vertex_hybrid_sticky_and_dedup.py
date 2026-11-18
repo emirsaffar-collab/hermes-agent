@@ -396,4 +396,74 @@ def test_eu_west2_macro_clusters_and_guardrail_reset_after_compaction():
     assert len(ctrl._call_history) == 0
 
 
+def test_active_europe_west2_session_ttl_expires_stale_sessions_while_preserving_affinity():
+    """Once 8 sessions register on europe-west2, sessions idle past EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS
+    no longer lock out new sessions from europe-west2, while still retaining their own sticky affinity."""
+    vertex_adapter.reset_vertex_hybrid_router_state()
+    for i in range(vertex_adapter.EUROPE_WEST2_MAX_ACTIVE_SESSIONS):
+        vertex_adapter._record_session_vertex_region_affinity(f"ew2_sess_{i}", "europe-west2")
+    assert vertex_adapter.get_active_europe_west2_session_count() == 8
+
+    # While all 8 are fresh (<180s), a 9th new session routes to asia-southeast1
+    reg_9, slot_9 = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="ew2_sess_8",
+        sticky_wait_seconds=0.0,
+    )
+    assert (reg_9, slot_9) == ("asia-southeast1", True)
+    vertex_adapter._ASIA_SOUTHEAST1_ARGON_SEMAPHORE.release()
+
+    # Age 5 of the 8 europe-west2 sessions beyond EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS
+    with vertex_adapter._EUROPE_WEST2_STATE_LOCK:
+        for i in range(5):
+            vertex_adapter._session_region_last_seen[f"ew2_sess_{i}"] -= (
+                vertex_adapter.EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS + 10.0
+            )
+    assert vertex_adapter.get_active_europe_west2_session_count() == 3
+
+    # New session now routes to europe-west2 instead of being locked out!
+    reg_new, slot_new = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="ew2_sess_after_ttl",
+        sticky_wait_seconds=0.0,
+    )
+    assert (reg_new, slot_new) == ("europe-west2", True)
+    vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
+
+    # And an aged session that wakes back up still retains its own europe-west2 sticky affinity
+    assert vertex_adapter.get_session_vertex_region_affinity("ew2_sess_0") == "europe-west2"
+    assert (
+        vertex_adapter._canonical_affinity_session_id("review-ew2_sess_0")
+        == "ew2_sess_0"
+    )
+    assert (
+        vertex_adapter.get_session_vertex_region_affinity("review-ew2_sess_0")
+        == "europe-west2"
+    )
+
+
+def test_blocking_events_include_pre_verify_and_known_manifest_fields_include_provides_middleware():
+    from agent import shell_hooks
+    from hermes_cli.plugins_manifest import _KNOWN_MANIFEST_FIELDS
+
+    assert "pre_verify" in shell_hooks._BLOCKING_EVENTS
+    assert "pre_llm_call" in shell_hooks._BLOCKING_EVENTS
+    assert "provides_middleware" in _KNOWN_MANIFEST_FIELDS
+    specs = shell_hooks._parse_hooks_block(
+        {
+            "pre_verify": [
+                {"command": "/tmp/verify_gate.sh", "fail_closed": True},
+            ]
+        }
+    )
+    assert len(specs) == 1
+    assert specs[0].fail_closed is True
+
+
+
+
 

@@ -41,7 +41,7 @@ _DEFAULT_BLOCK_MESSAGE = "Blocked by shell hook."
 # Exit code that signals "block this action" independent of stdout (Claude Code / Cursor).
 BLOCK_EXIT_CODE = 2
 # Events whose block directive is honored downstream; exit-2 blocking and fail_closed only apply here.
-_BLOCKING_EVENTS = frozenset({"pre_tool_call"})
+_BLOCKING_EVENTS = frozenset({"pre_tool_call", "pre_verify", "pre_llm_call"})
 _TOOL_EVENTS = frozenset({"pre_tool_call", "post_tool_call"})
 _STDERR_MESSAGE_LIMIT = 400
 _TRUTHY = {"1", "true", "yes", "on"}
