@@ -1,6 +1,7 @@
 """Session Insights Engine: aggregates the SQLite state DB into usage insights (tokens, cost estimates, tool/skill
 usage, activity, model/platform breakdowns). ``InsightsEngine(db).generate(days=30)`` → ``format_terminal(report)``."""
 
+import contextlib
 import json
 import sqlite3
 import threading
@@ -8,6 +9,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, format_cost_label, format_duration_compact, has_known_pricing
@@ -29,8 +31,7 @@ def _ingest_assistant_call_rows(
     highest_id = 0
     for row in rows:
         mid = int(row["id"] or 0)
-        if mid > highest_id:
-            highest_id = mid
+        highest_id = max(highest_id, mid)
         sid = row["session_id"]
         ts = row["timestamp"]
         try:
@@ -109,132 +110,35 @@ def _day(ts: Any) -> str:
     return safe_strftime(datetime.fromtimestamp(ts), "%b %d") if ts and (ts := coerce_epoch(ts)) else "?"
 
 
-# A source filter also matches the gateway's ``local`` rows that surface created: interactive local
-# sessions are stored as ``local`` with the surface kept in ``created_source``
-# (gateway/session_a2a.storage_source), so ``--source cli`` still finds the classic CLI's sessions.
-_LOCAL_SURFACE = " OR ({a}source = 'local' AND {a}created_source = ?)"
-
-
-def _scoped(before: str, after: str = "", *, alias: str = "s.") -> tuple[str, str]:
-    """(unfiltered, source-filtered) query pair sharing one body. Built once at class definition,
-    so no runtime value can alter query structure."""
-    src = f" AND ({alias}source = ?{_LOCAL_SURFACE.format(a=alias)})"
-    return before + after, before + src + after
-
-
 class InsightsEngine:
-    """Analyzes session history from a SessionDB (or raw sqlite3 connection)."""
+    """Analyzes session history through the usage analytics reads of a session store."""
 
-    _SESSION_COLS = ("id, source, model, started_at, ended_at, "
-                     "message_count, tool_call_count, input_tokens, output_tokens, "
-                     "cache_read_tokens, cache_write_tokens, billing_provider, "
-                     "billing_base_url, billing_mode, estimated_cost_usd, "
-                     "actual_cost_usd, cost_status, cost_source, api_call_count")
-
-    _GET_SESSIONS_ALL, _GET_SESSIONS_WITH_SOURCE = _scoped(
-        f"SELECT {_SESSION_COLS} FROM sessions WHERE started_at >= ?",
-        " ORDER BY started_at DESC",
-        alias="",
-    )
-    _GET_SESSION_IDS_ALL, _GET_SESSION_IDS_WITH_SOURCE = _scoped(
-        "SELECT s.id FROM sessions s WHERE s.started_at >= ?",
-    )
-
-    # ``INDEXED BY`` pins the partial index so the plan is deterministic on a
-    # fresh state.db (before ANALYZE) for both branches; without it the
-    # source-filtered probe falls back to idx_messages_session_active and scans
-    # each session's non-tool-call rows. The pin is a HARD dependency (SQLite
-    # raises ``no such index``): read-only opens skip ``_init_schema``, so an
-    # older writer's DB may lack it — ``__init__`` probes once and falls back
-    # to the unpinned variants (identical rows, optimizer-chosen plan).
     _MESSAGES_ASSISTANT_CALLS_INDEX = "idx_messages_assistant_calls_by_session"
-    _ASSISTANT_CALLS = (
-        f" FROM messages m INDEXED BY {_MESSAGES_ASSISTANT_CALLS_INDEX}"
-        " JOIN sessions s ON s.id = m.session_id"
-        " WHERE s.started_at >= ?"
-    )
-    _GET_TOOL_CALLS_ALL, _GET_TOOL_CALLS_WITH_SOURCE = _scoped(
-        "SELECT m.session_id, m.tool_calls" + _ASSISTANT_CALLS,
-        " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL",
-    )
-    _GET_SKILL_CALLS_ALL, _GET_SKILL_CALLS_WITH_SOURCE = _scoped(
-        "SELECT m.tool_calls, m.timestamp" + _ASSISTANT_CALLS,
-        " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
-        " AND (instr(m.tool_calls, 'skill_view') > 0"
-        " OR instr(m.tool_calls, 'skill_manage') > 0)",
-    )
-    _GET_TOOL_NAMES_ALL, _GET_TOOL_NAMES_WITH_SOURCE = _scoped(
-        """SELECT m.session_id, m.tool_name, COUNT(*) as count
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?""",
-        """
-                     AND m.role = 'tool' AND m.tool_name IS NOT NULL
-                   GROUP BY m.session_id, m.tool_name""",
-    )
-    _GET_MESSAGE_STATS_ALL, _GET_MESSAGE_STATS_WITH_SOURCE = _scoped(
-        """SELECT
-                     COUNT(*) as total_messages,
-                     SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
-                     SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) as assistant_messages,
-                     SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
-                   FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?""",
-    )
-    _GET_MODEL_USAGE_ALL, _GET_MODEL_USAGE_WITH_SOURCE = _scoped(
-        "SELECT u.session_id, u.model, u.billing_provider, u.billing_base_url,"
-        " u.api_call_count, u.input_tokens, u.output_tokens,"
-        " u.cache_read_tokens, u.cache_write_tokens, u.reasoning_tokens,"
-        " u.estimated_cost_usd, u.actual_cost_usd, u.cost_status,"
-        " u.cost_source, u.billing_mode"
-        " FROM session_model_usage u"
-        " JOIN sessions s ON s.id = u.session_id"
-        " WHERE s.started_at >= ?",
-    )
-    _PINNED = ("_GET_TOOL_CALLS", "_GET_SKILL_CALLS")
-    _SOURCE_SCOPED = ("_GET_SESSIONS", "_GET_SESSION_IDS", "_GET_TOOL_CALLS", "_GET_SKILL_CALLS", "_GET_TOOL_NAMES",
-                      "_GET_MESSAGE_STATS", "_GET_MODEL_USAGE")
     _WATERMARK_MIN_MESSAGES = 1000
 
-    def __init__(self, db):
+    def __init__(self, db, *, persistence=None):
         self.db = db
-        self._conn = db._conn
-        try:
-            self._has_assistant_calls_index = bool(self._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (self._MESSAGES_ASSISTANT_CALLS_INDEX,)).fetchone())
-        except sqlite3.Error:
-            self._has_assistant_calls_index = False
-        if not self._has_assistant_calls_index:
-            strip = f" INDEXED BY {self._MESSAGES_ASSISTANT_CALLS_INDEX}"
-            for base in self._PINNED:
-                for suffix in ("_ALL", "_WITH_SOURCE"):
-                    setattr(self, base + suffix, getattr(self, base + suffix).replace(strip, ""))
-        # Same read-only caveat: an older writer's DB has no ``created_source`` (and no ``local`` rows).
-        try:
-            self._local_surfaces = any(row[1] == "created_source" for row in self._conn.execute("PRAGMA table_info(sessions)"))
-        except sqlite3.Error:
-            self._local_surfaces = False
-        if not self._local_surfaces:
-            for base in self._SOURCE_SCOPED:
-                sql = getattr(self, base + "_WITH_SOURCE")
-                for alias in ("", "s."):
-                    sql = sql.replace(_LOCAL_SURFACE.format(a=alias), "")
-                setattr(self, base + "_WITH_SOURCE", sql)
+        self.persistence = persistence
 
-    def _query(self, base: str, cutoff: float, source: Optional[str]) -> list:
-        """Rows of ``<base>_WITH_SOURCE`` or ``<base>_ALL`` (instance attrs, so the unpinned fallback applies)."""
-        if not source:
-            return self._conn.execute(getattr(self, base + "_ALL"), (cutoff,)).fetchall()
-        params = (cutoff, source, source) if self._local_surfaces else (cutoff, source)
-        return self._conn.execute(getattr(self, base + "_WITH_SOURCE"), params).fetchall()
+    @contextlib.contextmanager
+    def _analytics(self):
+        """The usage analytics of the engine's handle, else of a reader opened beside ``db`` for one read."""
+        if self.persistence is not None:
+            yield self.persistence.usage_analytics
+            return
+        from persistence_assembly import open_persistence_reader
+        with open_persistence_reader(Path(self.db.db_path)) as reader:
+            yield reader.usage_analytics
 
     def generate(self, days: int = 30, source: str | None = None) -> dict[str, Any]:
         """Generate a complete insights report for the last ``days`` days, optionally filtered by source platform."""
         cutoff = time.time() - (days * 86400)
-        # Drain the SessionDB's async accounting queue so counters are exact
-        # (self.db may be a raw sqlite3 connection in tests — guard).
-        flush = getattr(self.db, "flush_token_counts", None)
+        # Drain the async accounting queue so counters are exact: the writer's when the engine holds one,
+        # else the store's when it has one.
+        from agent.agent_init_session import writer_interface
+
+        store = writer_interface(self.persistence, self.db)
+        flush = store.usage.flush_usage if store is not None else getattr(self.db, "flush_token_counts", None)
         if callable(flush):
             flush()
         sessions = self._get_sessions(cutoff, source)
@@ -263,16 +167,47 @@ class InsightsEngine:
         return {"tools": self._compute_tool_breakdown(self._get_tool_usage(cutoff, source)),
                 "skills": self._compute_skill_breakdown(self._get_skill_usage(cutoff, source))}
 
-    # ------------------------------------------------------------------ SQL
+    # ---------------------------------------------------------------- Reads
 
     def _get_sessions(self, cutoff: float, source: str | None = None) -> list[dict]:
         # Coerce the two epoch columns once at load: one corrupt/TEXT cell must degrade to "unknown"
         # for that session, never abort the whole report (#99959).
-        rows = [dict(row) for row in self._query("_GET_SESSIONS", cutoff, source)]
+        with self._analytics() as analytics:
+            rows = analytics.insight_sessions(started_since=cutoff, source=source)
         for row in rows:
             for col in ("started_at", "ended_at"):
                 row[col] = coerce_epoch(row.get(col), session_id=row.get("id"), field=col)
         return rows
+
+    @contextlib.contextmanager
+    def _watermark_conn(self):
+        if self.persistence is not None and callable(getattr(self.persistence, "holder", None)):
+            holder = self.persistence.holder()
+            with holder._read_ctx() as conn:
+                yield str(getattr(self.persistence, "store_path", None) or getattr(holder, "db_path", "") or ""), conn
+            return
+        conn = getattr(self.db, "_conn", None)
+        if conn is not None:
+            yield str(getattr(self.db, "db_path", "") or ""), conn
+            return
+        if self.db is not None and getattr(self.db, "db_path", None):
+            from persistence_assembly import open_persistence_reader
+            with open_persistence_reader(Path(self.db.db_path)) as reader:
+                holder = reader.holder()
+                with holder._read_ctx() as rconn:
+                    yield str(self.db.db_path), rconn
+            return
+        yield "", None
+
+    def _watermark_session_ids(self, cutoff: float, source: str | None = None) -> list[str]:
+        with self._watermark_conn() as (_db_key, conn):
+            if conn is None:
+                return []
+            if source:
+                rows = conn.execute("SELECT s.id FROM sessions s WHERE s.started_at >= ? AND s.source = ?", (cutoff, source)).fetchall()
+            else:
+                rows = conn.execute("SELECT s.id FROM sessions s WHERE s.started_at >= ?", (cutoff,)).fetchall()
+            return [r[0] for r in rows]
 
     def _sync_assistant_calls_watermark(self, cutoff: float) -> Optional[dict[str, Any]]:
         """Maintain an incremental per-DB watermark cache of parsed assistant tool_calls.
@@ -283,52 +218,58 @@ class InsightsEngine:
         per-session tool and skill counters up to MAX(messages.id), and subsequent calls
         only scan delta rows with ``m.id > watermark_id`` via primary key lookup.
         """
-        db_key = str(getattr(self.db, "db_path", "") or "")
-        if not db_key:
-            return None
-        try:
-            row = self._conn.execute("SELECT MAX(id) FROM messages").fetchone()
-            max_id = int(row[0] or 0) if row else 0
-        except sqlite3.Error:
-            return None
-        if max_id <= self._WATERMARK_MIN_MESSAGES:
-            return None
+        with self._watermark_conn() as (db_key, conn):
+            if not db_key or conn is None:
+                return None
+            try:
+                row = conn.execute("SELECT MAX(id) FROM messages").fetchone()
+                max_id = int(row[0] or 0) if row else 0
+            except sqlite3.Error:
+                return None
+            if max_id <= self._WATERMARK_MIN_MESSAGES:
+                return None
 
-        idx_clause = f" INDEXED BY {self._MESSAGES_ASSISTANT_CALLS_INDEX}" if self._has_assistant_calls_index else ""
-        with _ASSISTANT_CALLS_CACHE_LOCK:
-            state = _ASSISTANT_CALLS_WATERMARK_CACHE.get(db_key)
-            if state is None or max_id < state["watermark_id"] or cutoff < state["min_cutoff"]:
-                seed_cutoff = min(cutoff, state["min_cutoff"]) if (state and max_id >= state["watermark_id"]) else cutoff
-                seed_sql = (
-                    f"SELECT m.id, m.session_id, m.timestamp, m.tool_calls"
-                    f" FROM messages m{idx_clause}"
-                    f" JOIN sessions s ON s.id = m.session_id"
-                    f" WHERE s.started_at >= ? AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
-                )
-                calls_by_session: dict[str, Counter] = defaultdict(Counter)
-                skills_by_session: dict[str, list[tuple[str, str, Any]]] = defaultdict(list)
-                rows = self._conn.execute(seed_sql, (seed_cutoff,)).fetchall()
-                highest = _ingest_assistant_call_rows(rows, calls_by_session, skills_by_session)
-                state = {
-                    "watermark_id": max(max_id, highest),
-                    "min_cutoff": seed_cutoff,
-                    "calls_by_session": calls_by_session,
-                    "skills_by_session": skills_by_session,
-                }
-                _ASSISTANT_CALLS_WATERMARK_CACHE[db_key] = state
-            elif max_id > state["watermark_id"]:
-                delta_sql = (
-                    "SELECT m.id, m.session_id, m.timestamp, m.tool_calls"
-                    " FROM messages m"
-                    " WHERE m.id > ? AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
-                    " ORDER BY m.id ASC"
-                )
-                delta_rows = self._conn.execute(delta_sql, (state["watermark_id"],)).fetchall()
-                highest = _ingest_assistant_call_rows(
-                    delta_rows, state["calls_by_session"], state["skills_by_session"]
-                )
-                state["watermark_id"] = max(max_id, highest)
-            return state
+            has_idx = bool(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                    (self._MESSAGES_ASSISTANT_CALLS_INDEX,),
+                ).fetchone()
+            )
+            idx_clause = f" INDEXED BY {self._MESSAGES_ASSISTANT_CALLS_INDEX}" if has_idx else ""
+            with _ASSISTANT_CALLS_CACHE_LOCK:
+                state = _ASSISTANT_CALLS_WATERMARK_CACHE.get(db_key)
+                if state is None or max_id < state["watermark_id"] or cutoff < state["min_cutoff"]:
+                    seed_cutoff = min(cutoff, state["min_cutoff"]) if (state and max_id >= state["watermark_id"]) else cutoff
+                    seed_sql = (
+                        f"SELECT m.id, m.session_id, m.timestamp, m.tool_calls"
+                        f" FROM messages m{idx_clause}"
+                        f" JOIN sessions s ON s.id = m.session_id"
+                        f" WHERE s.started_at >= ? AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
+                    )
+                    calls_by_session: dict[str, Counter] = defaultdict(Counter)
+                    skills_by_session: dict[str, list[tuple[str, str, Any]]] = defaultdict(list)
+                    rows = conn.execute(seed_sql, (seed_cutoff,)).fetchall()
+                    highest = _ingest_assistant_call_rows(rows, calls_by_session, skills_by_session)
+                    state = {
+                        "watermark_id": max(max_id, highest),
+                        "min_cutoff": seed_cutoff,
+                        "calls_by_session": calls_by_session,
+                        "skills_by_session": skills_by_session,
+                    }
+                    _ASSISTANT_CALLS_WATERMARK_CACHE[db_key] = state
+                elif max_id > state["watermark_id"]:
+                    delta_sql = (
+                        "SELECT m.id, m.session_id, m.timestamp, m.tool_calls"
+                        " FROM messages m"
+                        " WHERE m.id > ? AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
+                        " ORDER BY m.id ASC"
+                    )
+                    delta_rows = conn.execute(delta_sql, (state["watermark_id"],)).fetchall()
+                    highest = _ingest_assistant_call_rows(
+                        delta_rows, state["calls_by_session"], state["skills_by_session"]
+                    )
+                    state["watermark_id"] = max(max_id, highest)
+                return state
 
     def _get_tool_usage(self, cutoff: float, source: str | None = None) -> list[dict]:
         """Tool call counts from two sources: ``tool_name`` on 'tool' rows (set
@@ -337,13 +278,15 @@ class InsightsEngine:
         SESSION (max — they describe the same calls), then summed across
         sessions: a global max dropped every call from a session that only
         carried the other representation (#9814)."""
+        with self._analytics() as analytics:
+            tool_names = analytics.insight_tool_result_counts(started_since=cutoff, source=source)
         by_session_tool = Counter()
-        for row in self._query("_GET_TOOL_NAMES", cutoff, source):
+        for row in tool_names:
             by_session_tool[(row["session_id"], row["tool_name"])] += row["count"]
         calls_by_session_tool = Counter()
         wm_state = self._sync_assistant_calls_watermark(cutoff)
         if wm_state is not None:
-            session_ids = [r["id"] for r in self._query("_GET_SESSION_IDS", cutoff, source)]
+            session_ids = self._watermark_session_ids(cutoff, source)
             cached_calls = wm_state["calls_by_session"]
             for sid in session_ids:
                 sc = cached_calls.get(sid)
@@ -351,7 +294,9 @@ class InsightsEngine:
                     for tname, cnt in sc.items():
                         calls_by_session_tool[(sid, tname)] += cnt
         else:
-            for row in self._query("_GET_TOOL_CALLS", cutoff, source):
+            with self._analytics() as analytics:
+                tool_calls = analytics.insight_tool_call_payloads(started_since=cutoff, source=source)
+            for row in tool_calls:
                 try:
                     names = filter(None, (fn.get("name") for fn in _iter_functions(row["tool_calls"])))
                     calls_by_session_tool.update((row["session_id"], name) for name in names)
@@ -367,7 +312,7 @@ class InsightsEngine:
         skill_counts: dict[str, dict[str, Any]] = {}
         wm_state = self._sync_assistant_calls_watermark(cutoff)
         if wm_state is not None:
-            session_ids = [r["id"] for r in self._query("_GET_SESSION_IDS", cutoff, source)]
+            session_ids = self._watermark_session_ids(cutoff, source)
             cached_skills = wm_state["skills_by_session"]
             for sid in session_ids:
                 for tool_name, skill_name, timestamp in cached_skills.get(sid, ()):
@@ -379,7 +324,9 @@ class InsightsEngine:
                     if timestamp is not None and (entry["last_used_at"] is None or timestamp > entry["last_used_at"]):
                         entry["last_used_at"] = timestamp
             return list(skill_counts.values())
-        for row in self._query("_GET_SKILL_CALLS", cutoff, source):
+        with self._analytics() as analytics:
+            rows = analytics.insight_skill_call_payloads(started_since=cutoff, source=source)
+        for row in rows:
             timestamp = row["timestamp"]
             for func in _iter_functions(row["tool_calls"]):
                 tool_name = func.get("name")
@@ -395,15 +342,13 @@ class InsightsEngine:
         return list(skill_counts.values())
 
     def _get_message_stats(self, cutoff: float, source: str | None = None) -> dict:
-        rows = self._query("_GET_MESSAGE_STATS", cutoff, source)
-        return dict(rows[0]) if rows else {"total_messages": 0, "user_messages": 0, "assistant_messages": 0, "tool_messages": 0}
+        with self._analytics() as analytics:
+            return analytics.insight_message_stats(started_since=cutoff, source=source)
 
     def _get_model_usage(self, cutoff: float, source: str | None = None) -> list[dict]:
-        """Per-model usage rows; [] when the table is missing (older DB) so the caller falls back to the per-session aggregate."""
-        try:
-            return [dict(row) for row in self._query("_GET_MODEL_USAGE", cutoff, source)]
-        except sqlite3.OperationalError:
-            return []
+        """Per-model usage rows; [] on a store from before them, so the caller falls back to the per-session aggregate."""
+        with self._analytics() as analytics:
+            return analytics.insight_model_usage(started_since=cutoff, source=source)
 
     # -------------------------------------------------------------- Compute
 

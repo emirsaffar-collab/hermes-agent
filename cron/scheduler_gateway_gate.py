@@ -42,7 +42,7 @@ def _supervised_gateway_respawning(home) -> bool:
     candidates = [home_path]
     if home_path.parent.name == "profiles":
         candidates.append(home_path.parent.parent)
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     for cand in candidates:
         state_file = cand / "gateway_state.json"
         try:
@@ -59,9 +59,9 @@ def _supervised_gateway_respawning(home) -> bool:
         if not isinstance(updated_raw, str) or not updated_raw.strip():
             continue
         try:
-            updated_dt = dt.datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+            updated_dt = dt.datetime.fromisoformat(updated_raw)
             if updated_dt.tzinfo is None:
-                updated_dt = updated_dt.astimezone(dt.timezone.utc)
+                updated_dt = updated_dt.astimezone(dt.UTC)
             age_s = (now - updated_dt).total_seconds()
             if 0 <= age_s <= _SUPERVISOR_RESPAWN_GRACE_S:
                 return True

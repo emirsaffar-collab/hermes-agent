@@ -15,6 +15,10 @@ from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
 
+def _persistence_for(_db):
+    from contextlib import nullcontext
+    return nullcontext(None)
+
 
 def _bot_mode_delivery_text(response: Any, *, successful: bool) -> Any:
     """Return the text Bot Mode may render or relay after a completed turn.
@@ -415,8 +419,8 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
     if _pending := session.get("pending_title"):
         _session_key = session.get("session_key") or sid
         try:
-            with _session_db(session) as _pdb:
-                if _pdb and _pdb.set_session_title(_session_key, _pending):
+            with _session_db(session) as _pdb, _persistence_for(_pdb) as persistence:
+                if persistence is not None and persistence.sessions.set_title(_session_key, _pending):
                     session["pending_title"] = None
         except ValueError as exc:
             # Invalid/duplicate title — non-retryable, drop it; auto-title takes over.
@@ -577,49 +581,63 @@ def _adopt_out_of_band_turns(session: dict) -> None:
     # holds none of the foreign rows (Telegram reply, cron) this function exists to adopt and the model
     # silently never sees them (#123545). Also detect in-place SQLite secret scrubs (rowbak receipt or
     # tool-row content length change on id <= seen) so poisoned in-memory history is re-hydrated (#CF67).
+    from persistence.conversation.messages import TranscriptRead
     target_key = _submit_row_target_key(session)  # type: ignore[name-defined]
     scrubbed = _history_has_dangling_tool_splice(history)
-    with _session_db(session) as db:
+    with _session_db(session) as db, (globals().get("_persistence_for") or (lambda _db: __import__("contextlib").nullcontext(None)))(db) as persistence:
         try:
-            newer = db.get_messages(target_key, after_id=seen) if db is not None else []
-            if db is not None and target_key:
+            if persistence is not None:
+                newer = persistence.messages.read_transcript(target_key, TranscriptRead(after_id=seen)) if target_key else ()
+            elif db is not None and callable(getattr(db, "get_messages", None)):
+                newer = db.get_messages(target_key, after_id=seen) if target_key else []
+            else:
+                newer = ()
+            if (persistence is not None or db is not None) and target_key:
                 import glob as _glob
                 import os as _os
-                db_path = str(getattr(db, "db_path", "") or _os.path.expanduser("~/.hermes/state.db"))
+                db_path = str(
+                    getattr(persistence, "store_path", None)
+                    or getattr(db, "db_path", None)
+                    or getattr(db, "store_path", None)
+                    or _os.path.expanduser("~/.hermes/state.db")
+                )
                 last_scrub_mt = float(session.get("_scrub_reloaded_mtime") or 0.0)
                 rowbaks = _glob.glob(f"{db_path}.rowbak-secret-scrub-*-{target_key}-*.json")
                 max_mt = max((_os.path.getmtime(p) for p in rowbaks), default=0.0)
                 if max_mt > last_scrub_mt:
                     session["_scrub_reloaded_mtime"] = max_mt
                     scrubbed = True
-                elif callable(getattr(db, "_read_all", None)):
-                    mem_tool_lens = {
-                        rid: len(m.get("content") or "")
-                        for m in history
-                        if isinstance(m, dict)
-                        and m.get("role") == "tool"
-                        and isinstance(m.get("content"), str)
-                        and isinstance((rid := _message_row_id(m)), int)  # type: ignore[name-defined]
-                        and _below_ceiling(rid)
-                    }
-                    if mem_tool_lens:
-                        db_rows = db._read_all(
-                            "SELECT id, LENGTH(COALESCE(content, '')) FROM messages "
-                            "WHERE session_id = ? AND active = 1 AND role = 'tool' AND id <= ?",
-                            (target_key, seen),
-                        ) or ()
-                        if any(mem_tool_lens.get(int(r[0])) not in (None, int(r[1])) for r in db_rows):
-                            scrubbed = True
+                else:
+                    holder = persistence.holder() if persistence is not None and callable(getattr(persistence, "holder", None)) else None
+                    read_all = getattr(db, "_read_all", None) or getattr(holder, "_read_all", None)
+                    if callable(read_all):
+                        mem_tool_lens = {
+                            rid: len(m.get("content") or "")
+                            for m in history
+                            if isinstance(m, dict)
+                            and m.get("role") == "tool"
+                            and isinstance(m.get("content"), str)
+                            and isinstance((rid := _message_row_id(m)), int)  # type: ignore[name-defined]
+                            and _below_ceiling(rid)
+                        }
+                        if mem_tool_lens:
+                            db_rows = read_all(
+                                "SELECT id, LENGTH(COALESCE(content, '')) FROM messages "
+                                "WHERE session_id = ? AND active = 1 AND role = 'tool' AND id <= ?",
+                                (target_key, seen),
+                            ) or ()
+                            if any(mem_tool_lens.get(int(r[0])) not in (None, int(r[1])) for r in db_rows):
+                                scrubbed = True
         except Exception:
             logger.debug("out-of-band history probe failed; turn runs on the in-memory history", exc_info=True)
             return
-    newer = [row for row in newer if _foreign(row.get("id"))]
+    newer = [row for row in newer if _foreign(row.get("id") if isinstance(row, dict) else row.id)]
     if not newer and not scrubbed:
         return
     rewritten = (
         scrubbed
-        or any(row.get("_compressed_summary") for row in newer)
-        or bool(newer and newer[0].get("role") != "user")
+        or any((row.get("_compressed_summary") if isinstance(row, dict) else row.compressed_summary) for row in newer)
+        or bool(newer and (newer[0].get("role") if isinstance(newer[0], dict) else newer[0].role) != "user")
         or bool(history and (history[-1].get("role") != "assistant" or history[-1].get("tool_calls")))
     )
     rows = _load_durable_truncation_history(session, repair_alternation=rewritten) or []
@@ -692,8 +710,8 @@ def _install_has_prior_sessions(session: dict) -> bool:
     its first-ever message holds exactly one row.
     """
     try:
-        with _session_db(session) as db:
-            return db is not None and db.session_count_ge(2)
+        with _session_db(session) as db, (globals().get("_persistence_for") or (lambda _db: __import__("contextlib").nullcontext(None)))(db) as persistence:
+            return persistence is not None and persistence.sessions.count_at_least(2)
     except Exception:
         logger.debug("session count probe failed for first-contact check", exc_info=True)
         return False
@@ -914,11 +932,11 @@ def _absorb_turn_result(
     result, agent = st.result, st.agent
     if display_kind and isinstance(text, str):
         # Post-turn fallback stamp of a synthesized turn's display kind (DB row + result).
-        db = getattr(agent, "_session_db", None)
+        persistence = getattr(agent, "persistence", None)
         current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
-        if db is not None:
+        if persistence is not None:
             try:
-                db.set_latest_matching_message_display_kind(
+                persistence.messages.set_latest_matching_message_display_kind(
                     current_session_id, role="user", content=text, display_kind=display_kind,
                     display_metadata=display_metadata)
             except Exception:
@@ -987,6 +1005,20 @@ def _persisted_turn_receipt(st: _TurnRun, raw: Any, status: str) -> dict | None:
             committed_row_id(before) is not None and committed_row_id(before) == committed_row_id(after)))
 
 
+def _retain_refused_turn(agent, result: dict) -> None:
+    """Take the refused turn out of the agent's durable model transcript, keeping it for display."""
+    from agent.agent_init_session import agent_interface
+    from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE
+    store, sid = agent_interface(agent), getattr(agent, "session_id", None)
+    if store is None or not sid:
+        return
+    try:
+        store.messages.retain_refused_turn_for_display(
+            sid, notice=CONTENT_REFUSED_NOTICE, boundary_row_id=result.get("refused_turn_boundary_row_id"))
+    except Exception:  # best-effort: a refusal must never crash turn teardown
+        logger.warning("content-policy refusal: could not retain the refused turn for %s", sid, exc_info=True)
+
+
 def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None, cols: int):
     """``(payload, raw, status)`` for message.complete; retains/clears the inflight turn and
     settles the hosted-room terminal receipt."""
@@ -1010,11 +1042,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     # deterministic filter re-locks the chat (#149708 review). Best-effort; the live refusal notice was
     # already delivered.
     if result.get("failure_reason") == "content_policy_blocked":
-        from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE
-        from hermes_state_rewind import retain_refused_turn_for_display
-        retain_refused_turn_for_display(
-            getattr(agent, "_session_db", None), getattr(agent, "session_id", None),
-            notice=CONTENT_REFUSED_NOTICE, boundary_row_id=result.get("refused_turn_boundary_row_id"))
+        _retain_refused_turn(agent, result)
     # The receipt verifies the stored row's body, which keeps the model's text as written;
     # only the delivered copy drops a silence marker.
     receipt = _persisted_turn_receipt(st, raw, status)
@@ -1110,6 +1138,8 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
 def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseException) -> None:
     """Except-path of the turn: crash log, history restore, terminal error frame."""
     import traceback
+
+    from storage_user_copy import error_type_name
     with contextlib.suppress(Exception):
         os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
         with open(_CRASH_LOG, "a", encoding="utf-8") as f:
@@ -1117,7 +1147,7 @@ def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseExcept
                 f"\n=== turn-dispatcher exception · "
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} · sid={sid} ===\n")
             f.write(traceback.format_exc())
-    print(f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    print(f"[gateway-turn] {error_type_name(e)}: {e}", file=sys.stderr, flush=True)
     # A finalizer exception can leave in-memory history at the turn-start snapshot.
     _restore_agent_history_after_turn_error(session, st.agent)
     if st.terminal_callback is not None and not st.receipt_attempted:
@@ -1131,7 +1161,7 @@ def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseExcept
         # Same terminal error frame shape as the returned-error path.
         _emit_terminal_turn_error(sid, session, e, retire_marker=st.receipt_committed)
         st.error_retained = True
-        st.error_detail = _turn_failure_detail(e, type(e).__name__, st.prompt_text)
+        st.error_detail = _turn_failure_detail(e, error_type_name(e), st.prompt_text)
     except Exception as emit_exc:
         print(
             f"[gateway-turn] terminal error emit failed: {type(emit_exc).__name__}: {emit_exc}",
@@ -1195,7 +1225,7 @@ _ROUTING_REOPEN_PATIENCE_S = 0.5
 
 
 def _routing_provenance_db(session: dict):
-    """The session's own SessionDB for :func:`_reopen_routed_session_row`, or a ``None`` context."""
+    """The session's own SessionDB (its handle goes to :func:`_reopen_routed_session_row`), or a ``None`` context."""
     try:
         return _session_db(session)
     except Exception:
@@ -1203,7 +1233,7 @@ def _routing_provenance_db(session: dict):
         return contextlib.nullcontext(None)
 
 
-def _reopen_routed_session_row(db, sid: str, session: dict) -> None:
+def _reopen_routed_session_row(persistence, sid: str, session: dict) -> None:
     """Routing provenance for #106459, called under ``_sessions_lock`` while this backend still has the
     session registered and is about to start a turn for it: an explicit-close stamp on its row missed a
     live conversation, so it is cleared (the gateway's #54878 stale-route self-heal, which this backend
@@ -1211,10 +1241,10 @@ def _reopen_routed_session_row(db, sid: str, session: dict) -> None:
     ``_finalize_session`` stamps, so a close of THIS session is either not written yet or already stops
     the turn -- it is never cleared here. Best-effort: a failure never blocks the turn."""
     session_id = getattr(session.get("agent"), "session_id", None)  # the compression tip this turn writes
-    if db is None or not session_id:
+    if persistence is None or not session_id:
         return
     try:
-        db.reopen_if_explicitly_closed(
+        persistence.sessions.reopen_if_explicitly_closed(
             session_id, provenance=f"TUI session {sid} is still registered and accepting a turn",
             patience_s=_ROUTING_REOPEN_PATIENCE_S)
     except Exception:
@@ -1361,14 +1391,14 @@ def _run_prompt_submit(
             _run_post_turn_followups(rid, sid, session, *followup)
     # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
     # state registry, and _sessions_lock gates every create/close/prompt on this backend.
-    with _routing_provenance_db(session) as routing_db, _sessions_lock:
+    with _routing_provenance_db(session) as routing_db, _persistence_for(routing_db) as routing, _sessions_lock:
         registered = _sessions.get(sid)
         can_start = not session.get("_closing") and (registered is None or registered is session)
         if can_start:
             # Only a registered session is proof the conversation is routed here; an unregistered one may
             # still run its turn, but its stamp stays (#106459).
             if registered is session:
-                _reopen_routed_session_row(routing_db, sid, session)
+                _reopen_routed_session_row(routing, sid, session)
             can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
     if not can_start:
         closing = False
