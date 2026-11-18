@@ -1162,13 +1162,26 @@ def _strip_deterministic_lean_sections(text: str) -> str:
     return "\n\n".join(kept)
 
 
-_SUMMARY_DIGIT_TOKEN_RE = re.compile(r"\b\d{3,10}\b")
+_SUMMARY_DIGIT_TOKEN_RE = re.compile(r"\b\d{3,25}\b")
 _SUMMARY_PAREN_ID_SUFFIX_RE = re.compile(
-    r"(?i)(?:,\s*|\(\s*,\s*)id\s*(?:=|:|\s)\s*`?#?(\d{3,10})`?(?=\s*\))"
+    r"(?i)(?:,\s*|\(\s*,\s*)id\s*(?:=|:|\s)\s*`?#?(\d{3,25})`?(?=\s*\))"
 )
 _SUMMARY_LABELED_ID_RE = re.compile(
-    r"(?i)\b(id|kf_id|repnr|repnrid|butik|butiknr|store_no|order_id|ticket_id)(\s*(?:=|:|\s)\s*`?#?)(\d{3,10})(`?)\b"
+    r"(?i)\b(id|kf_id|repnr|repnrid|butik|butiknr|store_no|order_id|ticket_id|user_id|sender_id|member_id|användar-id|anvandar-id)(\s*(?:=|:|\s)\s*`?#?)(\d{3,25})(`?)\b"
 )
+_SUMMARY_USER_HANDLE_RE = re.compile(r"\b(users/)(\d{5,30})\b")
+_SUMMARY_EMAIL_RE = re.compile(r"\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b")
+_SUMMARY_WORD_TOKEN_RE = re.compile(r"[A-Za-zÅÄÖåäöÉéŚśŁł]{3,}")
+_SUMMARY_COLLEAGUE_SURNAME_RE = re.compile(
+    r"\b(Celina|Evelina|Ola|Hanna|Vildana|Bashar|Jad|Sandra)"
+    r"((?:\s+[A-ZÅÄÖÉŚŁ][a-zåäöéśł]{2,}){1,2})\b"
+)
+_SUMMARY_COLLEAGUE_STOPWORDS = frozenset({
+    "och", "att", "som", "har", "hade", "kan", "ska", "vill", "från", "till",
+    "med", "för", "via", "mot", "under", "efter", "före", "utan", "kring",
+    "and", "has", "had", "can", "will", "from", "with", "for", "asked",
+    "sent", "wrote", "replied", "reported", "confirmed", "needs", "wants",
+})
 _SUMMARY_HEX_TOKEN_RE = re.compile(r"(?i)\b[0-9a-f]{7,64}\b")
 _SUMMARY_HEX40_RE = re.compile(r"(?i)(?<![0-9a-f:])\b([0-9a-f]{40})\b(?![0-9a-f])")
 _SUMMARY_LABELED_SHA_RE = re.compile(
@@ -1178,7 +1191,9 @@ _SUMMARY_CLOUD_RUN_REV_RE = re.compile(r"\b([a-z][a-z0-9-]+-\d{5}-[a-z0-9]{3})\b
 
 
 def _scrub_ungrounded_summary_id_labels(summary: str, *source_texts: Optional[str]) -> str:
-    """Strip or tag explicit entity ID numbers, git commit SHAs, and Cloud Run revision IDs in LLM summary prose that never appeared in the source turns."""
+    """Strip or tag explicit entity ID numbers, git commit SHAs, Cloud Run revision IDs,
+    email addresses, user handles, and hallucinated colleague surnames in LLM summary prose
+    that never appeared in the source turns."""
     if not summary:
         return summary
     non_empty_sources = [src for src in source_texts if isinstance(src, str) and src.strip()]
@@ -1187,6 +1202,8 @@ def _scrub_ungrounded_summary_id_labels(summary: str, *source_texts: Optional[st
     grounded_digits: set[str] = set()
     grounded_hex: set[str] = set()
     grounded_revs: set[str] = set()
+    grounded_emails: set[str] = set()
+    grounded_words: set[str] = set()
     for src in non_empty_sources:
         grounded_digits.update(_SUMMARY_DIGIT_TOKEN_RE.findall(src))
         for h in _SUMMARY_HEX_TOKEN_RE.findall(src):
@@ -1196,6 +1213,10 @@ def _scrub_ungrounded_summary_id_labels(summary: str, *source_texts: Optional[st
                 grounded_hex.add(hl[:7])
         for rev in _SUMMARY_CLOUD_RUN_REV_RE.findall(src):
             grounded_revs.add(rev.lower())
+        for email in _SUMMARY_EMAIL_RE.findall(src):
+            grounded_emails.add(email.lower())
+        for word in _SUMMARY_WORD_TOKEN_RE.findall(src):
+            grounded_words.add(word.lower())
 
     cleaned = summary
     if grounded_digits:
@@ -1215,6 +1236,40 @@ def _scrub_ungrounded_summary_id_labels(summary: str, *source_texts: Optional[st
             return f"{label}{sep}[UNGROUNDED_ID]{tail_bt}"
 
         cleaned = _SUMMARY_LABELED_ID_RE.sub(_sub_labeled_id, cleaned)
+
+    def _sub_user_handle(m: re.Match) -> str:
+        prefix, num = m.group(1), m.group(2)
+        if num in grounded_digits:
+            return m.group(0)
+        return f"{prefix}[UNGROUNDED_ID]"
+
+    cleaned = _SUMMARY_USER_HANDLE_RE.sub(_sub_user_handle, cleaned)
+
+    def _sub_email(m: re.Match) -> str:
+        email = m.group(1)
+        if email.lower() in grounded_emails:
+            return m.group(0)
+        return "[UNGROUNDED_EMAIL]"
+
+    cleaned = _SUMMARY_EMAIL_RE.sub(_sub_email, cleaned)
+
+    def _is_grounded_word(tok: str) -> bool:
+        tl = tok.lower()
+        if tl in grounded_words or tl in _SUMMARY_COLLEAGUE_STOPWORDS:
+            return True
+        return bool(tl.endswith("s") and len(tl) > 4 and tl[:-1] in grounded_words)
+
+    def _sub_colleague_surname(m: re.Match) -> str:
+        first_name = m.group(1)
+        surname_tokens = m.group(2).strip().split()
+        if all(_is_grounded_word(tok) for tok in surname_tokens):
+            return m.group(0)
+        last_tok = surname_tokens[-1] if surname_tokens else ""
+        if last_tok.endswith("s") and not first_name.endswith("s"):
+            return f"{first_name}s"
+        return first_name
+
+    cleaned = _SUMMARY_COLLEAGUE_SURNAME_RE.sub(_sub_colleague_surname, cleaned)
 
     def _is_grounded_sha(candidate: str) -> bool:
         cl = candidate.lower()
@@ -3837,9 +3892,24 @@ class ContextCompressor(
                 (re.compile(r"\b[a-z][a-z0-9-]+-\d{5}-[a-z0-9]{3}\b"), 15),
                 (re.compile(r"#\d{3,6}\b"), 20),
                 (re.compile(r"\b[\w./-]+/[\w.-]+\.(?:py|ts|tsx|js|rs|md|yaml|yml|json|toml|sh|php)\b"), 15),
+                (re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"), 15),
+                (re.compile(r"\b(?:users/\d{5,30}|spaces/[A-Za-z0-9_-]{6,24})\b"), 15),
+                (re.compile(r'"(?:displayName|label|fullName)"\s*:\s*"([^"\n]{3,80})"'), 15),
+                (
+                    re.compile(
+                        r"\b(?:Celina|Evelina|Ola|Hanna|Vildana|Bashar|Jad|Sandra|Agnese|Karim|Ayad|Emir|Sanna|Łukasz|Luca|Joanna)"
+                        r"(?:\s+[A-ZÅÄÖÉŚŁ][a-zåäöéśł]{2,}){1,2}\b"
+                    ),
+                    15,
+                ),
             ):
                 raw_tokens.extend(
-                    list(dict.fromkeys(m.group(0).strip().rstrip(".,;:") for m in _pat.finditer(_slice)))[:_cap]
+                    list(
+                        dict.fromkeys(
+                            (m.group(1) if m.lastindex else m.group(0)).strip().rstrip(".,;:")
+                            for m in _pat.finditer(_slice)
+                        )
+                    )[:_cap]
                 )
         updated = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
         if raw_urls:
@@ -4122,6 +4192,11 @@ class ContextCompressor(
             if len(content) > self._CONTENT_MAX:
                 content = elide_middle(content, self._CONTENT_HEAD, self._CONTENT_TAIL)
             if role == "tool":
+                anchor_toks = msg.get("_anchor_tokens")
+                if isinstance(anchor_toks, list) and anchor_toks:
+                    anchor_hint = _redact_compaction_text(", ".join(str(t) for t in anchor_toks[:12]))
+                    if anchor_hint:
+                        content = f"{content} [anchors: {anchor_hint}]"
                 parts.append(f"[TOOL RESULT {msg.get('tool_call_id', '')}]: {content}")
                 continue
             if role == "assistant" and msg.get("tool_calls", []):

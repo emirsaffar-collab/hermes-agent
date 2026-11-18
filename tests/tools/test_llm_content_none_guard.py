@@ -146,3 +146,34 @@ class TestExtractContentOrReasoning:
         assert "commit: [UNGROUNDED_SHA]" in scrubbed
         assert "[UNGROUNDED_REVISION]" in scrubbed
 
+    def test_scrub_ungrounded_summary_emails_user_ids_and_colleague_surnames(self):
+        """Regression for 2026-11-18 RCA (msg 7896821): when tool results were demoted,
+        aux summarizer hallucinated surname 'Celina Almqvist', email 'celina.almqvist@uropenn.se',
+        and 21-digit user ID 'users/113110204733479155799' from first-name-only MEMORY.md context."""
+        from agent.context_compressor import _scrub_ungrounded_summary_id_labels
+
+        source = (
+            "MEMORY: Till Celina/Ola/Hanna = max 1 mening DM. "
+            "RCA.md: Celina Lorén Saffar (celina@uropenn.se, users/109947836594006947151) "
+            "asked about order 200018365 in spaces/sx-m3CAAAAE."
+        )
+        raw_summary = (
+            "Utreda Celina Almqvists ärende: Celina Almqvist (celina.almqvist@uropenn.se, "
+            "users/113110204733479155799) och Celina Lorén Saffar (celina@uropenn.se, "
+            "users/109947836594006947151) i spaces/sx-m3CAAAAE gällande order_id=200018365 "
+            "samt user_id=100067343216892558485."
+        )
+        scrubbed = _scrub_ungrounded_summary_id_labels(raw_summary, source)
+
+        assert "Almqvist" not in scrubbed
+        assert "celina.almqvist@uropenn.se" not in scrubbed
+        assert "113110204733479155799" not in scrubbed
+        assert "100067343216892558485" not in scrubbed
+
+        assert "Utreda Celinas ärende" in scrubbed
+        assert "Celina ([UNGROUNDED_EMAIL], users/[UNGROUNDED_ID])" in scrubbed
+        assert "Celina Lorén Saffar (celina@uropenn.se, users/109947836594006947151)" in scrubbed
+        assert "order_id=200018365" in scrubbed
+        assert "user_id=[UNGROUNDED_ID]" in scrubbed
+
+

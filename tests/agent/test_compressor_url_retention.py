@@ -190,3 +190,50 @@ def test_demote_tool_result_preserves_anchor_tokens_for_anchor_index():
     assert "uop-returns-00034-fb6" in idx
     assert "classes/POS/Repositories/ItemPriceRepository.php" in idx
 
+
+def test_demote_tool_result_preserves_identity_anchors_in_serialized_records():
+    tool_output = (
+        '{"members": [{"member": {"name": "users/109947836594006947151", '
+        '"displayName": "Celina Lorén Saffar", "email": "celina@uropenn.se"}}], '
+        '"space": "spaces/sx-m3CAAAAE"}\n'
+        + ("padding line to exceed 200 char prune floor\n" * 8)
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_chat_1",
+                    "function": {
+                        "name": "tool_call",
+                        "arguments": json.dumps({"space": "spaces/sx-m3CAAAAE"}),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_chat_1",
+            "content": tool_output,
+        },
+    ]
+    ContextCompressor._demote_tool_result_at(
+        messages,
+        1,
+        {"call_chat_1": ("tool_call", json.dumps({"space": "spaces/sx-m3CAAAAE"}))},
+        200,
+    )
+    tokens = messages[1].get("_anchor_tokens", [])
+    assert "celina@uropenn.se" in tokens
+    assert "users/109947836594006947151" in tokens
+    assert "Celina Lorén Saffar" in tokens
+    compressor = ContextCompressor.__new__(ContextCompressor)
+    records = compressor._serialize_records_for_summary(messages)
+    serialized_tool = records[1]
+    assert "[anchors:" in serialized_tool
+    assert "Celina Lorén Saffar" in serialized_tool
+    assert "celina@uropenn.se" in serialized_tool
+    assert "users/109947836594006947151" in serialized_tool
+
+
