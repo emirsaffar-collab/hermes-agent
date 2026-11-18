@@ -78,7 +78,7 @@ def test_a2_blank_args_with_length_finish_reason_refused():
     from agent.chat_completion_helpers import _StreamingCall
     acc = {0: {"id": "call_0", "type": "function", "extra_content": None,
                "function": {"name": "delegate_task", "arguments": ""}}}
-    calls, flagged = _StreamingCall._assemble_tool_calls(acc, "length")
+    _calls, flagged = _StreamingCall._assemble_tool_calls(acc, "length")
     # blank args + finish_reason present: not flagged by assembler (existing
     # behavior), but validation below must refuse — asserted in test_a2_validation.
     assert flagged is False
@@ -94,7 +94,7 @@ def test_a2_validation_blank_args_length_never_executes():
 
     agent = SimpleNamespace(
         valid_tool_names={"delegate_task"},
-        _uniquify_tool_call_ids=lambda tcs: None,
+        _uniquify_tool_call_ids=lambda tcs, **kw: None,
         _repair_tool_call=lambda name: None,
         _buffer_vprint=lambda *a, **k: None,
         _vprint=lambda *a, **k: None,

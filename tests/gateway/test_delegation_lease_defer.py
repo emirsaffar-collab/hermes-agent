@@ -24,7 +24,7 @@ from gateway import wake
 from gateway.config import Platform
 from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.wake import WakeNotAccepted
-from hermes_state_errors import SessionTurnLeaseLostError
+from persistence.sqlite._state.errors import SessionTurnLeaseLostError
 
 
 class _Runner(GatewayNotificationsMixin):

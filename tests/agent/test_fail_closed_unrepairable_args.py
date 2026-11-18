@@ -7,7 +7,7 @@ pass through untouched.
 import json
 from types import SimpleNamespace
 
-from agent.chat_completion_helpers import _StreamingCall  # noqa: F401  (locate helper)
+from agent.chat_completion_helpers import _StreamingCall
 
 
 def _assemble(tool_calls_acc, finish_reason):

@@ -20,7 +20,7 @@ def _is_cron_execution(authority, live):
     execution = getattr(getattr(live, 'event_stream', None), 'execution', None) or {}
     if execution.get('admission_id') in getattr(authority, '_cron_cancellations', {}):
         return True
-    from hermes_state_keys import CRON_PRINCIPAL_ID
+    from persistence.authority.vocabulary import CRON_PRINCIPAL_ID
     return getattr(getattr(live, 'source', None), 'user_id', None) == CRON_PRINCIPAL_ID
 
 
