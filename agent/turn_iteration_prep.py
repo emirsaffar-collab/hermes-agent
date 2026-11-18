@@ -451,6 +451,8 @@ def begin_iteration(
         _productive = (
             True
             if int(api_call_count or 0) == 0
+            else bool(_tg_ctrl.is_making_spend_breaker_progress())
+            if _tg_ctrl is not None and callable(getattr(_tg_ctrl, "is_making_spend_breaker_progress", None))
             else bool(_tg_ctrl.is_making_productive_progress())
             if _tg_ctrl is not None and callable(getattr(_tg_ctrl, "is_making_productive_progress", None))
             else True

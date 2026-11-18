@@ -61,6 +61,7 @@ ASIA_SOUTHEAST1_VERTEX_REGION = "asia-southeast1"
 REGIONAL_VERTEX_REGIONS = (EUROPE_WEST2_VERTEX_REGION, ASIA_SOUTHEAST1_VERTEX_REGION)
 EUROPE_WEST2_ARGON_MAX_CONCURRENCY = 5
 EUROPE_WEST2_MAX_ACTIVE_SESSIONS = 8
+EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS = 180.0
 EUROPE_WEST2_COOLDOWN_SECONDS = 15.0
 EUROPE_WEST2_COOLDOWN_TAIL_WAIT_SECONDS = 5.0
 # carried-fix-anchor: EUROPE_WEST2_STICKY_WAIT_SECONDS = 3.0 (raised to 15.0s; deep 30.0s; initial 8.0s; min_tok 35k)
@@ -85,6 +86,10 @@ _europe_west2_cooldown_until: float = float(
 _prev_affinity = getattr(_prev_vertex_mod, "_session_region_affinity", None)
 _session_region_affinity: dict[str, str] = (
     _prev_affinity if isinstance(_prev_affinity, dict) else {}
+)
+_prev_last_seen = getattr(_prev_vertex_mod, "_session_region_last_seen", None)
+_session_region_last_seen: dict[str, float] = (
+    _prev_last_seen if isinstance(_prev_last_seen, dict) else {}
 )
 _SESSION_AFFINITY_CAP = 512
 _VERTEX_BASE_URL_RE = re.compile(
@@ -158,15 +163,18 @@ def reset_vertex_hybrid_router_state() -> None:
         _EUROPE_WEST2_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
         _ASIA_SOUTHEAST1_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
         _session_region_affinity.clear()
+        _session_region_last_seen.clear()
 
 
 def _canonical_affinity_session_id(session_id: Optional[str]) -> Optional[str]:
-    """Strip ``:bg-review:<seq>`` or ``:bg_review`` suffix so background_review inherits parent session affinity."""
+    """Strip ``review-`` prefix or ``:bg-review:<seq>`` / ``:bg_review`` suffix so background_review inherits parent session affinity."""
     if not session_id:
         return None
     raw = str(session_id).strip()
     if not raw:
         return None
+    if raw.startswith("review-") and len(raw) > 7:
+        raw = raw[7:].strip()
     base = re.split(r":bg[-_]review(?::|$)", raw, maxsplit=1)[0].strip()
     return base or raw
 
@@ -180,6 +188,7 @@ def reset_vertex_sticky_region(session_id: Optional[str], *, only_if_global: boo
         if only_if_global and _session_region_affinity.get(sid) != GLOBAL_VERTEX_REGION:
             return
         _session_region_affinity.pop(sid, None)
+        _session_region_last_seen.pop(sid, None)
 
 
 clear_session_vertex_region = reset_vertex_sticky_region
@@ -192,10 +201,13 @@ def migrate_vertex_sticky_region(old_session_id: Optional[str], new_session_id: 
     new_sid = _canonical_affinity_session_id(new_session_id)
     if not old_sid:
         return
+    now_mono = time.monotonic()
     with _EUROPE_WEST2_STATE_LOCK:
         prev = _session_region_affinity.pop(old_sid, None)
+        _session_region_last_seen.pop(old_sid, None)
         if new_sid and prev in REGIONAL_VERTEX_REGIONS:
             _session_region_affinity[new_sid] = prev
+            _session_region_last_seen[new_sid] = now_mono
 
 
 def get_session_vertex_region_affinity(session_id: Optional[str]) -> Optional[str]:
@@ -207,15 +219,31 @@ def get_session_vertex_region_affinity(session_id: Optional[str]) -> Optional[st
         return _session_region_affinity.get(sid)
 
 
+def get_active_europe_west2_session_count(now_monotonic: Optional[float] = None) -> int:
+    """Return number of sessions pinned to europe-west2 active within the TTL window."""
+    now_val = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    with _EUROPE_WEST2_STATE_LOCK:
+        return sum(
+            1
+            for s, r in _session_region_affinity.items()
+            if r == EUROPE_WEST2_VERTEX_REGION
+            and (now_val - _session_region_last_seen.get(s, now_val)) <= EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS
+        )
+
+
 def _record_session_vertex_region_affinity(session_id: Optional[str], region: str) -> None:
     sid = _canonical_affinity_session_id(session_id)
     if not sid:
         return
+    now_mono = time.monotonic()
     with _EUROPE_WEST2_STATE_LOCK:
         _session_region_affinity.pop(sid, None)
         _session_region_affinity[sid] = region
+        _session_region_last_seen[sid] = now_mono
         while len(_session_region_affinity) > _SESSION_AFFINITY_CAP:
-            del _session_region_affinity[next(iter(_session_region_affinity))]
+            oldest = next(iter(_session_region_affinity))
+            del _session_region_affinity[oldest]
+            _session_region_last_seen.pop(oldest, None)
 
 
 def acquire_vertex_hybrid_region(
@@ -275,10 +303,7 @@ def acquire_vertex_hybrid_region(
                 else EUROPE_WEST2_VERTEX_REGION
             )
             if pinned_region is None and target_region == EUROPE_WEST2_VERTEX_REGION:
-                with _EUROPE_WEST2_STATE_LOCK:
-                    ew2_active = sum(
-                        1 for r in _session_region_affinity.values() if r == EUROPE_WEST2_VERTEX_REGION
-                    )
+                ew2_active = get_active_europe_west2_session_count()
                 if ew2_active >= EUROPE_WEST2_MAX_ACTIVE_SESSIONS:
                     target_region = ASIA_SOUTHEAST1_VERTEX_REGION
             cd_rem = (
@@ -307,6 +332,21 @@ def acquire_vertex_hybrid_region(
                     acquired = sem.acquire(blocking=True, timeout=wait_s)
                 else:
                     acquired = sem.acquire(blocking=False)
+                if not acquired and pinned_region is None and interactive and bool(session_id):
+                    alt_region = (
+                        ASIA_SOUTHEAST1_VERTEX_REGION
+                        if target_region == EUROPE_WEST2_VERTEX_REGION
+                        else EUROPE_WEST2_VERTEX_REGION
+                    )
+                    if alt_region != EUROPE_WEST2_VERTEX_REGION or vertex_regional_cooldown_remaining() <= 0.0:
+                        alt_sem = (
+                            _ASIA_SOUTHEAST1_ARGON_SEMAPHORE
+                            if alt_region == ASIA_SOUTHEAST1_VERTEX_REGION
+                            else _EUROPE_WEST2_ARGON_SEMAPHORE
+                        )
+                        if alt_sem.acquire(blocking=False):
+                            target_region = alt_region
+                            acquired = True
                 if acquired:
                     _record_session_vertex_region_affinity(session_id, target_region)
                     return (target_region, True)

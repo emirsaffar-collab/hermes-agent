@@ -484,6 +484,7 @@ class ClientLifecycleMixin:
         # request ~3x past our stale detector.
         request_kwargs["max_retries"] = 0
         slot_held = False
+        target_region: Optional[str] = None
         routed_base_url = None
         if getattr(self, "provider", None) == "vertex":
             from agent.vertex_adapter import (
@@ -541,7 +542,13 @@ class ClientLifecycleMixin:
             with self._openai_client_lock():
                 primary_key = self._request_slot(_OPENAI_SLOT).get("key")
                 primary_url = str(primary_key.get("base_url", "")) if isinstance(primary_key, dict) else ""
-                if "europe-west2-aiplatform.googleapis.com" in primary_url:
+                if any(
+                    h in primary_url
+                    for h in (
+                        "europe-west2-aiplatform.googleapis.com",
+                        "asia-southeast1-aiplatform.googleapis.com",
+                    )
+                ):
                     target_slot = _OPENAI_GLOBAL_FALLBACK_SLOT
         try:
             if self._api_kwargs_have_image_parts(api_kwargs or {}):
@@ -557,6 +564,7 @@ class ClientLifecycleMixin:
                 if slot_held or routed_base_url is not None:
                     with suppress(Exception):
                         cached._vertex_regional_slot_held = bool(slot_held)
+                        cached._vertex_regional_slot_region = target_region if slot_held else None
                         cached._request_slot_name = target_slot
                         if routed_base_url is not None:
                             cached._vertex_routed_base_url = routed_base_url
@@ -570,15 +578,25 @@ class ClientLifecycleMixin:
             if slot_held or routed_base_url is not None:
                 with suppress(Exception):
                     client._vertex_regional_slot_held = bool(slot_held)
+                    client._vertex_regional_slot_region = target_region if slot_held else None
                     client._request_slot_name = target_slot
                     if routed_base_url is not None:
                         client._vertex_routed_base_url = routed_base_url
             return client
         except BaseException:
             if slot_held:
-                from agent.vertex_adapter import _EUROPE_WEST2_ARGON_SEMAPHORE
+                from agent.vertex_adapter import (
+                    ASIA_SOUTHEAST1_VERTEX_REGION,
+                    _ASIA_SOUTHEAST1_ARGON_SEMAPHORE,
+                    _EUROPE_WEST2_ARGON_SEMAPHORE,
+                )
+                sem = (
+                    _ASIA_SOUTHEAST1_ARGON_SEMAPHORE
+                    if target_region == ASIA_SOUTHEAST1_VERTEX_REGION
+                    else _EUROPE_WEST2_ARGON_SEMAPHORE
+                )
                 with suppress(ValueError):
-                    _EUROPE_WEST2_ARGON_SEMAPHORE.release()
+                    sem.release()
             raise
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:

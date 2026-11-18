@@ -676,3 +676,124 @@ def test_compaction_storm_long_term_fixes_guardrails_budget_and_lineage(tmp_path
     assert "tier1_runaway_autonomous_turn" in v_runaway["reason"]
 
 
+def test_extract_vertex_cluster_id_aligns_22_char_borg_request_id():
+    # 23-char (17-byte, raw[11]==0x0f) Borg request_id slices rid[10:16] directly
+    assert rsb.extract_vertex_cluster_id("K3P8aqzEB_Cxg7QP5O6x-AI") == "Cxg7QP"
+    # 22-char (16-byte, 2-byte usec LEB128 varint) Borg request_id aligns byte 10 -> 11 to recover canonical TPU pod & cell
+    assert rsb.extract_vertex_cluster_id("WnX8aqJ4_7iDtA_u76WoDw") == "-4g7QP"
+    assert rsb.extract_vertex_cluster_id("tqr3apZd-q_r7A_q_abgCA") == "qv6-wP"
+    assert rsb.extract_vertex_cluster_id("s7T3ar4cgfSy0w_Oq6HpAg") == "H0stMP"
+    # 20-char (15-byte, 1-byte or 2-byte usec LEB128 varint) Borg request_id aligns to canonical TPU pod & cell
+    assert rsb.extract_vertex_cluster_id("vAr8amqdi-vsD8XjlIkI") == "2L6-wP"
+    assert rsb.extract_vertex_cluster_id("u5b7arcMxry6wQ_46qgR") == "a8usEP"
+    assert rsb.extract_vertex_cluster_id("7ZD7atJ9gdbgBNuDk5gC") == "HW4ATb"
+    assert rsb.extract_vertex_cluster_id("n5j8asPcMJ2SmNAP-a4I") == "2SmNAP"
+    # 22-char 4ATb (3-byte usec LEB128 varint) preserves rid[10:16]
+    assert rsb.extract_vertex_cluster_id("pjb5auGeHoHW4ATbg5OYAg") == "HW4ATb"
+
+
+def test_spend_breaker_progress_survives_compaction_and_single_diagnostic_exit(tmp_path, monkeypatch):
+    from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+
+    ctrl = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    ctrl.after_call("read_file", {"path": "/repo/a.py"}, '{"content": "a = 1\\n"}', failed=False)
+    assert ctrl.is_making_productive_progress() is True
+    assert ctrl.is_making_spend_breaker_progress() is True
+
+    # 1) Immediately after mid-turn compaction (before first post-compaction tool call):
+    #    extend_on_progress gate (is_making_productive_progress) is False, while spend-breaker
+    #    progress (is_making_spend_breaker_progress) stays True so begin_iteration does not
+    #    kill the turn with pending_tool_result before the first post-compaction LLM call.
+    ctrl.reset_after_compaction()
+    assert ctrl.is_making_productive_progress() is False
+    assert ctrl.is_making_spend_breaker_progress() is True
+
+    # 2) Single non-zero diagnostic exit (e.g. diff -u exit 1 or gate check exit 1):
+    #    is_making_productive_progress is False (no +1 budget extension), but
+    #    is_making_spend_breaker_progress stays True for 1 turn so the model can read the output.
+    ctrl.after_call("terminal", {"command": "diff -u a.patch b.patch"}, '{"exit_code": 1, "output": "@@ -1 +1 @@"}')
+    assert ctrl.is_making_productive_progress() is False
+    assert ctrl.is_making_spend_breaker_progress() is True
+
+    # Negative polarity: 2nd consecutive failure flips is_making_spend_breaker_progress to False
+    ctrl.after_call("terminal", {"command": "false"}, '{"exit_code": 1, "output": "fail 2"}')
+    assert ctrl.is_making_spend_breaker_progress() is False
+
+    # Negative polarity: even a single auth-wall failure flips is_making_spend_breaker_progress to False
+    ctrl.reset_for_turn()
+    ctrl.after_call("read_file", {"path": "/repo/a.py"}, '{"content": "a = 1\\n"}', failed=False)
+    ctrl.after_call("terminal", {"command": "bq query"}, '{"exit_code": 1, "error": "invalid_grant: rapt_required"}')
+    assert ctrl.is_making_spend_breaker_progress() is False
+
+    # 3) Parallel interactive subagents: 2 cluster-hop resets in child_a + 2 in child_b do NOT
+    #    falsely trip tier1_cache_reset_storm (4 resets) on the parent Desktop session, whereas
+    #    4 resets inside a single subagent still trips tier1_cache_reset_storm.
+    rids = (
+        "K3P8aqzEB_Cxg7QP5O6x-AI",
+        "CN_3atLcDrqFg7QPgvDv8QM",
+        "K3P8aqzEB_Cxg7QP5O6x-AJ",
+    )
+    for child_idx, child_sid in enumerate(("sub_par_a", "sub_par_b")):
+        for call_idx, base_rid in enumerate(rids):
+            rsb.record_realtime_llm_call(
+                session_id=child_sid,
+                source="subagent",
+                job_name="parent:desk_parent_par",
+                provider="vertex",
+                model="google/gemini-4-argon",
+                prompt_tokens=360_000,
+                uncached_input_tokens=50_000 if call_idx == 0 else 350_000,
+                cache_read_tokens=310_000 if call_idx == 0 else 10_000,
+                output_tokens=400,
+                request_id=f"{base_rid[:-1]}{child_idx}",
+            )
+    v_par_ok = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_par_a",
+        source="subagent",
+        parent_session_id="desk_parent_par",
+        parent_source="desktop",
+        job_name="parent:desk_parent_par",
+        making_productive_progress=True,
+    )
+    assert v_par_ok["allowed"] is True
+
+    # Negative polarity: 4 resets inside a SINGLE subagent trips tier1_cache_reset_storm
+    single_rids = (
+        "K3P8aqzEB_Cxg7QP5O6x-B0",
+        "CN_3atLcDrqFg7QPgvDv8R1",
+        "K3P8aqzEB_Cxg7QP5O6x-B2",
+        "CN_3atLcDrqFg7QPgvDv8R3",
+        "K3P8aqzEB_Cxg7QP5O6x-B4",
+    )
+    for call_idx, rid in enumerate(single_rids):
+        rsb.record_realtime_llm_call(
+            session_id="sub_single_storm",
+            source="subagent",
+            job_name="parent:desk_parent_storm",
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=360_000,
+            uncached_input_tokens=50_000 if call_idx == 0 else 350_000,
+            cache_read_tokens=310_000 if call_idx == 0 else 10_000,
+            output_tokens=400,
+            request_id=rid,
+        )
+    v_storm = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_single_storm",
+        source="subagent",
+        parent_session_id="desk_parent_storm",
+        parent_source="desktop",
+        job_name="parent:desk_parent_storm",
+        making_productive_progress=True,
+    )
+    assert v_storm["allowed"] is False
+    assert "tier1_cache_reset_storm" in v_storm["reason"]
+
+
+
+

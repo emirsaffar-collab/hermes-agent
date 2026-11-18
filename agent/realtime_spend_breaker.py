@@ -19,6 +19,7 @@ Enforces quality-neutral multi-tier leak stopping:
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import logging
@@ -322,7 +323,18 @@ def _connect() -> sqlite3.Connection:
 def extract_vertex_cluster_id(request_id: str | None) -> str:
     if not request_id or not isinstance(request_id, str):
         return ""
-    rid = request_id.strip()
+    rid = request_id.strip().removeprefix("chatcmpl-")
+    if len(rid) in (20, 22) and not rid.startswith("*"):
+        try:
+            pad = "=" * ((4 - len(rid) % 4) % 4)
+            raw = base64.urlsafe_b64decode(rid + pad)
+            if len(raw) in (15, 16):
+                if raw[4] < 0x80 and len(raw) == 15:
+                    return base64.urlsafe_b64encode(b"\x00\x00" + raw).decode("ascii")[10:16]
+                if raw[4] >= 0x80 and raw[5] < 0x80 and (len(raw) <= 11 or raw[11] != 0x0f):
+                    return base64.urlsafe_b64encode(b"\x00" + raw).decode("ascii")[10:16]
+        except Exception:
+            pass
     if len(rid) >= 16:
         return rid[10:16]
     return rid[:16]
@@ -856,11 +868,17 @@ def evaluate_realtime_spend_breaker(
             if family_job_tag:
                 cur.execute(
                     f"""
-                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
+                    SELECT COALESCE(SUM(net_eur), 0.0),
+                           COALESCE(SUM(CASE WHEN session_id IN ({s_placeholders}) THEN cache_reset ELSE 0 END), 0)
                     FROM llm_call_ledger
                     WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND ts >= ?
                     """,
-                    (*spend_sids, family_job_tag, ts_now - 900.0),
+                    (
+                        *spend_sids,
+                        *spend_sids,
+                        family_job_tag,
+                        ts_now - 900.0,
+                    ),
                 )
             else:
                 cur.execute(
@@ -933,7 +951,10 @@ def evaluate_realtime_spend_breaker(
                     "reason": f"throttled:{q_reason} (€{s_eur_15m:.2f}/15m, €{s_eur_1h:.2f}/1h)",
                     "session_net_eur_15m": s_eur_15m,
                 }
-        elif not is_interactive or not making_productive_progress:
+        elif not is_interactive or (
+            not making_productive_progress
+            and int(consecutive_calls_since_user or 0) > 2
+        ):
             return {
                 "allowed": False,
                 "reason": f"quarantined:{q_reason}",

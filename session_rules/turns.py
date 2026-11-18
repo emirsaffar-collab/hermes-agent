@@ -283,10 +283,17 @@ _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT = (
     "Continue from the compressed conversation context above. This marker exists because the compacted "
     "transcript contained no preserved user turn."
 )
+_LEGACY_MAX_ITERATIONS_SUMMARY_REQUEST = (
+    "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response "
+    "summarizing what you've found and accomplished so far, without calling any more tools."
+)
 # Content string is the authoritative marker: the store drops ``_``-metadata.
 MAX_ITERATIONS_SUMMARY_REQUEST = (
     "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response "
-    "summarizing what you've found and accomplished so far, without calling any more tools."
+    "summarizing what you've found and accomplished so far, without calling any more tools. "
+    "If any tool result in history was stubbed or demoted (e.g. '(N chars result)' or 'output demoted at compaction'), "
+    "do NOT guess, reconstruct, or infer specific fields, IDs, or email addresses from its evicted payload — "
+    "state explicitly which fields were evicted from context and require re-reading."
 )
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
 
@@ -460,7 +467,8 @@ def _is_synthetic_compression_user_turn(message: Any) -> bool:
     text = _content_text_for_contains(message.get("content")).strip()
     return text in {
         COMPRESSION_CONTINUATION_USER_CONTENT, _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
-        MAX_ITERATIONS_SUMMARY_REQUEST, _CODEX_INCOMPLETE_NUDGE, _CODEX_ACK_CONTINUATION_NUDGE,
+        MAX_ITERATIONS_SUMMARY_REQUEST, _LEGACY_MAX_ITERATIONS_SUMMARY_REQUEST,
+        _CODEX_INCOMPLETE_NUDGE, _CODEX_ACK_CONTINUATION_NUDGE,
         _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE,
         _LENGTH_CONTINUATION_NETWORK_STUB, _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB,
         _LENGTH_CONTINUATION_OUTPUT_LIMIT,
