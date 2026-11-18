@@ -323,12 +323,16 @@ def _connect() -> sqlite3.Connection:
 def extract_vertex_cluster_id(request_id: str | None) -> str:
     if not request_id or not isinstance(request_id, str):
         return ""
-    rid = request_id.strip()
-    if len(rid) == 22 and not rid.startswith("*"):
+    rid = request_id.strip().removeprefix("chatcmpl-")
+    if len(rid) in (20, 22) and not rid.startswith("*"):
         try:
-            raw = base64.urlsafe_b64decode(rid + "==")
-            if len(raw) == 16 and raw[11] != 0x0f and raw[10] == 0x0f:
-                return base64.urlsafe_b64encode(b"\x00" + raw).decode("ascii")[10:16]
+            pad = "=" * ((4 - len(rid) % 4) % 4)
+            raw = base64.urlsafe_b64decode(rid + pad)
+            if len(raw) in (15, 16):
+                if raw[4] < 0x80 and len(raw) == 15:
+                    return base64.urlsafe_b64encode(b"\x00\x00" + raw).decode("ascii")[10:16]
+                if raw[4] >= 0x80 and raw[5] < 0x80 and (len(raw) <= 11 or raw[11] != 0x0f):
+                    return base64.urlsafe_b64encode(b"\x00" + raw).decode("ascii")[10:16]
         except Exception:
             pass
     if len(rid) >= 16:
