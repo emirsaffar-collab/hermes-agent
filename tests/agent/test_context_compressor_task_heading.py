@@ -63,3 +63,96 @@ def test_long_user_request_is_not_quoted_by_summary_model():
     )
     assert latest_request.strip() in grounded
     assert "## Goal\nCheck an issue" in grounded
+
+
+def test_protected_head_user_turn_grounds_snapshot_and_survives_merged_inflight_replay():
+    """Regression (512 Garmin RCA 2026-11-18): when the sole user turn sits in protected_head
+    (compress_start == 1) on Compaction #1 and is then merged onto the summary carrier via
+    _INFLIGHT_TASK_REPLAY_HEADER on Compaction #2+, turns_to_summarize has zero user rows.
+    _generate_summary must still ground ## Historical Task Snapshot and ## User Messages (verbatim)
+    from messages[:scan.tail_start], overwriting any hallucinated summarizer task list.
+    """
+    user_directive = (
+        "skapa en sales order så att det dras från saldot som personalköp i one, "
+        "skriv inte att det är till Alina, bara Personalköp Emir Saffar."
+    )
+    hallucinated_llm_summary = (
+        f"{HISTORICAL_TASK_HEADING}\n"
+        "User instructed:\n"
+        "1. Skapa en sales order i ERP One.\n"
+        "2. Skriv inte att det är till Alina.\n"
+        "3. Skriv ett mejl/meddelande till butik 512 (512@uropenn.se).\n\n"
+        "## Goal\nCreate order.\n\n"
+        "## Completed Actions\n1. READ schema [tool: terminal]\n"
+    )
+    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        compressor = ContextCompressor(
+            model="google/gemini-4-argon",
+            threshold_percent=0.18,
+            protect_first_n=1,
+            protect_last_n=4,
+            quiet_mode=True,
+        )
+
+    def _tool_pair(idx: int, chars: int = 8_000) -> list[dict]:
+        cid = f"call_{idx}"
+        return [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": cid, "type": "function", "function": {"name": "terminal", "arguments": '{"command":"roq"}'}}],
+            },
+            {"role": "tool", "tool_call_id": cid, "name": "terminal", "content": f"row-{idx}-" + ("x" * chars)},
+        ]
+
+    messages: list[dict] = [{"role": "user", "content": user_directive}]
+    for i in range(12):
+        messages.extend(_tool_pair(i))
+
+    with patch.object(compressor, "_call_summary_llm", return_value=hallucinated_llm_summary):
+        compacted_1 = compressor.compress(messages, current_tokens=90_000, force=True)
+
+    summaries_1 = [m for m in compacted_1 if compressor._is_context_summary_message(m)]
+    assert len(summaries_1) == 1
+    s1_text = str(summaries_1[0]["content"])
+    assert "User asked (deterministic, from compacted turns):" in s1_text
+    assert "3. Skriv ett mejl/meddelande till butik 512" not in s1_text
+    assert "## User Messages (verbatim, newest first)" in s1_text
+    assert user_directive in s1_text
+
+    # Compaction #2: user_directive now rides only on the merged in-flight replay carrier.
+    messages_2 = list(compacted_1)
+    for i in range(12, 24):
+        messages_2.extend(_tool_pair(i))
+
+    with patch.object(compressor, "_call_summary_llm", return_value=hallucinated_llm_summary):
+        compacted_2 = compressor.compress(messages_2, current_tokens=90_000, force=True)
+
+    summaries_2 = [m for m in compacted_2 if compressor._is_context_summary_message(m)]
+    assert len(summaries_2) == 1
+    s2_text = str(summaries_2[0]["content"])
+    assert "User asked (deterministic, from compacted turns):" in s2_text
+    assert "3. Skriv ett mejl/meddelande till butik 512" not in s2_text
+    assert "## User Messages (verbatim, newest first)" in s2_text
+    assert user_directive in s2_text
+
+
+def test_verbatim_user_section_excludes_max_iterations_nudges():
+    """MAX_ITERATIONS_SUMMARY_REQUEST (current and legacy) must never be quoted as user words."""
+    from agent.context_compressor import (
+        MAX_ITERATIONS_SUMMARY_REQUEST,
+        _LEGACY_MAX_ITERATIONS_SUMMARY_REQUEST,
+        _build_verbatim_user_section,
+    )
+
+    turns = [
+        {"role": "user", "content": "check past orders and logs"},
+        {"role": "user", "content": _LEGACY_MAX_ITERATIONS_SUMMARY_REQUEST},
+        {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST},
+    ]
+    section = _build_verbatim_user_section(turns)
+    assert "check past orders and logs" in section
+    assert "maximum number of tool-calling iterations allowed" not in section
+    assert "do NOT guess, reconstruct, or infer" in MAX_ITERATIONS_SUMMARY_REQUEST
+    assert ContextCompressor._is_synthetic_compression_user_turn({"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST})
+    assert ContextCompressor._is_synthetic_compression_user_turn({"role": "user", "content": _LEGACY_MAX_ITERATIONS_SUMMARY_REQUEST})

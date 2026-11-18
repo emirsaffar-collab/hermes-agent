@@ -433,10 +433,17 @@ _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT = (
     "Continue from the compressed conversation context above. This marker exists because the compacted "
     "transcript contained no preserved user turn."
 )
+_LEGACY_MAX_ITERATIONS_SUMMARY_REQUEST = (
+    "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response "
+    "summarizing what you've found and accomplished so far, without calling any more tools."
+)
 # Content string is the authoritative marker: SessionDB drops ``_``-metadata.
 MAX_ITERATIONS_SUMMARY_REQUEST = (
     "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response "
-    "summarizing what you've found and accomplished so far, without calling any more tools."
+    "summarizing what you've found and accomplished so far, without calling any more tools. "
+    "If any tool result in history was stubbed or demoted (e.g. '(N chars result)' or 'output demoted at compaction'), "
+    "do NOT guess, reconstruct, or infer specific fields, IDs, or email addresses from its evicted payload — "
+    "state explicitly which fields were evicted from context and require re-reading."
 )
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
 
@@ -1377,10 +1384,17 @@ def _typed_user_text(content: str) -> str:
 
 def _build_verbatim_user_section(turns: list[dict[str, Any]]) -> str:
     """Compacted region's REAL user messages verbatim, newest-first under a char budget (straddler truncated); "" if none."""
+    from agent.conversation_compression import _is_real_user_message
     collected: list[str] = []
     used = 0
     for msg in reversed(turns):
-        if msg.get("role") != "user":
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        if ContextCompressor._has_merged_inflight_replay(msg):
+            _, replay_tail = split_inflight_replay_turn(msg)
+            if replay_tail is not None:
+                msg = replay_tail
+        if not _is_real_user_message(msg):
             continue
         content = _typed_user_text(_content_text_for_contains(msg.get("content")))
         if _synthetic_user_row(content):
@@ -4258,13 +4272,19 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             logger.info("Lean tail: demoted %d stale tool result(s)", demoted)
         return result
 
-    def _augment_summary_lean(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
+    def _augment_summary_lean(
+        self,
+        summary: str,
+        turns_to_summarize: list[dict[str, Any]],
+        user_turns: Optional[list[dict[str, Any]]] = None,
+    ) -> str:
         """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
         if getattr(self, "tail_mode", "lean") != "lean":
             return summary
+        effective_user_turns = user_turns if user_turns is not None else turns_to_summarize
         for heading, build in (
             (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
-            (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(_build_verbatim_user_section(turns_to_summarize))),
+            (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(_build_verbatim_user_section(effective_user_turns))),
             (_LEAN_RECOVERY_HEADING, lambda: _build_recovery_footer(getattr(self, "_session_id", "") or "", len(turns_to_summarize))),
         ):
             if heading not in summary:
@@ -4533,11 +4553,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary = _strip_deterministic_lean_sections(summary)
             summary = _compact_previous_summary_lists(summary)
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
-            summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
+            grounding_turns = turns_to_summarize
+            if has_user_turn and not self._latest_user_task_snapshot(turns_to_summarize):
+                fallback_turns = getattr(self, "_active_grounding_messages", None)
+                if fallback_turns:
+                    grounding_turns = fallback_turns
+            summary = self._ground_historical_task_snapshot(summary, grounding_turns)
             summary = _scrub_ungrounded_summary_id_labels(
                 summary, grounding_transcript, anchor_grounding, self._previous_summary, memory_context, focus_topic
             )
-            summary = self._augment_summary_lean(summary, turns_to_summarize)
+            summary = self._augment_summary_lean(summary, turns_to_summarize, user_turns=grounding_turns)
             self._validate_summary_user_provenance(summary, has_user_turn)
             # A detached stale attempt must not publish its late summary onto shared compressor state:
             # the fallback already advanced _previous_summary and owns the cooldown/error fields. The
@@ -4890,7 +4915,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         )
         return text in {
             COMPRESSION_CONTINUATION_USER_CONTENT, _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
-            MAX_ITERATIONS_SUMMARY_REQUEST, _CODEX_INCOMPLETE_NUDGE, _CODEX_ACK_CONTINUATION_NUDGE,
+            MAX_ITERATIONS_SUMMARY_REQUEST, _LEGACY_MAX_ITERATIONS_SUMMARY_REQUEST,
+            _CODEX_INCOMPLETE_NUDGE, _CODEX_ACK_CONTINUATION_NUDGE,
             _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE,
             _LENGTH_CONTINUATION_NETWORK_STUB, _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
@@ -4999,7 +5025,13 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Reuse the runtime's real-user predicate so scaffolding rows can never anchor.
         from agent.conversation_compression import _is_real_user_message
         for msg in reversed(messages):
-            if msg.get("role") != "user" or not _is_real_user_message(msg):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            if cls._has_merged_inflight_replay(msg):
+                _, replay_tail = split_inflight_replay_turn(msg)
+                if replay_tail is not None:
+                    msg = replay_tail
+            if not _is_real_user_message(msg):
                 continue
             text = _redact_compaction_text(_typed_user_text(_content_text_for_contains(msg.get("content"))).strip())
             if not text:

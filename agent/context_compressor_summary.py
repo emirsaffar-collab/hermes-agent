@@ -91,6 +91,7 @@ class SummaryDispatchMixin:
         }
         if _accepts_keyword_argument(self._generate_summary, "bypass_cooldown"):
             summary_kwargs["bypass_cooldown"] = bypass_cooldown
+        self._active_grounding_messages = messages[:scan.tail_start]
         try:
             return self._generate_summary(turns_to_summarize, **summary_kwargs)
         except AuxiliaryExplicitCancellation:
