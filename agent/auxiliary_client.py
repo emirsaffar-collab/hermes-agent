@@ -7101,7 +7101,7 @@ class _ChatStreamAccumulator:
         if delta is None:
             return False
         made_progress = False
-        from agent.message_content import flatten_message_text
+        from session_rules.turns import flatten_message_text
         from agent.reasoning_carriers import is_google_thought
 
         google_thought = is_google_thought(delta)

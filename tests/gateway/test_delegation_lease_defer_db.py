@@ -11,7 +11,7 @@ import time
 
 from gateway.run_notifications import GatewayNotificationsMixin
 from hermes_state import SessionDB
-from hermes_state_errors import SessionTurnLeaseLostError
+from persistence.sqlite._state.errors import SessionTurnLeaseLostError
 
 
 def _fence_message_polarity(tmp_path):

@@ -1,45 +1,30 @@
-"""Cron job scheduling for Hermes Agent: scheduled tasks (cron expressions, intervals, one-shot),
-self-scheduled reminders, isolated sessions. The gateway daemon (``hermes gateway [install]``) ticks
-the scheduler every 60 seconds; a file lock prevents duplicate execution across processes.
-"""
-
-# The restart-safe external worker runs as ``-m cron.scheduler``, which executes this package
-# first: boot PM dependencies before ``cron.jobs`` reaches a third-party import. A no-op
-# unless ``_launch_external_cron_worker`` marked this process. See cron/worker_bootstrap.py.
-from cron.worker_bootstrap import worker_bootstrap as _boot_external_worker
-
-_boot_external_worker()
+"""Cron job scheduling system for Hermes Agent."""
 
 from cron.jobs import (
     create_job,
     get_job,
     list_jobs,
+    mark_job_run,
+    parse_schedule,
     remove_job,
     update_job,
-    pause_job,
-    resume_job,
-    trigger_job,
-    rearm_oneshot,
-    JOBS_FILE,
 )
+
+__all__ = [  # noqa: F822
+    "create_job",
+    "get_job",
+    "list_jobs",
+    "mark_job_run",
+    "parse_schedule",
+    "remove_job",
+    "tick",
+    "update_job",
+]
+
+
 def __getattr__(name: str):
     if name == "tick":
         from cron.scheduler import tick
 
-        globals()["tick"] = tick
         return tick
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-__all__ = [
-    "JOBS_FILE",
-    "create_job",
-    "get_job",
-    "list_jobs",
-    "pause_job",
-    "rearm_oneshot",
-    "remove_job",
-    "resume_job",
-    "tick",
-    "trigger_job",
-    "update_job",
-]

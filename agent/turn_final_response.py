@@ -200,9 +200,6 @@ def finish_text_response(
     agent._truncated_tool_call_retries = 0
     agent._content_filter_retries = 0
     agent._thinking_prefill_retries = 0
-    # Surface the one-shot fallback switch notice before dropping the retry buffer so a
-    # provider/model switch stays visible on success.
-    agent._emit_pending_fallback_notice()
     agent._clear_status_buffer()
 
     if marker_verdict := _recover_marker_reply(

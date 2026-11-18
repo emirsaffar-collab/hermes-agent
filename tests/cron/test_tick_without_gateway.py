@@ -191,7 +191,7 @@ def test_non_owner_tick_holds_agent_jobs_during_supervisor_respawn_or_starting(c
     # Case 1: gateway_state.json records gateway_state="running" updated just now while PID is absent
     (cron_home / "gateway_state.json").write_text(json.dumps({
         "gateway_state": "running",
-        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "updated_at": dt.datetime.now(dt.UTC).isoformat(),
     }), encoding="utf-8")
     monkeypatch.setattr(
         "hermes_cli.gateway_runtime.discover_gateway_endpoint",

@@ -121,7 +121,7 @@ def test_session_rows_sig_is_chunk_size_invariant_and_handles_blobs(tmp_path):
 
 def test_state_meta_local_policy_partial_indexes_prevent_full_scans(tmp_path):
     from hermes_state import SessionDB
-    from hermes_state_common import LOCAL_POLICY_PREFIX, NONDEFAULT_POLICY_WHERE
+    from persistence.sqlite._schema_ddl import LOCAL_POLICY_PREFIX, NONDEFAULT_POLICY_WHERE
 
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path)

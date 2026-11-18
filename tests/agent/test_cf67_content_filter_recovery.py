@@ -543,7 +543,7 @@ def test_cf76_inflight_replay_compaction_carrier_reanchors_and_retains_refused_t
     )
     from agent.turn_failure_copy import CONTENT_REFUSED_DISPLAY_KIND
     from hermes_state import SessionDB
-    from hermes_state_rewind import retain_refused_turn_for_display
+    from persistence.sqlite.conversation._store.rewind import retain_refused_turn_for_display
 
     carrier_text = (
         f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold summary\n\n"

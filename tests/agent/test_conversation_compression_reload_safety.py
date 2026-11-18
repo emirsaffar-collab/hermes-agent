@@ -158,7 +158,7 @@ def test_topological_reload_and_enum_exception_singleton_preservation():
     import agent.turn_context as tc
     import agent.turn_preflight as tp
     import agent.turn_recovery as tr
-    import hermes_state_rewind as hsr
+    from persistence.sqlite.conversation._store import rewind as hsr
     import tools.skills_tool_dedup as std
 
     orig_fr = ec.FailoverReason
