@@ -472,7 +472,8 @@ class SessionCompressionMixin:
             "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
             (total_messages, total_tool_calls, child_session_id))
         updated = conn.execute(
-            "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
+            "UPDATE sessions SET ended_at = ?, end_reason = 'compression', "
+            "last_activity_description = NULL, last_activity_provenance = NULL "
             "WHERE id = ? AND ended_at IS NULL", (time.time(), parent_session_id))
         if updated.rowcount != 1:
             raise RuntimeError(f"Compression parent changed during publication: {parent_session_id}")

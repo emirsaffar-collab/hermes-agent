@@ -135,3 +135,35 @@ def test_quiet_activity_write_suppresses_in_process_mutex_warning(db, monkeypatc
     lines = [r.getMessage() for r in caplog.records if "writer mutex" in r.getMessage()]
     assert lines == [], f"quiet activity write logged unexpected writer mutex warning: {lines}"
 
+
+def test_publish_compression_child_clears_parent_activity_labels_atomically(db, monkeypatch):
+    """publish_compression_child clears the closed parent's activity labels inside the atomic
+    publication transaction so post-publish clear_session_activity_labels is a zero-write no-op."""
+    db.touch_session_activity("owned", description="compressing context", provenance="compression")
+    before = db._read_one(
+        "SELECT last_activity_description, last_activity_provenance FROM sessions WHERE id = ?",
+        ("owned",),
+    )
+    assert before["last_activity_description"] == "compressing context"
+
+    db.publish_compression_child(
+        parent_session_id="owned",
+        child_session_id="owned-child-1",
+        source="cli",
+        messages=[{"role": "user", "content": "handoff summary"}],
+        require_compression_lease=False,
+    )
+    after = db._read_one(
+        "SELECT last_activity_description, last_activity_provenance FROM sessions WHERE id = ?",
+        ("owned",),
+    )
+    assert after["last_activity_description"] is None
+    assert after["last_activity_provenance"] is None
+
+    write_calls = []
+    orig_write_sql = db._write_sql
+    monkeypatch.setattr(db, "_write_sql", lambda *a, **kw: (write_calls.append(a), orig_write_sql(*a, **kw))[1])
+    db.clear_session_activity_labels("owned")
+    assert write_calls == [], f"Expected zero post-publish write_sql calls, got {write_calls}"
+
+
