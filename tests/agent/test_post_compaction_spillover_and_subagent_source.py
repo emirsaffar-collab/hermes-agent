@@ -104,12 +104,13 @@ def test_deep_europe_west2_epoch_preserves_regional_affinity_across_transient_co
     # Another session triggers a temporary regional 429 cooldown
     vertex_adapter.record_vertex_regional_429(cooldown_seconds=15.0, session_id="other-session-429")
 
-    # While cooldown is active, the deep session (140k tokens) spills over for this single call
+    # While cooldown > sticky_wait_seconds is active, the deep session (140k tokens) spills over for this single call
     r1, acq1 = vertex_adapter.acquire_vertex_hybrid_region(
         "google/gemini-4-argon",
         configured_region="global",
         interactive=True,
         session_id=sid,
+        sticky_wait_seconds=0.01,
         last_prompt_tokens=140_000,
     )
     assert (r1, acq1) == (vertex_adapter.GLOBAL_VERTEX_REGION, False)
@@ -343,6 +344,23 @@ def test_cron_or_global_session_429_does_not_poison_europe_west2_cooldown():
     vertex_adapter.record_vertex_regional_429(cooldown_seconds=15.0, session_id="subagent_worker_1")
     vertex_adapter.record_vertex_regional_429(cooldown_seconds=15.0, session_id=global_sid)
     assert vertex_adapter.vertex_regional_cooldown_remaining() == 0.0
+
+    # Deep (>=55k) asia-southeast1 session 429 via last_prompt_tokens must neither trip
+    # europe-west2 cooldown nor overwrite its asia-southeast1 affinity
+    ase1_sid = "20261119_145920_22e131"
+    vertex_adapter._record_session_vertex_region_affinity(
+        ase1_sid, vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION
+    )
+    vertex_adapter.record_vertex_regional_429(
+        cooldown_seconds=15.0,
+        session_id=ase1_sid,
+        last_prompt_tokens=192_566,
+    )
+    assert vertex_adapter.vertex_regional_cooldown_remaining() == 0.0
+    assert (
+        vertex_adapter.get_session_vertex_region_affinity(ase1_sid)
+        == vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION
+    )
 
     # Warm europe-west2 session continues on europe-west2 without spilling
     r, acq = vertex_adapter.acquire_vertex_hybrid_region(

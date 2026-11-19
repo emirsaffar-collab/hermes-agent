@@ -939,7 +939,7 @@ def evaluate_realtime_spend_breaker(
             )
             family_job_tag = (
                 f"parent:{p_sid}"
-                if (src == "subagent" and p_sid and not is_interactive_subagent)
+                if (src == "subagent" and p_sid)
                 else ""
             )
             spend_sids = (

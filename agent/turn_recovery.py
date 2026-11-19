@@ -1974,17 +1974,24 @@ def route_classified_error(
                 and retry_count < 2
                 and not _is_stale_kill
             )
+            _is_bg_review_turn = (
+                getattr(agent, "_write_origin", None) == "background_review"
+                or getattr(agent, "_memory_write_origin", None) == "background_review"
+                or getattr(agent, "_turn_origin", None) == "background_review"
+            )
             _v_sid = (
                 None
-                if (
-                    _preserve_deep_ew2_cache
-                    or getattr(agent, "_write_origin", None) == "background_review"
-                    or getattr(agent, "_memory_write_origin", None) == "background_review"
-                    or getattr(agent, "_turn_origin", None) == "background_review"
-                )
+                if _is_bg_review_turn
                 else str(getattr(agent, "session_id", "") or "") or None
             )
-            record_vertex_regional_429(session_id=_v_sid)
+            record_vertex_regional_429(
+                session_id=_v_sid,
+                last_prompt_tokens=(
+                    max(_tr_prompt_tok, GLOBAL_STICKY_EPOCH_MIN_TOKENS)
+                    if _preserve_deep_ew2_cache
+                    else 0
+                ),
+            )
         except Exception:
             pass
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
