@@ -1999,6 +1999,41 @@ class TestGetPreVerifyContinueMessage:
         assert seen["attempt"] == 2
         assert seen["changed_paths"] == ["a.py"]
 
+    def test_pre_verify_nudge_consults_hook_on_open_items_section_even_without_edits(self, monkeypatch):
+        """When _turn_file_mutation_paths is empty (e.g. terminal/skill_manage/text turns),
+        _pre_verify_nudge still consults pre_verify hooks with changed_paths=[] if the
+        response contains an open-items/unverified section, while staying silent on
+        ordinary text turns."""
+        from types import SimpleNamespace
+        from agent.turn_stop_gates import _pre_verify_nudge
+
+        seen = []
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "pre_verify")
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_verify_continue_message",
+            lambda **kw: (seen.append(kw), "nudge from open-items-gate")[1],
+        )
+        agent = SimpleNamespace(
+            session_id="s-open",
+            platform="desktop",
+            model="test-model",
+            _turn_file_mutation_paths=set(),
+            _resolved_is_coding=True,
+        )
+        # Ordinary text turn without edits or open-items section -> does not consult hook
+        assert _pre_verify_nudge(agent, "Everything is complete.", 0) is None
+        assert seen == []
+
+        # Text turn containing 'What I Have NOT Verified' -> consults hook with changed_paths=[]
+        nudge = _pre_verify_nudge(
+            agent,
+            "### What I Have NOT Verified\n- Nothing remains unverified (0 open items)",
+            0,
+        )
+        assert nudge == "nudge from open-items-gate"
+        assert len(seen) == 1
+        assert seen[0]["changed_paths"] == []
+
 
 class TestThreadToolWhitelist:
     """Tests for the thread-local tool whitelist used by background review forks."""

@@ -50,16 +50,36 @@ def _verify_on_stop_nudge(agent) -> Optional[str]:
     return None
 
 
+_OPEN_ITEMS_HEADING_MARKERS = (
+    "what i have not verified",
+    "unverified / working hypotheses",
+    "what remains",
+    "what is blocked",
+    "vad jag inte verifierat",
+    "vad som inte är verifierat",
+    "öppna punkter",
+)
+
+
 def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
-    """After code edits a registered ``pre_verify`` hook may keep the agent going one
-    more turn; no default continuation cost."""
+    """After code edits (or when the reply includes an open-items/unverified section)
+    a registered ``pre_verify`` hook may keep the agent going one more turn; no default
+    continuation cost on ordinary text turns."""
     _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
     try:
         from agent.verify_hooks import max_verify_nudges
         from hermes_cli.lifecycle import has_hook
         from hermes_cli.plugins import get_pre_verify_continue_message
 
-        if _edited and has_hook("pre_verify") and attempt < max_verify_nudges():
+        _has_open_items_section = bool(
+            not _edited
+            and isinstance(final_response, str)
+            and (
+                os.environ.get("HERMES_PRE_VERIFY_TEXT_TURNS", "").strip().lower() in ("1", "true", "yes")
+                or any(_m in final_response.lower() for _m in _OPEN_ITEMS_HEADING_MARKERS)
+            )
+        )
+        if (_edited or _has_open_items_section) and has_hook("pre_verify") and attempt < max_verify_nudges():
             # Posture is fixed for the session — resolve once + cache.
             coding = getattr(agent, "_resolved_is_coding", None)
             if coding is None:
