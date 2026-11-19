@@ -421,6 +421,7 @@ class InMemoryMaintenance:
         victims = [
             row for sid, row in self._rows().items()
             if row["ended_at"] is None and row["source"] in wanted
+            and (not row.get("archived") or row.get("auto_archived"))
             and not (exclude_pinned and (row.get("pinned") or sid in tail))
             and row["started_at"].timestamp() < cutoff and self._recency(row) < cutoff
             and not (respect_gateway_heartbeats and self._owned_by_live_backend(row["started_at"].timestamp(), now - staleness, grace))

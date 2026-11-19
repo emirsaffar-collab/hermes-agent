@@ -136,6 +136,11 @@ def _not_pinned_sql(alias: str = "s") -> str:
     return f"COALESCE({alias}.pinned, 0) = 0 AND {alias}.id NOT IN ({_PINNED_TAIL_SQL})"
 
 
+def _not_deliberately_archived_sql(alias: str = "s") -> str:
+    """Predicate sparing deliberately archived rows (``archived != 0`` without ``auto_archived``)."""
+    return f"(COALESCE({alias}.archived, 0) = 0 OR COALESCE({alias}.auto_archived, 0) != 0)"
+
+
 _PRUNE_FILTER_NAMES = frozenset(name for name, _, _ in _PRUNE_FILTERS) | {"archived", "include_pinned", "lineage_tips_only"}
 
 
@@ -317,7 +322,10 @@ class SQLiteSessionMaintenance(SessionPortability):
             hb_grace = hb_staleness
         cutoff = (now := time.time()) - max_idle_seconds
         pin_scope = f" AND {_not_pinned_sql('sessions')}" if exclude_pinned else ""
-        orphan_predicate = f"started_at < ? AND {_sql_session_last_active('sessions')} < ?"
+        orphan_predicate = (
+            f"{_not_deliberately_archived_sql('sessions')} AND started_at < ?"
+            f" AND {_sql_session_last_active('sessions')} < ?"
+        )
         heartbeat_params: tuple[float, ...] = ()
         if respect_gateway_heartbeats:
             orphan_predicate += (" AND NOT EXISTS (SELECT 1 FROM gateway_heartbeats h WHERE"

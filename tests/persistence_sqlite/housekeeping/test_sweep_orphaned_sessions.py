@@ -661,3 +661,32 @@ class TestSweepOrphanedSessions:
         _make_session(db, "stale-tui", source="tui", started_at=stale, message_at=stale)
         assert _sweep(store, max_idle_seconds=0) == []
         assert get_session(db, "stale-tui")["ended_at"] is None
+
+    def test_deliberately_archived_open_session_spared_while_auto_archived_swept(self, store, db):
+        """Deliberate archives (``archived=1, auto_archived=0``) keep ``ended_at=NULL``
+        and ``end_reason=NULL`` so ``unarchive_recoverable`` never resurrects them and
+        ``prune_sessions`` never deletes them; idle-sweep ``auto_archived=1`` rows are
+        still closed so 90-day auto-maintenance ages them out."""
+        stale = time.time() - 8 * 3600
+        _make_session(db, "deliberate-arch", source="desktop", started_at=stale, message_at=stale)
+        _make_session(db, "auto-arch", source="desktop", started_at=stale, message_at=stale)
+        _make_session(db, "unarchived-orphan", source="desktop", started_at=stale, message_at=stale)
+
+        assert store.sessions.set_archived("deliberate-arch", True).changed is True
+        assert store.maintenance.auto_archive_lineage("auto-arch") is True
+
+        swept = set(_sweep(store, max_idle_seconds=IDLE_S))
+        assert swept == {"auto-arch", "unarchived-orphan"}
+
+        delib = get_session(db, "deliberate-arch")
+        assert delib is not None
+        assert delib["archived"] == 1
+        assert delib["auto_archived"] == 0
+        assert delib["ended_at"] is None
+        assert delib["end_reason"] is None
+        assert store.sessions.unarchive_recoverable("deliberate-arch") is False
+
+        auto_row = get_session(db, "auto-arch")
+        assert auto_row is not None
+        assert auto_row["end_reason"] == "startup_orphan_reap"
+        assert auto_row["ended_at"] is not None

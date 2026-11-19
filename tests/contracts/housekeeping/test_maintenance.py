@@ -176,14 +176,19 @@ def test_sweep_heartbeat_gate_can_be_disabled(backend, scope_a):
 
 def test_sweep_spares_leased_and_pinned_rows(backend, scope_a):
     store_a = backend.open(scope_a)
-    _seed(backend, scope_a, _payload("sw-leased"), _payload("sw-pinned"), _payload("sw-plain"))
+    _seed(backend, scope_a, _payload("sw-leased"), _payload("sw-pinned"), _payload("sw-delib-arch"), _payload("sw-auto-arch"), _payload("sw-plain"))
     assert store_a.coordination.try_acquire_compression_lock(session_id=SessionId("sw-leased"), holder="h1", ttl_seconds=60) is True
     assert store_a.sessions.set_pinned(SessionId("sw-pinned"), True)
-    # CONTRACT: a row under a live compression lock is spared; exclude_pinned spares pinned rows.
-    assert _sweep(store_a, exclude_pinned=True) == (SessionId("sw-plain"),)
+    assert store_a.sessions.set_archived(SessionId("sw-delib-arch"), True).changed is True
+    assert store_a.maintenance.auto_archive_lineage(SessionId("sw-auto-arch")) is True
+    # CONTRACT: a row under a live compression lock or deliberately archived is spared; auto_archived rows are swept; exclude_pinned spares pinned rows.
+    assert set(_sweep(store_a, exclude_pinned=True)) == {SessionId("sw-plain"), SessionId("sw-auto-arch")}
+    assert store_a.sessions.get(SessionId("sw-delib-arch")).ended_at is None
+    assert store_a.sessions.unarchive_recoverable(SessionId("sw-delib-arch")) is False
     store_a.coordination.release_compression_lock(session_id=SessionId("sw-leased"), holder="h1")
-    # CONTRACT: pinned rows are reaped when the sweep does not exclude them; the released row is reaped too.
+    # CONTRACT: pinned rows are reaped when the sweep does not exclude them; the released row is reaped too; deliberately archived rows remain spared.
     assert set(_sweep(store_a)) == {SessionId("sw-leased"), SessionId("sw-pinned")}
+    assert store_a.sessions.get(SessionId("sw-delib-arch")).ended_at is None
 
 
 def test_sweep_two_contenders_disjoint_union_is_victim_set(backend, scope_a):

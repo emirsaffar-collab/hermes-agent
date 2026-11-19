@@ -150,3 +150,47 @@ def test_reload_split_modules_preserves_persistence_for_and_detects_first_collis
         if "tui_gateway.fake_collision_mod" in _REGISTERED_SPLIT_MODULES:
             _REGISTERED_SPLIT_MODULES.remove("tui_gateway.fake_collision_mod")
 
+
+def test_no_top_level_assign_or_def_collisions_across_split_modules():
+    """Guard against duplicate top-level stubs (e.g. ``_persistence_for = lambda _s: None``)
+    shadowing real split-module implementations during ``server.py`` star-imports."""
+    import ast
+    from pathlib import Path
+
+    tui_dir = Path(server.__file__).resolve().parent
+    plumbing = {
+        "HandlerRegistry",
+        "method",
+        "_profile_scoped",
+        "register",
+        "rebind",
+        "reload_split_modules",
+        "logger",
+        "_",
+        "_registry",
+    }
+    seen: dict[str, str] = {}
+    collisions: list[str] = []
+    for path in sorted(tui_dir.glob("*.py")):
+        src = path.read_text(encoding="utf-8", errors="replace")
+        if "bind_module(" not in src or path.name in ("server.py", "method_ctx.py"):
+            continue
+        tree = ast.parse(src, filename=str(path))
+        for node in tree.body:
+            names: list[str] = []
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.append(node.name)
+            elif isinstance(node, ast.Assign):
+                names.extend(t.id for t in node.targets if isinstance(t, ast.Name))
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.append(node.target.id)
+            for name in names:
+                if name in plumbing:
+                    continue
+                prev = seen.get(name)
+                if prev and prev != path.name:
+                    collisions.append(f"{name}:{prev}<->{path.name}")
+                seen[name] = path.name
+    assert collisions == []
+
+
