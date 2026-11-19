@@ -958,6 +958,168 @@ def test_background_review_and_subagent_never_quarantine_desktop_parent_and_upda
     assert desk_sid not in q_sids
 
 
+def test_mid_turn_spend_breaker_over_max_iterations_completes_cleanly_in_cron(tmp_path, monkeypatch):
+    """Backtest for the 9 historical pending_tool_result cron runs (including 5 runs where
+    execute_code refunds / extend_on_progress raised api_call_count=54..82 above max_iterations=45):
+    finalize_turn must return completed=True, failed=False, final_response='[SILENT]' and
+    cron.scheduler._final_response_from_result must not raise RuntimeError('[SILENT]')."""
+    import json
+    from agent.turn_finalizer import finalize_turn
+    from cron.scheduler import _final_response_from_result
 
+    class _DummyBudget:
+        used = 54
+        max_total = 57
+        remaining = 3
 
+    class _DummyCompressor:
+        last_prompt_tokens = 173_057
+
+    class _DummyAgent:
+        max_iterations = 45
+        iteration_budget = _DummyBudget()
+        context_compressor = _DummyCompressor()
+        model = "google/gemini-4-argon"
+        provider = "vertex"
+        base_url = "https://aiplatform.googleapis.com"
+        session_id = "20261119_081812_05076e"
+        quiet_mode = True
+        platform = "cli"
+        cron_job_name: str | None = "lager-builder-owner"
+        _turn_origin: str | None = None
+        _interrupt_requested = False
+        _interrupt_message = None
+        _tool_guardrail_halt_decision = None
+        _response_was_previewed = False
+        _skill_nudge_interval = 0
+        _iters_since_skill = 0
+        _current_streamed_assistant_text = None
+        session_input_tokens = 0
+        session_output_tokens = 0
+        session_cache_read_tokens = 0
+        session_cache_write_tokens = 0
+        session_reasoning_tokens = 0
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_estimated_cost_usd = 0.0
+        session_cost_status = "ok"
+        session_cost_source = "stub"
+
+        def _save_trajectory(self, *a, **k):
+            pass
+
+        def _cleanup_task_resources(self, *a, **k):
+            pass
+
+        def _drop_trailing_empty_response_scaffolding(self, messages):
+            pass
+
+        def _persist_session(self, messages, conversation_history):
+            pass
+
+        def _emit_status(self, *a, **k):
+            pass
+
+        def _safe_print(self, *a, **k):
+            pass
+
+        def _file_mutation_verifier_enabled(self):
+            return False
+
+        def _turn_completion_explainer_enabled(self):
+            return False
+
+        def _drain_pending_steer(self):
+            return None
+
+        def clear_interrupt(self):
+            pass
+
+        def _sync_external_memory_for_turn(self, **k):
+            pass
+
+    agent = _DummyAgent()
+    messages = [
+        {"role": "user", "content": "run builder loop"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c54", "function": {"name": "terminal", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c54", "content": "exit 0"},
+    ]
+    res = finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=54,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=None,
+        effective_task_id="t1",
+        turn_id="turn1",
+        user_message="run builder loop",
+        original_user_message="run builder loop",
+        _should_review_memory=False,
+        _turn_exit_reason="realtime_spend_breaker:tier2_estate_15m_burst (€8.02/15m)",
+    )
+    assert res["turn_exit_reason"].startswith("realtime_spend_breaker:")
+    assert res["failed"] is False
+    assert res["completed"] is True
+    assert res["final_response"] == "[SILENT]"
+    assert messages[-1]["role"] == "assistant"
+    assert _final_response_from_result(res, "job1", "lager-builder-owner", _DummyAgent) == "[SILENT]"
+
+    # Also verify review_input_budget_exhausted on background_review with tool tail
+    agent.cron_job_name = None
+    agent._turn_origin = "background_review"
+    messages_bg = [
+        {"role": "user", "content": "review memory"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "function": {"name": "skill_view", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "skill text"},
+    ]
+    res_bg = finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages_bg,
+        conversation_history=None,
+        effective_task_id="t2",
+        turn_id="turn2",
+        user_message="review memory",
+        original_user_message="review memory",
+        _should_review_memory=False,
+        _turn_exit_reason="review_input_budget_exhausted",
+    )
+    assert res_bg["turn_exit_reason"] == "review_input_budget_exhausted"
+    assert res_bg["failed"] is False
+    assert res_bg["completed"] is True
+    assert res_bg["final_response"] == "[SILENT]"
+
+    # Declarative jobs.json spend_tier / tier / critical support
+    fake_home = tmp_path / "home"
+    cron_dir = fake_home / ".hermes" / "cron"
+    cron_dir.mkdir(parents=True)
+    (cron_dir / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {"id": "decl0", "name": "custom-ops-sentinel", "prompt": "check", "tier": 0},
+                    {"id": "decl2", "name": "evelina-bulk-backfill", "prompt": "backfill", "spend_tier": "tier2"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rsb.Path, "home", staticmethod(lambda: fake_home))
+    rsb._HC_JOBS_CACHE = (0.0, frozenset())
+    assert rsb.is_tier0_critical_cron("custom-ops-sentinel") is True
+    assert rsb.is_tier0_critical_cron("plane-triage-daily") is True
 

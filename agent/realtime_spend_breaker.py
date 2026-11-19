@@ -205,9 +205,15 @@ _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "store-support-",
     "update-autorescue",
     "hermes-update",
+    "hermes-carried",
     "carried-fixes",
     "cron-failure-watch",
     "checkpoints-prune",
+    "plane-triage",
+    "verify-nutanix",
+    "sync-hermes",
+    "pr-corpus",
+    "voice-register",
 )
 
 _LAST_STATUS_WRITE_TS: float = 0.0
@@ -463,12 +469,18 @@ def _hc_monitored_job_names() -> frozenset[str]:
                         except Exception:
                             pass
             jname_low = str(j.get("name") or "").strip().lower()
-            if "builder-owner" in jname_low:
+            explicit_tier = str(j.get("spend_tier") if j.get("spend_tier") is not None else j.get("tier", "")).strip().lower()
+            is_explicit_tier2 = explicit_tier in ("2", "tier2", "bulk") or j.get("critical") is False
+            if "builder-owner" in jname_low or is_explicit_tier2:
                 continue
+            is_explicit_tier0 = (
+                explicit_tier in ("0", "tier0", "critical")
+                or j.get("critical") is True
+            )
             is_prefix_tier0 = bool(
                 jname_low and any(jname_low.startswith(p) or p in jname_low for p in _TIER0_CRITICAL_PREFIXES)
             )
-            if "hc-ping.sh" in blob or "hc.uropenn.se" in blob or is_prefix_tier0:
+            if is_explicit_tier0 or "hc-ping.sh" in blob or "hc.uropenn.se" in blob or is_prefix_tier0:
                 for key in ("name", "id"):
                     val = str(j.get(key) or "").strip().lower()
                     if val:

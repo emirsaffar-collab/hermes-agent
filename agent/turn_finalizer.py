@@ -681,12 +681,16 @@ def finalize_turn(
     )
 
     if (
-        str(_turn_exit_reason or "").startswith("realtime_spend_breaker:")
+        (
+            str(_turn_exit_reason or "").startswith("realtime_spend_breaker:")
+            or _turn_exit_reason == "review_input_budget_exhausted"
+        )
         and not final_response
         and (
             (getattr(agent, "platform", "") or "").lower() == "cron"
             or bool(getattr(agent, "cron_job_name", None))
             or getattr(agent, "_write_origin", None) == "background_review"
+            or getattr(agent, "_memory_write_origin", None) == "background_review"
             or getattr(agent, "_turn_origin", None) == "background_review"
             or str(getattr(agent, "session_id", "")).startswith("cron_")
         )
@@ -711,6 +715,7 @@ def finalize_turn(
         and not (getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
         and not str(_turn_exit_reason or "").startswith("realtime_spend_breaker:")
         and _turn_exit_reason != "review_input_budget_exhausted"
+        and exit_reason_failure(_turn_exit_reason) is None
     ):
         _turn_exit_reason = "pending_tool_result"
         failed = True
@@ -740,11 +745,17 @@ def finalize_turn(
 
     # Sibling producers (``turn_recovery``, ``codex_runtime``) return ``completed=False`` for an
     # interrupted turn; the gateway stream gate and the API run status rely on that contract.
+    _eff_used = min(api_call_count, getattr(agent.iteration_budget, "used", api_call_count))
+    _eff_max = max(agent.max_iterations, getattr(agent.iteration_budget, "max_total", 0) or 0)
     completed = (
         final_response is not None
         and not failed
         and not interrupted
-        and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))
+        and (
+            _eff_used < _eff_max
+            or str(_turn_exit_reason).startswith(("text_response(", "realtime_spend_breaker:"))
+            or _turn_exit_reason == "review_input_budget_exhausted"
+        )
     )
 
     _rollback_interrupted_preflight_display(agent, interrupted)
