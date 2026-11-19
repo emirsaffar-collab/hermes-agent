@@ -1348,5 +1348,103 @@ def test_budget_cap_daily_tier2_tier3_override_lifts_builder_owner_crons(tmp_pat
     assert v_allowed["reason"] == "ok"
 
 
+def test_desktop_turn_usage_records_ledger_and_non_tier0_0cache_breaker_at_060_eur(tmp_path, monkeypatch):
+    import ast
+    from pathlib import Path
+    from types import SimpleNamespace
+    import agent.turn_usage as tu
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+
+    # 1) Static AST guard: _agent_session_source must never appear in agent/turn_usage.py
+    tu_src = Path(tu.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(tu_src)
+    bad_names = [
+        node.id for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id == "_agent_session_source"
+    ]
+    assert bad_names == []
+
+    # 2) Live Desktop agent source resolution & breaker evaluation
+    dummy_desktop = SimpleNamespace(
+        session_id="20261119_183402_b50798",
+        platform="desktop",
+        _is_subagent=False,
+        _delegate_depth=0,
+        cron_job_name=None,
+        _write_origin=None,
+        _memory_write_origin=None,
+        _turn_origin=None,
+    )
+    assert tu.agent_session_source(dummy_desktop) == "desktop"
+
+    # 3) Non-Tier-0 cron cache-reset storm trips at >= 4 resets & >= €0.60 (not €2.50)
+    for seed_idx in range(2):
+        rsb.record_realtime_llm_call(
+            session_id="cron_nont0_flash",
+            source="cron",
+            job_name="atlas-watchdog",
+            provider="vertex",
+            model="google/gemini-3.8-flash",
+            prompt_tokens=60_000,
+            uncached_input_tokens=60_000,
+            cache_read_tokens=0,
+            output_tokens=200,
+            request_id=f"rid_nont0_seed_{seed_idx}",
+        )
+    # 4 resets with ~€0.35 total (< €0.60) -> still allowed (positive polarity)
+    for idx in range(4):
+        r_c = rsb.record_realtime_llm_call(
+            session_id="cron_nont0_flash",
+            source="cron",
+            job_name="atlas-watchdog",
+            provider="vertex",
+            model="google/gemini-3.8-flash",
+            prompt_tokens=60_000,
+            uncached_input_tokens=60_000,
+            cache_read_tokens=0,
+            output_tokens=200,
+            request_id=f"rid_nont0_low_{idx}",
+        )
+        assert r_c["cache_reset"] == 1
+    ev_below = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_nont0_flash",
+        source="cron",
+        job_name="atlas-watchdog",
+        model="google/gemini-3.8-flash",
+        provider="vertex",
+    )
+    assert ev_below["allowed"] is True
+
+    # Cross €0.60 threshold with >= 4 resets -> blocked by tier1_cache_reset_storm (negative polarity)
+    for idx in range(8):
+        rsb.record_realtime_llm_call(
+            session_id="cron_nont0_flash",
+            source="cron",
+            job_name="atlas-watchdog",
+            provider="vertex",
+            model="google/gemini-3.8-flash",
+            prompt_tokens=80_000,
+            uncached_input_tokens=80_000,
+            cache_read_tokens=0,
+            output_tokens=200,
+            request_id=f"rid_nont0_high_{idx}",
+        )
+    ev_above = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_nont0_flash",
+        source="cron",
+        job_name="atlas-watchdog",
+        model="google/gemini-3.8-flash",
+        provider="vertex",
+    )
+    assert ev_above["allowed"] is False
+    assert "tier1_cache_reset_storm" in ev_above["reason"]
+    assert ev_above["session_net_eur_15m"] < 1.20
+
+
+
 
 

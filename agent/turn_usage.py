@@ -469,7 +469,7 @@ def record_response_usage(
                 or str(getattr(agent, "session_id", "") or "").startswith("cron_")
                 or str(getattr(agent, "platform", "") or "").strip().lower() == "cron"
             )
-            else _agent_session_source(agent)
+            else agent_session_source(agent)
         )
         _rt_parent_sid = str(
             getattr(agent, "_root_session_id", None)
