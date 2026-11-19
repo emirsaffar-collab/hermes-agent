@@ -1984,14 +1984,13 @@ def route_classified_error(
                 if _is_bg_review_turn
                 else str(getattr(agent, "session_id", "") or "") or None
             )
-            record_vertex_regional_429(
-                session_id=_v_sid,
-                last_prompt_tokens=(
-                    max(_tr_prompt_tok, GLOBAL_STICKY_EPOCH_MIN_TOKENS)
-                    if _preserve_deep_ew2_cache
-                    else 0
-                ),
-            )
+            if _preserve_deep_ew2_cache:
+                record_vertex_regional_429(
+                    session_id=_v_sid,
+                    last_prompt_tokens=max(_tr_prompt_tok, GLOBAL_STICKY_EPOCH_MIN_TOKENS),
+                )
+            else:
+                record_vertex_regional_429(session_id=_v_sid)
         except Exception:
             pass
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
