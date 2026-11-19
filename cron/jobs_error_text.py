@@ -26,7 +26,14 @@ def sanitize_persisted_error(error: Optional[str]) -> Optional[str]:
     except Exception:
         logger.warning("Failed to redact cron error before persisting it", exc_info=True)
         return "[REDACTED - redaction failed]"
-    return text[:MAX_PERSISTED_ERROR_CHARS]
+    if len(text) > MAX_PERSISTED_ERROR_CHARS:
+        if "\n" in text:
+            sep = "\n...\n"
+            tail_len = 600
+            head_len = MAX_PERSISTED_ERROR_CHARS - len(sep) - tail_len
+            return text[:head_len] + sep + text[-tail_len:]
+        return text[:MAX_PERSISTED_ERROR_CHARS]
+    return text
 
 
 def scrub_retained_stamps(job: dict) -> None:

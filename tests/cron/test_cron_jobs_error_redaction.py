@@ -128,6 +128,26 @@ def test_persisted_error_is_length_bounded(tmp_cron_dir):
     assert len(get_job(job["id"])["last_error"]) == MAX_PERSISTED_ERROR_CHARS
 
 
+def test_persisted_multiline_traceback_preserves_leaf_exception(tmp_cron_dir):
+    from cron.jobs_error_text import MAX_PERSISTED_ERROR_CHARS
+
+    long_frames = "\n".join(f'  File "/app/frame_{i}.py", line {i}, in step_{i}' for i in range(60))
+    leaf = "ModuleNotFoundError: No module named 'tools.checkpoint_manager'"
+    tb = f"Script exited with code 2\nstderr:\nTraceback (most recent call last):\n{long_frames}\n{leaf}"
+    assert len(tb) > MAX_PERSISTED_ERROR_CHARS
+
+    job = create_job(prompt="watch prices", schedule="every 1h")
+    mark_job_run(job["id"], success=False, error=tb)
+
+    saved = get_job(job["id"])
+    assert saved is not None
+    saved_err = saved["last_error"]
+    assert saved_err is not None
+    assert len(saved_err) == MAX_PERSISTED_ERROR_CHARS
+    assert saved_err.startswith("Script exited with code 2")
+    assert saved_err.endswith(leaf)
+
+
 def test_redactor_failure_stores_placeholder_not_raw_text(tmp_cron_dir, monkeypatch):
     def _boom(*_a, **_k):
         raise RuntimeError("redactor exploded")

@@ -12,7 +12,7 @@ from agent.checkpoints.manager import (
     _GIT_TIMEOUT, _LEGACY_PREFIX, _PRUNE_MARKER_NAME, _REFS_PREFIX, _STORE_DIRNAME,
     _dir_size_bytes, _index_path, _list_projects, _pre_v2_shadow_repos,
     _project_meta_path, _ref_name, _resolve_checkpoint_base, _run_git, _store_has_head,
-    _store_path,
+    _store_path, _too_broad,
 )
 
 # Pinned name: these lines stay under `hermes logs --component tools`.
@@ -302,7 +302,7 @@ def _prune_checkpoints(
                 parent_dev = None
             if not isinstance(parent_ino, int) or isinstance(parent_ino, bool):
                 parent_ino = None
-            from tools.checkpoint_manager import _too_broad
+            from agent.checkpoints.manager import _too_broad
             if (
                 delete_orphans
                 and (

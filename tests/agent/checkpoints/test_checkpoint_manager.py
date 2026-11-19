@@ -1510,7 +1510,7 @@ def test_too_broad_covers_carried_cf57_exclusions():
     pathspecs (_stage_all_args/_exclude_store_args) deliberately allow checkpointing it.
     """
     from hermes_constants import get_hermes_home
-    from tools import checkpoint_manager as cm
+    from agent.checkpoints import manager as cm
 
     home = Path.home().resolve()
     hermes = get_hermes_home().resolve()
