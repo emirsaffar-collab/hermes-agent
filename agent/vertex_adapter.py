@@ -65,7 +65,9 @@ ASIA_SOUTHEAST1_MAX_ACTIVE_SESSIONS = 8
 EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS = 180.0
 EUROPE_WEST2_COOLDOWN_SECONDS = 15.0
 EUROPE_WEST2_COOLDOWN_TAIL_WAIT_SECONDS = 15.0
-REGIONAL_429_STRIKE_WINDOW_SECONDS = 180.0
+EUROPE_WEST2_COOLDOWN_MAX_TOTAL_WAIT_SECONDS = 45.0
+EUROPE_WEST2_DEEP_SEMAPHORE_WAIT_SECONDS = 90.0
+REGIONAL_429_STRIKE_WINDOW_SECONDS = 45.0
 REGIONAL_429_MAX_STRIKES = 2
 # carried-fix-anchor: EUROPE_WEST2_STICKY_WAIT_SECONDS = 3.0 (raised to 15.0s; deep 30.0s; initial 8.0s; min_tok 35k)
 EUROPE_WEST2_INITIAL_WAIT_SECONDS = 8.0
@@ -304,6 +306,10 @@ def _record_session_vertex_region_affinity(session_id: Optional[str], region: st
         _session_region_last_seen[sid] = now_mono
         if region == GLOBAL_VERTEX_REGION:
             _session_regional_429_strikes.pop(sid, None)
+        elif region in REGIONAL_VERTEX_REGIONS and sid in _session_regional_429_strikes:
+            _, _first_strike_ts = _session_regional_429_strikes[sid]
+            if (now_mono - _first_strike_ts) > 25.0:
+                _session_regional_429_strikes.pop(sid, None)
         while len(_session_region_affinity) > _SESSION_AFFINITY_CAP:
             oldest = next(iter(_session_region_affinity))
             del _session_region_affinity[oldest]
@@ -396,13 +402,28 @@ def acquire_vertex_hybrid_region(
                 if target_region == ASIA_SOUTHEAST1_VERTEX_REGION
                 else 0.0
             )
-            if (
-                0.0 < cd_rem <= min(wait_s, EUROPE_WEST2_COOLDOWN_TAIL_WAIT_SECONDS)
-                and pinned_region in REGIONAL_VERTEX_REGIONS
+            is_deep_regional_sticky = (
+                pinned_region in REGIONAL_VERTEX_REGIONS
                 and prompt_tok >= GLOBAL_STICKY_EPOCH_MIN_TOKENS
+            )
+            cd_wait_cap = (
+                EUROPE_WEST2_COOLDOWN_MAX_TOTAL_WAIT_SECONDS
+                if sticky_wait_seconds is None
+                else max(0.0, float(sticky_wait_seconds))
+            )
+            cd_slept_total = 0.0
+            while (
+                is_deep_regional_sticky
+                and 0.0 < cd_rem <= EUROPE_WEST2_COOLDOWN_TAIL_WAIT_SECONDS
+                and cd_slept_total < cd_wait_cap
             ):
-                time.sleep(cd_rem)
-                wait_s = max(0.0, wait_s - cd_rem)
+                sleep_chunk = min(cd_rem, cd_wait_cap - cd_slept_total)
+                if sleep_chunk <= 0.0:
+                    break
+                time.sleep(sleep_chunk)
+                cd_slept_total += sleep_chunk
+                if sticky_wait_seconds is not None:
+                    wait_s = max(0.0, wait_s - sleep_chunk)
                 cd_rem = (
                     vertex_regional_cooldown_remaining()
                     if target_region == EUROPE_WEST2_VERTEX_REGION
@@ -416,11 +437,16 @@ def acquire_vertex_hybrid_region(
                     if target_region == ASIA_SOUTHEAST1_VERTEX_REGION
                     else _EUROPE_WEST2_ARGON_SEMAPHORE
                 )
+                sem_wait_s = (
+                    max(wait_s, EUROPE_WEST2_DEEP_SEMAPHORE_WAIT_SECONDS)
+                    if (is_deep_regional_sticky and sticky_wait_seconds is None)
+                    else wait_s
+                )
                 if (
                     pinned_region in REGIONAL_VERTEX_REGIONS
                     or (pinned_region is None and interactive and bool(session_id))
-                ) and wait_s > 0.0:
-                    acquired = sem.acquire(blocking=True, timeout=wait_s)
+                ) and sem_wait_s > 0.0:
+                    acquired = sem.acquire(blocking=True, timeout=sem_wait_s)
                 else:
                     acquired = sem.acquire(blocking=False)
                 if not acquired and pinned_region is None and interactive and bool(session_id):

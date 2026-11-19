@@ -511,6 +511,63 @@ def test_deep_ew2_waits_out_full_cooldown_and_sheds_over_cap_only_at_compaction(
             vertex_adapter._ASIA_SOUTHEAST1_ARGON_SEMAPHORE.release()
 
 
+def test_deep_regional_session_survives_overlapping_cooldown_and_clears_recovered_strike():
+    """When a sibling session extends the regional cooldown mid-sleep, a deep-cache session
+    loops until cooldown clears and still has its full semaphore wait budget; and once a
+    session recovers past the 25s retry window, its single strike is cleared."""
+    import threading
+    import time
+
+    vertex_adapter.reset_vertex_hybrid_router_state()
+    vertex_adapter._record_session_vertex_region_affinity("deep_overlap", "europe-west2")
+    vertex_adapter.record_vertex_regional_429(
+        cooldown_seconds=0.06,
+        session_id="deep_overlap",
+        last_prompt_tokens=160_000,
+    )
+
+    def _extend_cooldown_mid_sleep():
+        time.sleep(0.02)
+        vertex_adapter.record_vertex_regional_429(
+            cooldown_seconds=0.06,
+            session_id="sibling_ew2",
+            last_prompt_tokens=160_000,
+        )
+
+    ext_thread = threading.Thread(target=_extend_cooldown_mid_sleep, daemon=True)
+    ext_thread.start()
+    try:
+        reg, slot = vertex_adapter.acquire_vertex_hybrid_region(
+            "google/gemini-4-argon",
+            configured_region="global",
+            interactive=True,
+            session_id="deep_overlap",
+            last_prompt_tokens=160_000,
+        )
+        try:
+            assert (reg, slot) == ("europe-west2", True)
+            assert vertex_adapter.get_session_vertex_region_affinity("deep_overlap") == "europe-west2"
+        finally:
+            if slot:
+                vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
+    finally:
+        ext_thread.join(timeout=1.0)
+
+    # Simulate strike 1 aged >25s followed by a clean regional checkout -> strike cleared
+    with vertex_adapter._EUROPE_WEST2_STATE_LOCK:
+        vertex_adapter._session_regional_429_strikes["deep_overlap"] = (1, time.monotonic() - 30.0)
+    vertex_adapter._record_session_vertex_region_affinity("deep_overlap", "europe-west2")
+    assert "deep_overlap" not in vertex_adapter._session_regional_429_strikes
+    # Subsequent isolated 429 is treated as strike 1 (kept on europe-west2), not strike 2 demotion
+    vertex_adapter.record_vertex_regional_429(
+        cooldown_seconds=0.01,
+        session_id="deep_overlap",
+        last_prompt_tokens=160_000,
+    )
+    assert vertex_adapter.get_session_vertex_region_affinity("deep_overlap") == "europe-west2"
+
+
+
 
 
 
