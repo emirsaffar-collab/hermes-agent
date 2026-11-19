@@ -346,7 +346,8 @@ def test_cron_or_global_session_429_does_not_poison_europe_west2_cooldown():
     assert vertex_adapter.vertex_regional_cooldown_remaining() == 0.0
 
     # Deep (>=55k) asia-southeast1 session 429 via last_prompt_tokens must neither trip
-    # europe-west2 cooldown nor overwrite its asia-southeast1 affinity
+    # europe-west2 cooldown nor overwrite its asia-southeast1 affinity on strike 1,
+    # while tripping asia-southeast1's own cooldown so attempt 2/3 spills to global.
     ase1_sid = "20261119_145920_22e131"
     vertex_adapter._record_session_vertex_region_affinity(
         ase1_sid, vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION
@@ -357,9 +358,33 @@ def test_cron_or_global_session_429_does_not_poison_europe_west2_cooldown():
         last_prompt_tokens=192_566,
     )
     assert vertex_adapter.vertex_regional_cooldown_remaining() == 0.0
+    assert vertex_adapter.vertex_asia_southeast1_cooldown_remaining() > 0.0
     assert (
         vertex_adapter.get_session_vertex_region_affinity(ase1_sid)
         == vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION
+    )
+    r_ase1_retry, acq_ase1_retry = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id=ase1_sid,
+        sticky_wait_seconds=0.01,
+        last_prompt_tokens=192_566,
+    )
+    assert (r_ase1_retry, acq_ase1_retry) == (vertex_adapter.GLOBAL_VERTEX_REGION, False)
+    assert (
+        vertex_adapter.get_session_vertex_region_affinity(ase1_sid)
+        == vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION
+    )
+    # Strike 2 within 180s demotes repeat-offending regional session to global
+    vertex_adapter.record_vertex_regional_429(
+        cooldown_seconds=15.0,
+        session_id=ase1_sid,
+        last_prompt_tokens=192_566,
+    )
+    assert (
+        vertex_adapter.get_session_vertex_region_affinity(ase1_sid)
+        == vertex_adapter.GLOBAL_VERTEX_REGION
     )
 
     # Warm europe-west2 session continues on europe-west2 without spilling
@@ -372,5 +397,27 @@ def test_cron_or_global_session_429_does_not_poison_europe_west2_cooldown():
     )
     assert (r, acq) == (vertex_adapter.EUROPE_WEST2_VERTEX_REGION, True)
     assert vertex_adapter.release_vertex_hybrid_slot(SimpleNamespace(_vertex_regional_slot_held=True)) is True
+
+    # When both europe-west2 (8) and asia-southeast1 (8) hit active-session cap, 17th session spills to global
+    vertex_adapter.reset_vertex_hybrid_router_state()
+    for i in range(vertex_adapter.EUROPE_WEST2_MAX_ACTIVE_SESSIONS):
+        vertex_adapter._record_session_vertex_region_affinity(
+            f"ew2_cap_{i}", vertex_adapter.EUROPE_WEST2_VERTEX_REGION
+        )
+    for i in range(vertex_adapter.ASIA_SOUTHEAST1_MAX_ACTIVE_SESSIONS):
+        vertex_adapter._record_session_vertex_region_affinity(
+            f"ase1_cap_{i}", vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION
+        )
+    r_17, acq_17 = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="overflow_17",
+    )
+    assert (r_17, acq_17) == (vertex_adapter.GLOBAL_VERTEX_REGION, False)
+    assert (
+        vertex_adapter.get_session_vertex_region_affinity("overflow_17")
+        == vertex_adapter.GLOBAL_VERTEX_REGION
+    )
 
 
