@@ -63,12 +63,12 @@ EUROPE_WEST2_ARGON_MAX_CONCURRENCY = 5
 EUROPE_WEST2_MAX_ACTIVE_SESSIONS = 8
 EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS = 180.0
 EUROPE_WEST2_COOLDOWN_SECONDS = 15.0
-EUROPE_WEST2_COOLDOWN_TAIL_WAIT_SECONDS = 5.0
+EUROPE_WEST2_COOLDOWN_TAIL_WAIT_SECONDS = 15.0
 # carried-fix-anchor: EUROPE_WEST2_STICKY_WAIT_SECONDS = 3.0 (raised to 15.0s; deep 30.0s; initial 8.0s; min_tok 35k)
 EUROPE_WEST2_INITIAL_WAIT_SECONDS = 8.0
 EUROPE_WEST2_STICKY_WAIT_SECONDS = 15.0
 EUROPE_WEST2_DEEP_EPOCH_WAIT_SECONDS = 30.0
-GLOBAL_STICKY_EPOCH_MIN_TOKENS = 35_000
+GLOBAL_STICKY_EPOCH_MIN_TOKENS = 55_000
 
 _prev_vertex_mod = sys.modules.get(__name__)
 _EUROPE_WEST2_ARGON_SEMAPHORE = getattr(
@@ -286,6 +286,12 @@ def acquire_vertex_hybrid_region(
     pinned_region = get_session_vertex_region_affinity(session_id)
     if prompt_tok == -1:
         if pinned_region == GLOBAL_VERTEX_REGION:
+            reset_vertex_sticky_region(session_id)
+            pinned_region = None
+        if (
+            pinned_region == EUROPE_WEST2_VERTEX_REGION
+            and get_active_europe_west2_session_count() > EUROPE_WEST2_MAX_ACTIVE_SESSIONS
+        ):
             reset_vertex_sticky_region(session_id)
             pinned_region = None
         prompt_tok = 0

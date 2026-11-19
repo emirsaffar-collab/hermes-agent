@@ -464,6 +464,54 @@ def test_blocking_events_include_pre_verify_and_known_manifest_fields_include_pr
     assert specs[0].fail_closed is True
 
 
+def test_deep_ew2_waits_out_full_cooldown_and_sheds_over_cap_only_at_compaction():
+    """Deep europe-west2 sessions (>= 55k tokens) wait out a <=15s 429 cooldown instead of
+    spilling an uncached call to global mid-epoch, while over-cap (>8) sessions rebalance at
+    compaction boundary (last_prompt_tokens < 0) where prefix cache resets anyway."""
+    vertex_adapter.reset_vertex_hybrid_router_state()
+    assert vertex_adapter.EUROPE_WEST2_COOLDOWN_TAIL_WAIT_SECONDS == 15.0
+    assert vertex_adapter.GLOBAL_STICKY_EPOCH_MIN_TOKENS == 55_000
+
+    vertex_adapter._record_session_vertex_region_affinity("deep_ew2", "europe-west2")
+    vertex_adapter.record_vertex_regional_429(
+        cooldown_seconds=0.05,
+        session_id="deep_ew2",
+        last_prompt_tokens=90_000,
+    )
+    reg, slot = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="deep_ew2",
+        last_prompt_tokens=90_000,
+    )
+    try:
+        assert (reg, slot) == ("europe-west2", True)
+        assert vertex_adapter.get_session_vertex_region_affinity("deep_ew2") == "europe-west2"
+    finally:
+        if slot:
+            vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
+
+    # When >8 sessions are active on europe-west2, a session hitting compaction (-1) rebalances to asia-southeast1
+    for i in range(9):
+        vertex_adapter._record_session_vertex_region_affinity(f"herd_{i}", "europe-west2")
+    assert vertex_adapter.get_active_europe_west2_session_count() > vertex_adapter.EUROPE_WEST2_MAX_ACTIVE_SESSIONS
+    reg_rebal, slot_rebal = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="herd_8",
+        last_prompt_tokens=-1,
+    )
+    try:
+        assert (reg_rebal, slot_rebal) == ("asia-southeast1", True)
+        assert vertex_adapter.get_session_vertex_region_affinity("herd_8") == "asia-southeast1"
+    finally:
+        if slot_rebal:
+            vertex_adapter._ASIA_SOUTHEAST1_ARGON_SEMAPHORE.release()
+
+
+
 
 
 
