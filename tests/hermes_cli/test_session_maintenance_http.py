@@ -73,6 +73,15 @@ async def test_owner_backfill_skips_exclusive_maintenance_when_no_unowned_rows_e
                 assert response.status_code == 200, response.text
                 assert response.json() == {'ok': True, 'stamped': 0, 'profile': 'default'}
 
+                # Polarity 1b (control socket busy / TimeoutError while gateway.lock is held): still 200
+                monkeypatch.setattr(
+                    'hermes_cli.gateway_runtime_discovery.query_identify',
+                    lambda home, timeout=1.5: (_ for _ in ()).throw(TimeoutError('control socket busy')),
+                )
+                timeout_resp = await client.post('/api/sessions/owner-backfill', json={})
+                assert timeout_resp.status_code == 200, timeout_resp.text
+                assert timeout_resp.json() == {'ok': True, 'stamped': 0, 'profile': 'default'}
+
                 # Polarity 2 (legacy NULL row present): must not falsely report stamped=0; hits write lock -> 409
                 store.sessions._store.holder()._execute_write(
                     lambda conn: conn.execute("UPDATE sessions SET profile_name = NULL WHERE id = 'already-owned'")

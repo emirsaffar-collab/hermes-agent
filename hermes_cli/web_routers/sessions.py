@@ -960,7 +960,7 @@ def _owner_store_for(request: Request, profile: Optional[str]):
 def _live_gateway_owns_profile(profile: Optional[str]) -> bool:
     """Whether a live gateway daemon answers on the control socket for *profile*."""
     import hermes_state
-    from hermes_cli.gateway_runtime_discovery import DiscoveryError, query_identify
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError, missing_owner_state, query_identify
     from hermes_cli.gateway_runtime_multiplex import multiplexer_root_for
     _db_path_fn = getattr(hermes_state, "_default_db_path", None)
     default_home = Path(str(_db_path_fn())).parent if callable(_db_path_fn) else profile_scope().profile_dir
@@ -972,7 +972,11 @@ def _live_gateway_owns_profile(profile: Optional[str]) -> bool:
             payload = query_identify(candidate, timeout=1.5)
             if isinstance(payload, dict) and payload.get("state") in {"starting", "ready", "draining"}:
                 return True
-        except (FileNotFoundError, ConnectionRefusedError, TimeoutError, DiscoveryError,
+        except TimeoutError:
+            if missing_owner_state(candidate) == "starting":
+                return True
+            continue
+        except (FileNotFoundError, ConnectionRefusedError, DiscoveryError,
                 PermissionError, OSError, ValueError, TypeError):
             continue
     return False
