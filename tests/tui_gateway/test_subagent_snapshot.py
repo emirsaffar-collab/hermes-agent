@@ -347,3 +347,38 @@ def test_persist_dispatch_failure_rolls_back_in_memory_record(runtime, monkeypat
             runner=lambda: {"results": []},
         )
     assert bg._records == {}
+
+
+def test_reap_zombies_frees_slot_and_finalize_survives_push_exception(runtime, monkeypatch):
+    """Verify (1) zombie records with no future (>15s old) or done future (>5s old) are reaped
+    at admission time so they never block ``max_async_children``, and (2) ``_finalize`` still
+    transitions ``status`` out of ``_LIVE_STATES`` even if ``_push_completion_event`` raises."""
+    import time
+    from tools import async_delegation as bg
+
+    now = time.time()
+    done_fut = SimpleNamespace(done=lambda: True)
+    with bg._records_lock:
+        bg._records["z_nofut"] = {
+            "delegation_id": "z_nofut", "slot_key": "z_nofut",
+            "status": "running", "dispatched_at": now - 30.0, "_future": None,
+        }
+        bg._records["z_donefut"] = {
+            "delegation_id": "z_donefut", "slot_key": "z_donefut",
+            "status": "running", "dispatched_at": now - 20.0, "_future": done_fut,
+        }
+        bg._reap_zombies_locked(now)
+        assert bg._records["z_nofut"]["status"] == "error"
+        assert bg._records["z_donefut"]["status"] == "error"
+
+    def _boom_push(*_a, **_kw):
+        raise RuntimeError("push failed")
+
+    monkeypatch.setattr(bg, "_push_completion_event", _boom_push)
+    with bg._records_lock:
+        bg._records["z_fin"] = {
+            "delegation_id": "z_fin", "slot_key": "z_fin",
+            "status": "running", "dispatched_at": now,
+        }
+    bg._finalize("z_fin", {"status": "completed"}, "completed")
+    assert bg._records["z_fin"]["status"] == "completed"

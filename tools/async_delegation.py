@@ -764,6 +764,33 @@ def _prune_completed_locked() -> None:
         _records.pop(rid, None)
 
 
+def _reap_zombies_locked(now: float) -> None:
+    """Evict or mark terminal any in-memory record whose worker future already finished without
+    flipping status out of ``_LIVE_STATES``, or whose dispatch failed before attaching a future.
+    Caller holds ``_records_lock``."""
+    for r in list(_records.values()):
+        st = r.get("status")
+        if st not in _LIVE_STATES:
+            continue
+        fut = r.get("_future")
+        disp_ts = float(r.get("dispatched_at") or 0.0)
+        comp_ts = float(r.get("completed_at") or disp_ts)
+        if fut is not None and callable(getattr(fut, "done", None)) and fut.done() and (now - comp_ts) > 5.0:
+            r["status"] = "error"
+            r["completed_at"] = r.get("completed_at") or now
+            r["interrupt_fn"] = None
+            r["progress_fn"] = None
+            r.pop("_context", None)
+            r.pop("_finished_children", None)
+        elif fut is None and st in _ACTIVE_STATES and disp_ts and (now - disp_ts) > 15.0:
+            r["status"] = "error"
+            r["completed_at"] = now
+            r["interrupt_fn"] = None
+            r["progress_fn"] = None
+            r.pop("_context", None)
+            r.pop("_finished_children", None)
+
+
 def _current_origin_session_id() -> str:
     """Raw session id of the ORIGINATING api_server request, or ``""``. ``HERMES_SESSION_ID``
     is unsafe here: building the child agent calls ``set_current_session_id(child.session_id)``
@@ -842,6 +869,7 @@ def _dispatch_admitted(
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None,
         "_home": hermes_home_key(get_hermes_home())}  # the profile that dispatched it (``active_count(home=...)``)
     with _records_lock:
+        _reap_zombies_locked(dispatched_at)
         if any((field, record[field]) in _refused_by for field in _FENCED_FIELDS):
             return {"status": "rejected", "error": "This session was closed (exit or /new): no new background work."}
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
@@ -890,6 +918,8 @@ def _dispatch_admitted(
     retirement.acquire(bind_thread=False)
     try:
         future = executor.submit(propagate_context_to_thread(_worker))
+        with _records_lock:
+            record["_future"] = future
         def worker_done(completed):
             try:
                 lease.release()
@@ -1008,19 +1038,23 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         snapshot = dict(record)
-    lease = snapshot.get("_approval_lease")
-    if lease is not None:
-        lease.release()
-    final = result(snapshot) if callable(result) else result
-    _push_completion_event(snapshot, _keep_finished_children(snapshot, final, status), status)
-    with _records_lock:
-        if delegation_id in _records:
-            _records[delegation_id]["status"] = status
-            # Only an active record is ever force-finalized under its dispatcher's Context; a
-            # retained completed one would otherwise pin that turn's agent and history.
-            _records[delegation_id].pop("_context", None)
-            _records[delegation_id].pop("_finished_children", None)
-        _prune_completed_locked()
+    try:
+        lease = snapshot.get("_approval_lease")
+        if lease is not None:
+            lease.release()
+        final = result(snapshot) if callable(result) else result
+        _push_completion_event(snapshot, _keep_finished_children(snapshot, final, status), status)
+    except Exception:
+        logger.exception("Async delegation %s finalization post-processing failed", delegation_id)
+    finally:
+        with _records_lock:
+            if delegation_id in _records:
+                _records[delegation_id]["status"] = status
+                # Only an active record is ever force-finalized under its dispatcher's Context; a
+                # retained completed one would otherwise pin that turn's agent and history.
+                _records[delegation_id].pop("_context", None)
+                _records[delegation_id].pop("_finished_children", None)
+            _prune_completed_locked()
 
 
 def completion_event(record: dict[str, Any], result: dict[str, Any], status: str) -> tuple[dict, dict, bool]:
@@ -1210,22 +1244,26 @@ def _stale_monitor_loop() -> None:
     ``stalling`` and calls ``interrupt_fn``; a ``stalling`` record still unreturned after the
     grace window is force-finalized with a terminal ``stalled`` event."""
     while not _monitor_stop.wait(_STALE_CHECK_INTERVAL):
-        now = time.time()
-        with _records_lock:
-            stalled, expired, any_monitorable = _sweep_stale_locked(now)
-        for delegation_id, quiet_for, in_tool in stalled:
-            logger.warning("Async delegation %s made no progress for %.0fs "
-                           "(in_tool=%s) — interrupting; grace window %.0fs",
-                           delegation_id, quiet_for, in_tool, _STALL_GRACE_SECONDS)
+        try:
+            now = time.time()
             with _records_lock:
-                fn = (_records.get(delegation_id) or {}).get("interrupt_fn")
-            _call_interrupt(fn, "Async delegation %s stall interrupt failed: %s", delegation_id)
-        for delegation_id in expired:
-            with _records_lock:
-                ctx = (_records.get(delegation_id) or {}).get("_context") or contextvars.copy_context()
-            ctx.run(_finalize, delegation_id, lambda rec, d=delegation_id: _stalled_result(d, rec), "stalled")
-        if not any_monitorable:
-            return
+                _reap_zombies_locked(now)
+                stalled, expired, any_monitorable = _sweep_stale_locked(now)
+            for delegation_id, quiet_for, in_tool in stalled:
+                logger.warning("Async delegation %s made no progress for %.0fs "
+                               "(in_tool=%s) — interrupting; grace window %.0fs",
+                               delegation_id, quiet_for, in_tool, _STALL_GRACE_SECONDS)
+                with _records_lock:
+                    fn = (_records.get(delegation_id) or {}).get("interrupt_fn")
+                _call_interrupt(fn, "Async delegation %s stall interrupt failed: %s", delegation_id)
+            for delegation_id in expired:
+                with _records_lock:
+                    ctx = (_records.get(delegation_id) or {}).get("_context") or contextvars.copy_context()
+                ctx.run(_finalize, delegation_id, lambda rec, d=delegation_id: _stalled_result(d, rec), "stalled")
+            if not any_monitorable:
+                return
+        except Exception:
+            logger.exception("Async delegation stale monitor iteration failed")
 
 
 def _stalled_error_text(event_record: dict[str, Any]) -> str:
