@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, UTC
@@ -563,6 +564,81 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
     return result
 
 
+_HOMO_MAP = {
+    chr(c): a
+    for c, a in {
+        0x3B1: "a", 0x3B2: "b", 0x3B5: "e", 0x3BF: "o", 0x3C1: "p", 0x3C7: "x", 0x3C5: "y", 0x3C2: "c",
+        0x430: "a", 0x431: "b", 0x435: "e", 0x43E: "o", 0x43F: "p", 0x445: "x", 0x443: "y", 0x441: "c",
+        0x456: "i", 0x458: "j", 0x453: "s",
+    }.items()
+}
+
+_FAST_ACCEPT_ABSENT_RE: dict[str, re.Pattern[str]] = {
+    "destructive-guard.sh": re.compile(
+        r"\b(rm|rmdir|unlink|find|rsync|git|mkfs|dd|drop|truncate|delete|gcloud|kubectl|gsutil|gh|approve\.sh|docker|vitest|jest|next|pytest|cargo|shred|wipe)\b"
+    ),
+    "sibling-lease-guard.sh": re.compile(
+        r"\b(git|gcloud|gsutil|decision-queue|fleet_health_monitor|remote_call_lane|scratch|state\.db|vitest|jest|next|rm|send_message|create_draft|update_draft|send_draft|gmail|google_chat|sendemail|spaces/|iam|policy|access_grant|gam|write_file|patch|edit)\b"
+    ),
+    "ledger-write-guard-hermes.sh": re.compile(
+        r"(approved-shas|base64|openssl|xxd|gunzip|gpg|unzip|uudecode|eval)"
+    ),
+    "github-review-gate.sh": re.compile(r"\b(git|gh)\b"),
+    "config-write-guard-hermes.sh": re.compile(
+        r"(config\.yaml|soul\.md|agents\.md|authorization-matrix|hooks-hermes|hooks/|base64|openssl|xxd|gunzip|gpg|unzip|uudecode)"
+    ),
+    "recipient-guard.sh": re.compile(r"(gmail|send|draft|himalaya|chat|mail|spaces/|@)"),
+    "release-note-gate.py": re.compile(r"\b(gh|git|merge|pr|pull)\b"),
+    "gmail-draft-delete-guard.sh": re.compile(r"(draft|gmail)"),
+    "upstream-post-guard.py": re.compile(r"\b(gh|curl|api\.github\.com|issue|pr|discussion|comment)\b"),
+    "prod-db-write-guard.py": re.compile(
+        r"\b(update|delete|insert|drop|alter|truncate|create|replace|grant|revoke|psql|mysql|roq|sql|cloud-sql-proxy)\b"
+    ),
+    "poll-guard.sh": re.compile(r"\b(sleep|watch|while|until|for|poll|wait)\b"),
+    "access-grant-guard.sh": re.compile(
+        r"\b(iam|policy|binding|workspace_user|workspace_group|grant|role|gam|gcloud|gh)\b"
+    ),
+    "cron-mutation-provenance-guard.sh": re.compile(r"(cron|jobs\.json|crontab|launchctl|plist)"),
+    "guide-publish-guard-hermes.sh": re.compile(r"(gsutil|gcloud|uropenn-docs|guide|storage)"),
+    "ooo-window-gate-hermes.sh": re.compile(r"(ooo|out.of.office|vacation|auto.reply|vacation_settings)"),
+    "plane-html-guard-hermes.sh": re.compile(r"(plane|workitem)"),
+    "marker-corruption-guard.py": re.compile(r"(redacted|<<|write_file|patch)"),
+    "persona-save-guard.py": re.compile(r"(persona|soul\.md|memory\.md|user\.md|generate\.py)"),
+}
+
+
+def _fast_accept_pre_tool_hook(command: str, kwargs: dict[str, Any]) -> bool:
+    """Return True if a known pre_tool_call guard script has zero overlap with the NFKC/homoglyph
+    normalized tool input and can safely fast-accept without spawning a subprocess."""
+    try:
+        bname = os.path.basename(command.strip().split()[0])
+    except Exception:
+        return False
+    pat = _FAST_ACCEPT_ABSENT_RE.get(bname)
+    if pat is None:
+        return False
+    parts: list[str] = []
+
+    def _walk(o: Any) -> None:
+        if isinstance(o, str):
+            parts.append(o)
+        elif isinstance(o, dict):
+            for v in o.values():
+                _walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                _walk(v)
+
+    _walk(kwargs.get("args") or {})
+    s = str(kwargs.get("tool_name") or "") + "\n" + "\n".join(parts)
+    s = s.replace("\\\n", "").replace("$'", "").replace("''", "")
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(_HOMO_MAP.get(ch, ch) if ord(ch) > 127 else ch for ch in s)
+    s = "".join(ch for ch in s if ord(ch) < 128)
+    s = s.replace("'", "").replace('"', "").replace("\\", "").lower()
+    return pat.search(s) is None
+
+
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[dict[str, Any]]]:
     """Build the closure that ``invoke_hook()`` will call per firing."""
 
@@ -574,6 +650,8 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[dict[str, Any]
         if safe_worker_enabled() or not host_feature_enabled("shell_hooks"):
             return None
         if spec.event in _TOOL_EVENTS and not spec.matches_tool(kwargs.get("tool_name")):
+            return None
+        if spec.event == "pre_tool_call" and _fast_accept_pre_tool_hook(spec.command, kwargs):
             return None
         return _evaluate_result(spec, _spawn(spec, _serialize_payload(spec.event, kwargs)))
 

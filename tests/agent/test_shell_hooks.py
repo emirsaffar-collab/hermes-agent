@@ -794,3 +794,22 @@ def test_real_tool_hooks_receive_only_the_owning_workers_identity(tmp_path, monk
             payload = json.loads(capture.read_text())
             assert payload["hook_event_name"] == "post_tool_call"
             assert payload["extra"]["kanban_task_id"] == expected
+
+
+def test_fast_accept_pre_tool_hook_two_way_polarity():
+    # Positive leg (benign command fast-accepts without spawning subprocess)
+    benign = {"tool_name": "terminal", "args": {"command": "ls -la /Users/emirsaffar/workspace"}}
+    assert shell_hooks._fast_accept_pre_tool_hook("/path/to/destructive-guard.sh", benign) is True
+    assert shell_hooks._fast_accept_pre_tool_hook("/path/to/config-write-guard-hermes.sh", benign) is True
+    assert shell_hooks._fast_accept_pre_tool_hook("/path/to/ledger-write-guard-hermes.sh", benign) is True
+
+    # Negative leg (domain-matching or homoglyph-obfuscated commands must NOT fast-accept)
+    rm_cmd = {"tool_name": "terminal", "args": {"command": "rm -rf /tmp/foo"}}
+    assert shell_hooks._fast_accept_pre_tool_hook("/path/to/destructive-guard.sh", rm_cmd) is False
+
+    homoglyph_cfg = {"tool_name": "terminal", "args": {"command": "cp /tmp/x ~/.hermes/c\u043enfig.yaml"}}
+    assert shell_hooks._fast_accept_pre_tool_hook("/path/to/config-write-guard-hermes.sh", homoglyph_cfg) is False
+
+    ledger_cmd = {"tool_name": "terminal", "args": {"command": "echo 123 >> .approved-shas"}}
+    assert shell_hooks._fast_accept_pre_tool_hook("/path/to/ledger-write-guard-hermes.sh", ledger_cmd) is False
+
