@@ -1277,4 +1277,76 @@ def test_tier0_critical_cache_reset_ceiling_and_flash_keepalive_pool_rotation(tm
     assert req_closed == ["vertex_flash_0cache_rotate"]
 
 
+def test_budget_cap_daily_tier2_tier3_override_lifts_builder_owner_crons(tmp_path, monkeypatch):
+    import json
+    import time
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    cap_file = tmp_path / "ai-budget-cap.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+    monkeypatch.setenv("HERMES_AI_BUDGET_CAP_PATH", str(cap_file))
+
+    now = time.time()
+    # Record €205 of cron spend earlier today, then evaluate 2 hours later so 15m/1h session window is 0
+    rsb.record_realtime_llm_call(
+        session_id="cron_earlier_today",
+        source="cron",
+        job_name="chat247-owner",
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=60_000_000,
+        uncached_input_tokens=60_000_000,
+        cache_read_tokens=0,
+        output_tokens=15_000_000,
+        request_id="rid_day_205",
+    )
+    eval_now = now + 7200.0
+    summary_blocked = rsb.get_realtime_spend_summary(now=eval_now)
+    assert summary_blocked["net_eur_today_non_interactive"] >= 195.0
+    assert summary_blocked["breaker_state"] == "TIER3_DAILY_HARD_CAP"
+
+    v_blocked = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_newintra-builder-owner",
+        source="cron",
+        job_name="newintra-builder-owner",
+        model="google/gemini-4-argon",
+        provider="vertex",
+        now=eval_now,
+    )
+    assert v_blocked["allowed"] is False
+    assert "tier3_daily_hard_cap" in v_blocked["reason"]
+
+    # Write ai-budget-cap.json lifting daily soft/hard caps to €350/€450
+    cap_file.write_text(
+        json.dumps(
+            {
+                "active": True,
+                "ts": eval_now,
+                "expires_at": eval_now + 86400.0,
+                "tier2_daily_soft_cap_eur": 350.0,
+                "tier3_daily_hard_cap_eur": 450.0,
+                "tier2_estate_15m_burst_eur": 18.0,
+                "operator": "emir-go",
+            }
+        ),
+        encoding="utf-8",
+    )
+    summary_lifted = rsb.get_realtime_spend_summary(now=eval_now)
+    assert summary_lifted["breaker_state"] == "ARMED_OK"
+
+    v_allowed = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_newintra-builder-owner",
+        source="cron",
+        job_name="newintra-builder-owner",
+        model="google/gemini-4-argon",
+        provider="vertex",
+        now=eval_now,
+    )
+    assert v_allowed["allowed"] is True
+    assert v_allowed["reason"] == "ok"
+
+
+
 

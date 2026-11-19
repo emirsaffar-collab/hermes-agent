@@ -287,13 +287,35 @@ def get_active_budget_cap(now: float | None = None) -> dict[str, Any] | None:
         exp = float(data.get("expires_at") or (float(data.get("ts") or 0.0) + 4 * 3600.0))
         if exp > 0 and ts_now >= exp:
             return None
+        has_hourly_cap = any(
+            k in data for k in ("cap_usd_hr", "cap_usd", "cap_eur_hr", "cap_eur_15m")
+        )
         cap_usd_hr = float(data.get("cap_usd_hr") or data.get("cap_usd") or 15.0)
         cap_eur_hr = float(data.get("cap_eur_hr") or round(cap_usd_hr * 0.90, 2))
         cap_eur_15m = float(data.get("cap_eur_15m") or round(cap_eur_hr / 4.0, 2))
+        tier2_soft_eur = float(
+            data.get("tier2_daily_soft_cap_eur")
+            or data.get("daily_soft_cap_eur")
+            or TIER2_DAILY_SOFT_CAP_EUR
+        )
+        tier3_hard_eur = float(
+            data.get("tier3_daily_hard_cap_eur")
+            or data.get("daily_hard_cap_eur")
+            or max(TIER3_DAILY_HARD_CAP_EUR, round(tier2_soft_eur * 1.30, 2))
+        )
+        tier2_burst_15m_eur = float(
+            data.get("tier2_estate_15m_burst_eur")
+            or data.get("non_interactive_15m_burst_eur")
+            or TIER2_ESTATE_15M_BURST_EUR
+        )
         return {
+            "has_hourly_cap": has_hourly_cap,
             "cap_usd_hr": cap_usd_hr,
             "cap_eur_hr": cap_eur_hr,
             "cap_eur_15m": cap_eur_15m,
+            "tier2_daily_soft_cap_eur": tier2_soft_eur,
+            "tier3_daily_hard_cap_eur": tier3_hard_eur,
+            "tier2_estate_15m_burst_eur": tier2_burst_15m_eur,
             "expires_at": exp,
             "operator": str(data.get("operator") or "ui"),
         }
@@ -786,11 +808,27 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
     eurday_cron_bg_f = float(eurday_cron_bg or 0.0)
     eur15_cron_bg_f = float(eur15_cron_bg or 0.0)
     q_int = int(q_count or 0)
+    active_cap = get_active_budget_cap(ts_now)
+    eff_tier3_hard_eur = (
+        float(active_cap.get("tier3_daily_hard_cap_eur") or TIER3_DAILY_HARD_CAP_EUR)
+        if active_cap is not None
+        else TIER3_DAILY_HARD_CAP_EUR
+    )
+    eff_tier2_soft_eur = (
+        float(active_cap.get("tier2_daily_soft_cap_eur") or TIER2_DAILY_SOFT_CAP_EUR)
+        if active_cap is not None
+        else TIER2_DAILY_SOFT_CAP_EUR
+    )
+    eff_tier2_burst_15m_eur = (
+        float(active_cap.get("tier2_estate_15m_burst_eur") or TIER2_ESTATE_15M_BURST_EUR)
+        if active_cap is not None
+        else TIER2_ESTATE_15M_BURST_EUR
+    )
     if manual_brake:
         breaker_state = "MANUAL_EMERGENCY_BRAKE"
-    elif eurday_cron_bg_f >= TIER3_DAILY_HARD_CAP_EUR:
+    elif eurday_cron_bg_f >= eff_tier3_hard_eur:
         breaker_state = "TIER3_DAILY_HARD_CAP"
-    elif eurday_cron_bg_f >= TIER2_DAILY_SOFT_CAP_EUR or eur15_cron_bg_f >= TIER2_ESTATE_15M_BURST_EUR:
+    elif eurday_cron_bg_f >= eff_tier2_soft_eur or eur15_cron_bg_f >= eff_tier2_burst_15m_eur:
         breaker_state = "TIER2_DAILY_SOFT_CAP"
     elif q_int > 0:
         breaker_state = "TIER1_SESSION_QUARANTINED"
@@ -1069,7 +1107,7 @@ def evaluate_realtime_spend_breaker(
 
     # 0B) Manual UI Hourly Spend Cap (e.g. $15/h -> €13.50/h -> €3.38/15m via ai-budget-cap.json)
     active_cap = get_active_budget_cap(ts_now)
-    if active_cap is not None and not is_tier0:
+    if active_cap is not None and active_cap.get("has_hourly_cap", True) and not is_tier0:
         cap_15m_eur = float(active_cap["cap_eur_15m"])
         cap_usd_hr = float(active_cap["cap_usd_hr"])
         if not is_interactive:
@@ -1197,26 +1235,41 @@ def evaluate_realtime_spend_breaker(
             "estate_net_eur_today": estate_today,
         }
 
-    # Tier 3: Daily Hard Cap (€195/day net)
+    # Tier 3: Daily Hard Cap (€195/day net default, overridable via ai-budget-cap.json)
     # - cron and background_review evaluate against non_interactive_today so interactive Desktop spikes never starve crons.
     # - non-exempt subagents (unparented/non-Tier-0 cron subagents or stalled Desktop subagents that fell past line 825)
     #   evaluate against max(non_interactive_today, estate_today).
+    eff_tier3_hard_eur = (
+        float(active_cap.get("tier3_daily_hard_cap_eur") or TIER3_DAILY_HARD_CAP_EUR)
+        if active_cap is not None
+        else TIER3_DAILY_HARD_CAP_EUR
+    )
+    eff_tier2_soft_eur = (
+        float(active_cap.get("tier2_daily_soft_cap_eur") or TIER2_DAILY_SOFT_CAP_EUR)
+        if active_cap is not None
+        else TIER2_DAILY_SOFT_CAP_EUR
+    )
+    eff_tier2_burst_15m_eur = (
+        float(active_cap.get("tier2_estate_15m_burst_eur") or TIER2_ESTATE_15M_BURST_EUR)
+        if active_cap is not None
+        else TIER2_ESTATE_15M_BURST_EUR
+    )
     tier3_pool_today = (
         non_interactive_today
         if src in ("cron", "background_review")
         else max(non_interactive_today, estate_today)
     )
-    if tier3_pool_today >= TIER3_DAILY_HARD_CAP_EUR:
+    if tier3_pool_today >= eff_tier3_hard_eur:
         return {
             "allowed": False,
-            "reason": f"tier3_daily_hard_cap (pool today €{tier3_pool_today:.2f} >= €{TIER3_DAILY_HARD_CAP_EUR:.2f})",
+            "reason": f"tier3_daily_hard_cap (pool today €{tier3_pool_today:.2f} >= €{eff_tier3_hard_eur:.2f})",
             "estate_net_eur_today": estate_today,
             "non_interactive_net_eur_today": non_interactive_today,
         }
 
-    # Tier 2: Daily Soft Cap (€150/day net) or 15m Burst (€8/15m on non-interactive pool) suppresses background_review and non-Tier-0 crons
+    # Tier 2: Daily Soft Cap (€150/day net default) or 15m Burst (€8/15m default on non-interactive pool) suppresses background_review and non-Tier-0 crons
     if src in ("background_review", "cron") and (
-        non_interactive_today >= TIER2_DAILY_SOFT_CAP_EUR or non_interactive_15m >= TIER2_ESTATE_15M_BURST_EUR
+        non_interactive_today >= eff_tier2_soft_eur or non_interactive_15m >= eff_tier2_burst_15m_eur
     ):
         return {
             "allowed": False,
