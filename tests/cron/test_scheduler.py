@@ -2841,3 +2841,44 @@ class TestOriginNullIncidentGatePolarity:
     def test_crash_gate_plain_error_leaves_open(self, monkeypatch):
         assert self._run_crash_gate(monkeypatch, "smtp timeout") == []
 
+
+class TestWallClockTimeoutEnforcement:
+    """Verify job['timeout_seconds'] enforces a hard wall-clock ceiling even when agent stays active."""
+
+    def test_wall_clock_timeout_interrupts_active_run(self, monkeypatch):
+        import time
+        from cron import scheduler as sched
+
+        monkeypatch.setattr(sched, "_cron_inactivity_seconds", lambda: 600)
+        interrupted = []
+
+        class FakeActiveAgent:
+            def get_activity_summary(self):
+                return {
+                    "seconds_since_activity": 0.1,
+                    "last_activity_desc": "terminal tool loop",
+                    "api_call_count": 12,
+                    "max_iterations": 20,
+                    "current_tool": "terminal",
+                }
+
+            def run_conversation(self, prompt, task_id=None):
+                for _ in range(50):
+                    if interrupted:
+                        break
+                    time.sleep(0.02)
+                return {"final_response": "done", "completed": True}
+
+        monkeypatch.setattr(
+            sched,
+            "request_hard_interrupt",
+            lambda agent, msg, tool_reason=None: interrupted.append((msg, tool_reason)),
+        )
+        job = {"id": "b0a4a2d3918e", "name": "chat247-owner", "timeout_seconds": 0.12}
+        with pytest.raises(TimeoutError, match="exceeded wall-clock timeout"):
+            sched._run_agent_with_watchdog(
+                FakeActiveAgent(), "prompt", job, "b0a4a2d3918e", "chat247-owner", "task-1", None
+            )
+        assert interrupted == [("Cron job timed out (wall-clock)", "cron wall-clock timeout")]
+
+

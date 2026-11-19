@@ -602,7 +602,7 @@ def test_overnight_peak_burst_12_concurrent_deep_sessions_zero_cold_spills():
                 with lock:
                     results.append((sid, turn, reg, slot, expected_reg))
             finally:
-                vertex_adapter.release_vertex_hybrid_slot(slot, region=reg)
+                vertex_adapter.release_vertex_hybrid_slot(slot, reg)
 
     threads = []
     for i in range(6):

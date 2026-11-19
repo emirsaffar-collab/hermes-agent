@@ -1969,15 +1969,40 @@ def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
         f"— last activity: {_last_desc}")
 
 
+def _raise_wall_clock_timeout(agent, job_name: str, limit_s: float, elapsed_s: float) -> None:
+    """Log the agent's last activity, hard-interrupt it and raise TimeoutError on wall-clock limit."""
+    _activity = {}
+    if hasattr(agent, "get_activity_summary"):
+        with contextlib.suppress(Exception):
+            _activity = agent.get_activity_summary()
+    _last_desc = _activity.get("last_activity_desc", "unknown")
+    logger.error(
+        "Job '%s' exceeded wall-clock timeout %.0fs (elapsed %.0fs) "
+        "| last_activity=%s | iteration=%s/%s | tool=%s",
+        job_name, limit_s, elapsed_s,
+        _last_desc, _activity.get("api_call_count", 0), _activity.get("max_iterations", 0),
+        _activity.get("current_tool") or "none")
+    request_hard_interrupt(agent, "Cron job timed out (wall-clock)", tool_reason="cron wall-clock timeout")
+    raise TimeoutError(
+        f"Cron job '{job_name}' exceeded wall-clock timeout of {int(limit_s)}s "
+        f"(elapsed {int(elapsed_s)}s) — last activity: {_last_desc}")
+
+
 def _run_agent_with_watchdog(
     agent, prompt: str, job: dict, job_id: str, job_name: str, task_id: str, cancel_event,
     worker_state: Optional[dict] = None,
 ) -> dict:
-    """Run ``agent.run_conversation`` on a worker thread under the inactivity (not wall-clock)
-    watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
+    """Run ``agent.run_conversation`` on a worker thread under the inactivity watchdog
+    (default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited) and optional per-job
+    wall-clock ``timeout_seconds`` ceiling."""
     _cron_timeout = _cron_inactivity_seconds()
     _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-    _POLL_INTERVAL = 5.0
+    try:
+        _raw_wall = float(job.get("timeout_seconds") or 0)
+    except (TypeError, ValueError):
+        _raw_wall = 0.0
+    _wall_clock_limit = _raw_wall if _raw_wall > 0 else None
+    _POLL_INTERVAL = 5.0 if (_wall_clock_limit is None or _wall_clock_limit >= 5.0) else max(0.05, _wall_clock_limit / 4.0)
     # Heartbeat the one-shot run_claim while alive: without it a long run looks like a dead owner
     # and gets re-dispatched / stale-removed out from under the live run.
     # Keep the one-shot run_claim fresh while the run is alive (#62002): the claim TTL is a dead-owner
@@ -2022,6 +2047,8 @@ def _run_agent_with_watchdog(
     if worker_state is not None:
         worker_state["future"] = _cron_future
     _inactivity_timeout = False
+    _wall_clock_timeout = False
+    _wall_clock_started = time.monotonic()
     _watch_stop = threading.Event()
 
     def _idle_seconds() -> float:
@@ -2055,7 +2082,7 @@ def _run_agent_with_watchdog(
             # loop / hung ``get_activity_summary`` on this thread can no longer keep the 600s inactivity
             # limit from firing (#94285).
             _watch_thread.start()
-        if _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
+        if _cron_inactivity_limit is None and _wall_clock_limit is None and not _is_oneshot and cancel_event is None:
             result = _cron_future.result()
         else:
             result = None
@@ -2066,6 +2093,9 @@ def _run_agent_with_watchdog(
                     result = _cron_future.result()
                     break
                 if _inactivity_timeout:
+                    break
+                if _wall_clock_limit is not None and (time.monotonic() - _wall_clock_started) >= _wall_clock_limit:
+                    _wall_clock_timeout = True
                     break
                 _abort_if_fire_claim_lost()
                 _heartbeat_run_claim_if_due()
@@ -2079,6 +2109,9 @@ def _run_agent_with_watchdog(
 
     if _inactivity_timeout:
         _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
+    if _wall_clock_timeout and _wall_clock_limit is not None:
+        _raise_wall_clock_timeout(
+            agent, job_name, _wall_clock_limit, time.monotonic() - _wall_clock_started)
 
     if not isinstance(result, dict):
         raise RuntimeError(
@@ -2147,6 +2180,26 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
                 job_id, turn_exit_reason)
             final_response = ""
     return final_response
+
+
+def _stamp_early_owner_session_title(owner_execution, job_id: str, job_name: str) -> None:
+    """When a canonical owner-admitted cron run exits before opening ``_session_db`` (e.g. wakeAgent=false,
+    monitor skip, or preflight block), stamp the title on the owner's already-open persistence handle so
+    fast-exit cron rows in ``state.db`` never remain ``title IS NULL``."""
+    if owner_execution is None:
+        return
+    try:
+        from gateway.session_persistence import authority_persistence
+        _authority, _session_id = owner_execution[0], owner_execution[1]
+        _pers = authority_persistence(_authority)
+        _sessions = getattr(_pers, "sessions", None)
+        if _sessions is not None and _session_id:
+            _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+            _cron_title = f"{_title_base} · {safe_strftime(_hermes_now(), '%b %d %H:%M')}"
+            if not _set_cron_session_title(_sessions, _session_id, _cron_title):
+                _set_cron_session_title(_sessions, _session_id, f"cron {job_id}")
+    except (Exception, KeyboardInterrupt):
+        pass
 
 
 def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str,
@@ -2649,6 +2702,7 @@ def run_job(
 
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
+        _stamp_early_owner_session_title(owner_execution, job_id, job_name)
         return early
     from run_agent import AIAgent
 
@@ -2674,6 +2728,7 @@ def run_job(
         model = jc.model
         setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)
         if setup.blocked is not None:
+            _stamp_early_owner_session_title(owner_execution, job_id, job_name)
             return setup.blocked
         model = setup.model
 
@@ -2817,6 +2872,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     job_id = str(job.get("id") or "")
     stop = threading.Event()
     lost_ownership = threading.Event()
+    lost_ownership._stop_heartbeat = stop.set
 
     def _finish_unstarted(error: str) -> None:
         execution_id = job.get("execution_id")
@@ -2847,8 +2903,8 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
                 if not heartbeat_fire_claim(job_id, expected_owner=owner):
-                    if self_removal_delivery_allowed(job_id):
-                        # Record dropped by this run; nothing left to keep fresh.
+                    if stop.is_set() or self_removal_delivery_allowed(job_id):
+                        # Record dropped by this run or terminal bookkeeping started; nothing left to keep fresh.
                         continue
                     # One miss is a sample, not a verdict (#113357): a latch cancels the live
                     # agent run and ends the lease refresh, so confirm before acting on it.
@@ -2856,6 +2912,8 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                             job_id, expected_owner=owner):
                         last_confirmed = time.monotonic()
                         continue
+                    if stop.is_set():
+                        return
                     lost_ownership.set()
                     logger.warning(
                         "Job '%s': fire claim ownership lost; interrupting stale run",
@@ -3397,6 +3455,11 @@ def _run_one_job_body(
     _side_effect_fence = fence.side_effect_fence
     _fire_claim_ownership_lost = fence.lost
 
+    def _stop_fire_claim_heartbeat() -> None:
+        stop_fn = getattr(claim_lost, "_stop_heartbeat", None)
+        if callable(stop_fn):
+            stop_fn()
+
     delivery_attempted = False
     delivery_error = None
 
@@ -3467,6 +3530,7 @@ def _run_one_job_body(
 
         if _fire_claim_ownership_lost():
             _teardown_deferred()
+            _stop_fire_claim_heartbeat()
             _record_fire_ownership_lost(job, fire_owner, execution_id)
             return True
 
@@ -3488,6 +3552,7 @@ def _run_one_job_body(
 
         if d.side_effect_ownership_lost:
             # The claim died inside a side-effect fence: the side effect did NOT complete.
+            _stop_fire_claim_heartbeat()
             _record_fire_ownership_lost(job, fire_owner, execution_id)
             return True
 
@@ -3511,9 +3576,11 @@ def _run_one_job_body(
                         "Job '%s': transport cancellation arrived before terminal completion; "
                         "recording the interrupted run",
                         job["id"])
+                _stop_fire_claim_heartbeat()
                 _record_fire_ownership_lost(job, fire_owner, execution_id)
                 return True
 
+        _stop_fire_claim_heartbeat()
         if _consume_interrupted_flag(job["id"], execution_token):
             from cron.scheduler_bookkeeping import finish_interrupted_run
             finish_interrupted_run(job, execution_id, delivery_error)
@@ -3564,6 +3631,7 @@ def _run_one_job_body(
         ):
             delivery_error, delivery_outcome = _deliver_crash_failure(
                 job, _err_text, adapters=adapters, loop=loop)
+        _stop_fire_claim_heartbeat()
         try:
             if (
                 not _consume_interrupted_flag(job["id"], execution_token)
