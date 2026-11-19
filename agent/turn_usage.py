@@ -141,11 +141,20 @@ def maybe_rotate_vertex_flash_keepalive_pool(
 ) -> bool:
     """Close pooled HTTP keep-alive connections when a Vertex ``locations/global`` Flash
     session receives 0 cached tokens on Call #2+ (>= 16,384 prompt tokens), so the next
-    request dials a fresh global frontend instead of staying pinned to a non-caching socket."""
+    request dials a fresh global frontend instead of staying pinned to a non-caching socket.
+
+    Streaming turns reuse ``agent._request_client_cache["client"]`` (and
+    ``agent._request_global_fallback_client_cache["client"]``) rather than ``agent.client``,
+    so both the cached per-request client slot(s) and ``agent.client`` must be rotated.
+    """
+    if int(cache_read_tokens or 0) > 0:
+        if getattr(agent, "_vertex_flash_pool_rotation_count", 0):
+            agent._vertex_flash_pool_rotation_count = 0
+        return False
     if completed_compaction_pending:
         return False
     calls = int(getattr(agent, "session_api_calls", 0) or 0)
-    if calls < 2 or int(prompt_tokens or 0) < 16_384 or int(cache_read_tokens or 0) > 0:
+    if calls < 2 or int(prompt_tokens or 0) < 16_384:
         return False
     model_low = str(getattr(agent, "model", "") or "").lower()
     prov_low = str(getattr(agent, "provider", "") or "").lower()
@@ -156,17 +165,35 @@ def maybe_rotate_vertex_flash_keepalive_pool(
         return False
     last_rot = int(getattr(agent, "_vertex_flash_pool_rotated_call", 0) or 0)
     rot_count = int(getattr(agent, "_vertex_flash_pool_rotation_count", 0) or 0)
-    if calls - last_rot < 2 or rot_count >= 4:
+    if calls - last_rot < 2 or rot_count >= 8:
         return False
-    client = getattr(agent, "client", None)
-    hc = getattr(client, "_client", None)
-    tr = getattr(hc, "_transport", None)
-    pool = getattr(tr, "_pool", None)
-    close_fn = getattr(pool, "close", None)
-    if not callable(close_fn):
-        return False
+
+    rotated = False
+    candidate_clients: list[Any] = []
+    primary = getattr(agent, "client", None)
+    if primary is not None:
+        candidate_clients.append(primary)
+    for slot_attr in ("_request_client_cache", "_request_global_fallback_client_cache"):
+        slot = getattr(agent, slot_attr, None)
+        req_client = slot.get("client") if isinstance(slot, dict) else None
+        if req_client is not None and req_client not in candidate_clients:
+            candidate_clients.append(req_client)
+
     try:
-        close_fn()
+        for cand in candidate_clients:
+            hc = getattr(cand, "_client", None)
+            tr = getattr(hc, "_transport", None)
+            pool = getattr(tr, "_pool", None)
+            close_fn = getattr(pool, "close", None)
+            if callable(close_fn):
+                close_fn()
+                rotated = True
+        close_cached_fn = getattr(agent, "_close_cached_request_openai_client", None)
+        if callable(close_cached_fn):
+            close_cached_fn(reason="vertex_flash_0cache_rotate")
+            rotated = True
+        if not rotated:
+            return False
         agent._vertex_flash_pool_rotated_call = calls
         agent._vertex_flash_pool_rotation_count = rot_count + 1
         logger.info(

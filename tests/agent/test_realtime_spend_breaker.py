@@ -1254,4 +1254,27 @@ def test_tier0_critical_cache_reset_ceiling_and_flash_keepalive_pool_rotation(tm
     )
     assert len(closed_calls) == 2
 
+    # Streaming turns keep the active socket in _request_client_cache["client"] (shared=False)
+    req_closed: list[str] = []
+    streaming_agent = SimpleNamespace(
+        session_api_calls=2,
+        model="google/gemini-3.8-flash",
+        provider="vertex",
+        base_url="https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi",
+        client=None,
+        _request_client_cache={
+            "client": SimpleNamespace(_client=SimpleNamespace(_transport=SimpleNamespace(_pool=_FakePool())))
+        },
+        _close_cached_request_openai_client=lambda *, reason: req_closed.append(reason),
+    )
+    assert (
+        maybe_rotate_vertex_flash_keepalive_pool(
+            streaming_agent, prompt_tokens=48_000, cache_read_tokens=0
+        )
+        is True
+    )
+    assert len(closed_calls) == 3
+    assert req_closed == ["vertex_flash_0cache_rotate"]
+
+
 
