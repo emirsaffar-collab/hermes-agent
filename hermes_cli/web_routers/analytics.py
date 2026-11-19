@@ -87,10 +87,11 @@ _USAGE_BREAKDOWN_TTL_S = 60.0
 def _cached_usage_breakdown(persistence, days: int) -> dict[str, Any]:
     from agent.insights import InsightsEngine
 
-    db_key = str(getattr(persistence, "store_path", None) or getattr(persistence, "db_path", "") or "")
+    bound = persistence._bound_store() if callable(getattr(persistence, "_bound_store", None)) else persistence
+    db_key = str(getattr(bound, "store_path", None) or getattr(persistence, "db_path", "") or "")
     max_id = 0
     try:
-        holder = persistence.holder() if callable(getattr(persistence, "holder", None)) else None
+        holder = bound.holder() if callable(getattr(bound, "holder", None)) else None
         if holder is not None:
             row = holder._read_one("SELECT COALESCE(MAX(id), 0) FROM messages")
             max_id = int(row[0] or 0) if row else 0

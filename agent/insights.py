@@ -181,10 +181,15 @@ class InsightsEngine:
 
     @contextlib.contextmanager
     def _watermark_conn(self):
-        if self.persistence is not None and callable(getattr(self.persistence, "holder", None)):
-            holder = self.persistence.holder()
+        bound = (
+            self.persistence._bound_store()
+            if self.persistence is not None and callable(getattr(self.persistence, "_bound_store", None))
+            else self.persistence
+        )
+        if bound is not None and callable(getattr(bound, "holder", None)):
+            holder = bound.holder()
             with holder._read_ctx() as conn:
-                yield str(getattr(self.persistence, "store_path", None) or getattr(holder, "db_path", "") or ""), conn
+                yield str(getattr(bound, "store_path", None) or getattr(holder, "db_path", "") or ""), conn
             return
         conn = getattr(self.db, "_conn", None)
         if conn is not None:
@@ -193,7 +198,8 @@ class InsightsEngine:
         if self.db is not None and getattr(self.db, "db_path", None):
             from persistence_assembly import open_persistence_reader
             with open_persistence_reader(Path(self.db.db_path)) as reader:
-                holder = reader.holder()
+                rbound = reader._bound_store() if callable(getattr(reader, "_bound_store", None)) else reader
+                holder = rbound.holder()
                 with holder._read_ctx() as rconn:
                     yield str(self.db.db_path), rconn
             return

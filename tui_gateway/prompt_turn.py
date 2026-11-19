@@ -595,8 +595,13 @@ def _adopt_out_of_band_turns(session: dict) -> None:
             if (persistence is not None or db is not None) and target_key:
                 import glob as _glob
                 import os as _os
+                bound = (
+                    persistence._bound_store()
+                    if persistence is not None and callable(getattr(persistence, "_bound_store", None))
+                    else persistence
+                )
                 db_path = str(
-                    getattr(persistence, "store_path", None)
+                    getattr(bound, "store_path", None)
                     or getattr(db, "db_path", None)
                     or getattr(db, "store_path", None)
                     or _os.path.expanduser("~/.hermes/state.db")
@@ -608,7 +613,7 @@ def _adopt_out_of_band_turns(session: dict) -> None:
                     session["_scrub_reloaded_mtime"] = max_mt
                     scrubbed = True
                 else:
-                    holder = persistence.holder() if persistence is not None and callable(getattr(persistence, "holder", None)) else None
+                    holder = bound.holder() if bound is not None and callable(getattr(bound, "holder", None)) else None
                     read_all = getattr(db, "_read_all", None) or getattr(holder, "_read_all", None)
                     if callable(read_all):
                         mem_tool_lens = {

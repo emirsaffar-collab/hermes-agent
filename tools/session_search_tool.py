@@ -452,8 +452,9 @@ def _lineage_session_ids(persistence, target_session_id: str) -> list[str]:
     out: set[str] = {target_session_id, root}
 
     def _lookup() -> list[str]:
-        if callable(getattr(persistence, "holder", None)):
-            holder = persistence.holder()
+        bound = persistence._bound_store() if callable(getattr(persistence, "_bound_store", None)) else persistence
+        if callable(getattr(bound, "holder", None)):
+            holder = bound.holder()
             rows = holder._read_all(
                 "WITH RECURSIVE tree(id) AS ("
                 "  SELECT ? UNION ALL "
