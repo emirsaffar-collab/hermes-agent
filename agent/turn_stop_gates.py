@@ -66,6 +66,7 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
     a registered ``pre_verify`` hook may keep the agent going one more turn; no default
     continuation cost on ordinary text turns."""
     _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
+    _exec_ran = getattr(agent, "_turn_exec_tool_ran", False) is True
     try:
         from agent.verify_hooks import max_verify_nudges
         from hermes_cli.lifecycle import has_hook
@@ -79,7 +80,7 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
                 or any(_m in final_response.lower() for _m in _OPEN_ITEMS_HEADING_MARKERS)
             )
         )
-        if (_edited or _has_open_items_section) and has_hook("pre_verify") and attempt < max_verify_nudges():
+        if (_edited or _exec_ran or _has_open_items_section) and has_hook("pre_verify") and attempt < max_verify_nudges():
             # Posture is fixed for the session — resolve once + cache.
             coding = getattr(agent, "_resolved_is_coding", None)
             if coding is None:

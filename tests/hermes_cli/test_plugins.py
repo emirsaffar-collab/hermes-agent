@@ -2034,6 +2034,14 @@ class TestGetPreVerifyContinueMessage:
         assert len(seen) == 1
         assert seen[0]["changed_paths"] == []
 
+        # Turn where terminal/execute_code ran (_turn_exec_tool_ran=True) -> consults hook even with plain text
+        seen.clear()
+        agent._turn_exec_tool_ran = True
+        nudge_exec = _pre_verify_nudge(agent, "Everything is complete.", 0)
+        assert nudge_exec == "nudge from open-items-gate"
+        assert len(seen) == 1
+        assert seen[0]["changed_paths"] == []
+
 
 class TestThreadToolWhitelist:
     """Tests for the thread-local tool whitelist used by background review forks."""
