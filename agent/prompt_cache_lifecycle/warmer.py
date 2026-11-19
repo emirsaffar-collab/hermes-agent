@@ -257,6 +257,10 @@ class PromptCacheWarmer:
             return self._stop("prompt caching disabled")
         if "_moa_prepared_request" in api_kwargs or getattr(agent, "provider", "") == "moa":
             return self._stop("MoA requests are not replayable")
+        if getattr(agent, "provider", "") == "vertex" and "/locations/global/" in str(
+            getattr(agent, "_last_routed_base_url", None) or getattr(agent, "base_url", "") or ""
+        ):
+            return self._stop("vertex global endpoint is unpinned across Borg sub-pools")
         if getattr(agent, "_interrupt_requested", False):
             return self._stop("turn interrupted")
         if api_mode == "anthropic_messages" and not has_cache_markers(api_kwargs):

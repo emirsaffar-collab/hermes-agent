@@ -217,8 +217,8 @@ def finish_text_response(
     # delivery channel (gateway status message / CLI print). NEVER appended to messages/api_messages:
     # conversation context and the cached prompt prefix stay byte-identical.
     from agent.agent_runtime_helpers import (
-        intent_ack_continuation_mode, looks_like_degenerate_final, promoted_reasoning_announces_action,
-        tool_results_this_turn, trailing_continue_intent,
+        intent_ack_continuation_mode, looks_like_degenerate_final, looks_like_tool_echo_collapse,
+        promoted_reasoning_announces_action, tool_results_this_turn, trailing_continue_intent,
     )
 
     _ack_mode = intent_ack_continuation_mode(agent)
@@ -244,10 +244,15 @@ def finish_text_response(
     _tool_rows = tool_results_this_turn(messages)
     _degenerate_final = (
         bool(getattr(agent, "_stall_guards", True))
-        and _ack_mode != "off"
         and codex_ack_continuations < 2
         and _tool_rows > 0
-        and looks_like_degenerate_final(_stall_text, user_message=user_message)
+        and (
+            looks_like_tool_echo_collapse(_stall_text)
+            or (
+                _ack_mode != "off"
+                and looks_like_degenerate_final(_stall_text, user_message=user_message)
+            )
+        )
     )
     # Precedence: an announced next action outranks the fragment shape; the codex ack is last.
     if _stall_continue_intent:

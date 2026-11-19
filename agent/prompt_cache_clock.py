@@ -215,6 +215,8 @@ def _rule_openai_spec(ctx: _Ctx) -> _Verdict:
     An assumption on non-OpenAI vendors: the first keep-alive that misses stops warming for the session."""
     if proven := _written_tiers(ctx.write_tiers):
         return _Verdict(proven, PROVEN, "openai_write_tier")
+    if ctx.ceiling in TTL_SECONDS and TTL_SECONDS[ctx.ceiling] < TTL_SECONDS[_OPENAI_READ_FLOOR]:
+        return _Verdict((ctx.ceiling,), DECLARED, f"route_ceiling_{ctx.ceiling}")
     return _Verdict((_OPENAI_READ_FLOOR,), DECLARED, "openai_spec_30m")
 
 
@@ -229,7 +231,7 @@ def _refresh_restart(deadline: float, tier: str, at: float) -> float:
 
 
 def _refresh_openai(deadline: float, tier: str, at: float) -> float:
-    return max(deadline, at + TTL_SECONDS[_OPENAI_READ_FLOOR])
+    return max(deadline, at + TTL_SECONDS.get(tier, TTL_SECONDS[_OPENAI_READ_FLOOR]))
 
 
 # How a read moves a covered tier's deadline; route classes absent here never hold coverage.
@@ -316,7 +318,7 @@ def _route_key(provider: Any, base_url: Any, model: Any) -> tuple[str, str, str]
 
 #: Reply fields that name the upstream a gateway routed the request to (OpenRouter's ``provider``).
 _UPSTREAM_FIELDS = ("provider",)
-_ID_FAMILY = re.compile(r"^([A-Za-z]+)[-_]")
+_ID_FAMILY = re.compile(r"^([a-z]{3,16})[-_]")
 
 
 def response_upstream(response: Any) -> Optional[str]:

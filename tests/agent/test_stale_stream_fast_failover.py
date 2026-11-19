@@ -103,9 +103,12 @@ def test_vertex_regional_ttfb_stale_cap_is_150s_while_post_chunk_and_global_stay
     diag["first_chunk_at"] = 1001.0
     assert call._effective_stale_timeout() == 600.0
 
-    # On locations/global, Phase 1 also retains the full 600s floor.
+    # On locations/global, Phase 1 also uses the 150s pre-first-chunk TTFB cap (19/23 stale
+    # hangs occur on global before first chunk), while Phase 2 retains the full 600s floor.
     diag["first_chunk_at"] = None
     call.agent._last_routed_base_url = call.agent.base_url
+    assert call._effective_stale_timeout() == 150.0
+    diag["first_chunk_at"] = 1002.0
     assert call._effective_stale_timeout() == 600.0
 
 
@@ -191,4 +194,19 @@ def test_subagent_and_cron_never_acquire_regional_slot_via_bg_review_branch():
             assert held is False
         finally:
             va.reset_vertex_sticky_region(sid)
+
+    # Timestamped subagent/cron session IDs (20261119_*) acquired with interactive=False
+    # are pinned to global and never trip europe-west2 regional cooldown on a global 429/timeout.
+    va.reset_vertex_hybrid_router_state()
+    ts_subagent_sid = "20261119_193800_3c709f"
+    region_ts, held_ts = va.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=False,
+        session_id=ts_subagent_sid,
+    )
+    assert (region_ts, held_ts) == ("global", False)
+    assert va.get_session_vertex_region_affinity(ts_subagent_sid) == "global"
+    va.record_vertex_regional_429(cooldown_seconds=15.0, session_id=ts_subagent_sid)
+    assert va.vertex_regional_cooldown_remaining() == 0.0
 

@@ -297,6 +297,7 @@ def assemble_api_request(
         request_pressure_tokens = _pressure_with_real_floor(
             agent.context_compressor, request_pressure_tokens
         )
+    agent._last_assembled_request_pressure_tokens = int(request_pressure_tokens or 0)
     # Measured: the request-only replay price must not reach a provider.
     from agent.message_metadata import drop_request_reasoning_tokens
 

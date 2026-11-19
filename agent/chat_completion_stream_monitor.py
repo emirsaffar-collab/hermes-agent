@@ -60,10 +60,7 @@ class StreamingWaitMonitor:
                 or getattr(agent, "base_url", None)
                 or ""
             )
-            if (
-                "europe-west2-aiplatform.googleapis.com" in routed
-                or "asia-southeast1-aiplatform.googleapis.com" in routed
-            ):
+            if "aiplatform.googleapis.com" in routed or not routed:
                 return min(stale, VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS)
         return stale
 

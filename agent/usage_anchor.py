@@ -259,6 +259,13 @@ def restore_usage_anchor(agent: Any, conversation_history: Optional[list[dict[st
             matched = False
     if matched:
         agent._usage_anchor = anchor
+        cc = getattr(agent, "context_compressor", None)
+        pt = int(anchor.get("prompt_tokens") or 0)
+        if cc is not None and pt > 0:
+            if int(getattr(cc, "last_prompt_tokens", 0) or 0) == 0:
+                cc.last_prompt_tokens = pt
+            if int(getattr(cc, "last_real_prompt_tokens", 0) or 0) == 0:
+                cc.last_real_prompt_tokens = pt
     else:
         persist_usage_anchor(agent, None)
 

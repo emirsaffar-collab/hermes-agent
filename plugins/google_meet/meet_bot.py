@@ -661,6 +661,7 @@ class _RtcTranscriber:
         speeches: Optional[list[dict]] = None,
     ):
         """Run Simul-Whisper style variable-length dynamic encoder on Apple Silicon Metal GPU."""
+        import gc
         import importlib
         import numpy as np
         from types import SimpleNamespace
@@ -802,6 +803,14 @@ class _RtcTranscriber:
                     c_s = seg_start_s + (float(c_start) / 16000.0)
                     c_e = min(seg_end_s, seg_start_s + (float(c_end) / 16000.0))
                     segs.append(SimpleNamespace(text=txt, start=c_s, end=c_e))
+            try:
+                if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+                    mx.metal.clear_cache()
+                elif hasattr(mx, "clear_cache"):
+                    mx.clear_cache()
+            except Exception:
+                pass
+            gc.collect()
         info = SimpleNamespace(
             language=det_lang or "sv",
             language_probability=det_prob,

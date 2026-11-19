@@ -1969,6 +1969,11 @@ def route_classified_error(
                 if _cc_tr is not None
                 else 0
             )
+            if _tr_prompt_tok == 0:
+                _tr_prompt_tok = max(
+                    _tr_prompt_tok,
+                    int(getattr(agent, "_last_assembled_request_pressure_tokens", 0) or 0),
+                )
             _preserve_deep_ew2_cache = (
                 _tr_prompt_tok >= GLOBAL_STICKY_EPOCH_MIN_TOKENS
                 and retry_count < 2

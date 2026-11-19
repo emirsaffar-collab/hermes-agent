@@ -727,7 +727,15 @@ def _dispatch_authorized_once(
         resolve = lambda: _pre_tool_block(agent, ref)
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
-    block_body = None if block_message is None else {"error": block_message}
+    block_body = (
+        None
+        if block_message is None
+        else (
+            {"error": block_message, "exit_code": 2, "output": ""}
+            if ref.name in ("terminal", "Bash")
+            else {"error": block_message}
+        )
+    )
 
     # Checked once, after plugin modify hooks (which may replace arguments) and
     # before guardrails or real dispatch: a copied compression marker in an

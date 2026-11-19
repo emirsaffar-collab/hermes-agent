@@ -525,6 +525,8 @@ class ClientLifecycleMixin:
                 project_id, configured_region = parsed_vertex
                 _cc = getattr(self, "context_compressor", None)
                 _last_prompt_tok = int(getattr(_cc, "last_prompt_tokens", 0) or 0) if _cc is not None else 0
+                if _last_prompt_tok == 0:
+                    _last_prompt_tok = max(0, int(getattr(self, "_last_assembled_request_pressure_tokens", 0) or 0))
                 target_region, slot_held = acquire_vertex_hybrid_region(
                     req_model,
                     configured_region=configured_region,

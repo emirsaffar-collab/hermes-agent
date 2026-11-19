@@ -103,6 +103,10 @@ _prev_strikes = getattr(_prev_vertex_mod, "_session_regional_429_strikes", None)
 _session_regional_429_strikes: dict[str, tuple[int, float]] = (
     _prev_strikes if isinstance(_prev_strikes, dict) else {}
 )
+_prev_non_interactive = getattr(_prev_vertex_mod, "_non_interactive_session_ids", None)
+_non_interactive_session_ids: set[str] = (
+    _prev_non_interactive if isinstance(_prev_non_interactive, set) else set()
+)
 _SESSION_AFFINITY_CAP = 512
 _VERTEX_BASE_URL_RE = re.compile(
     r"^https://(?:[a-z0-9-]+-)?aiplatform\.googleapis\.com/v1(?:beta1)?/projects/([^/]+)/locations/([^/]+)/endpoints/openapi/?$"
@@ -161,6 +165,7 @@ def record_vertex_regional_429(
             pinned_before != EUROPE_WEST2_VERTEX_REGION
             and (
                 raw_sid.startswith(("cron_", "subagent_"))
+                or (bool(canon_sid) and canon_sid in _non_interactive_session_ids)
                 or pinned_before in (GLOBAL_VERTEX_REGION, ASIA_SOUTHEAST1_VERTEX_REGION)
             )
         )
@@ -216,6 +221,7 @@ def reset_vertex_hybrid_router_state() -> None:
         _session_region_affinity.clear()
         _session_region_last_seen.clear()
         _session_regional_429_strikes.clear()
+        _non_interactive_session_ids.clear()
 
 
 def _canonical_affinity_session_id(session_id: Optional[str]) -> Optional[str]:
@@ -362,12 +368,22 @@ def acquire_vertex_hybrid_region(
             reset_vertex_sticky_region(session_id)
             pinned_region = None
         prompt_tok = 0
+    canon_sid = _canonical_affinity_session_id(raw_sid) if raw_sid else None
     is_bg_review_for_ew2_parent = (
         pinned_region in REGIONAL_VERTEX_REGIONS
         and (bool(raw_sid) or ":bg-review:" in raw_sid)
         and not raw_sid.startswith(("cron_", "subagent_"))
+        and not (bool(canon_sid) and canon_sid in _non_interactive_session_ids)
     )
     if is_vertex_argon_model(model) and reg in (GLOBAL_VERTEX_REGION, *REGIONAL_VERTEX_REGIONS):
+        if interactive and canon_sid:
+            with _EUROPE_WEST2_STATE_LOCK:
+                _non_interactive_session_ids.discard(canon_sid)
+        elif not interactive and not is_bg_review_for_ew2_parent and canon_sid:
+            with _EUROPE_WEST2_STATE_LOCK:
+                _non_interactive_session_ids.add(canon_sid)
+            if pinned_region is None:
+                _record_session_vertex_region_affinity(session_id, GLOBAL_VERTEX_REGION)
         if (interactive or is_bg_review_for_ew2_parent) and pinned_region != GLOBAL_VERTEX_REGION:
             if sticky_wait_seconds is not None:
                 wait_s = max(0.0, float(sticky_wait_seconds))

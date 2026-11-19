@@ -2878,6 +2878,15 @@ _SENTENCE_TERMINALS = (".", "!", "?", "\u3002", "\uff01", "\uff1f")
 # Punctuation no answer begins with when a letter follows ("?warming"); "$5", "#123", "-1",
 # "/tmp", ".env", "(a)", ":8080", ":)", ";;" all stay answers.
 _DEGENERATE_LEADING_PUNCT = "?!,;:)]}"
+_TOOL_ECHO_COLLAPSE_RE = re.compile(
+    r"\A,?\s*(?:exit_code\s*:\s*-?\d+\s*,\s*output\s*:|output\s*:.*,?\s*exit_code\s*:\s*-?\d+)",
+    re.DOTALL,
+)
+
+
+def looks_like_tool_echo_collapse(text: str) -> bool:
+    """Detect hallucinated tool-result tail fragments (',exit_code:2,output:...') emitted as assistant text."""
+    return bool(_TOOL_ECHO_COLLAPSE_RE.match((text or "").strip()))
 
 
 def looks_like_degenerate_final(text: str, user_message: Any = None) -> bool:
@@ -2887,6 +2896,8 @@ def looks_like_degenerate_final(text: str, user_message: Any = None) -> bool:
     non-ASCII letters, a terse non-Latin reply ("是", "Готово") is an answer, not a collapse.
     """
     t = (text or "").strip()
+    if looks_like_tool_echo_collapse(t):
+        return True
     if not t or len(t) > _DEGENERATE_FINAL_MAX_CHARS or t.endswith(_SENTENCE_TERMINALS):
         return False
     if t[0] in _DEGENERATE_LEADING_PUNCT and len(t) > 1 and t[1].isalpha():

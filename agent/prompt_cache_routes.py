@@ -158,7 +158,7 @@ def observe(*, provider: str, base_url: str, model: str, explicit: bool, read: i
                 return
             if hit:
                 entry["reads"] = int(entry.get("reads", 0)) + 1
-                if gap_s is not None:
+                if gap_s is not None and (tier_s is None or gap_s < tier_s):
                     _push(entry, "hit_gaps", gap_s)
                     entry["longest_hit"] = max(float(entry.get("longest_hit") or 0.0), round(gap_s, 1))
                 if replay and abs(write - read) <= _SAME_PREFIX_SHARE * read:
@@ -184,7 +184,12 @@ def _entry(key: str, now: float) -> dict[str, Any]:
 def learned_lifetime(entry: dict[str, Any], tier_s: float) -> Optional[float]:
     """The shortest miss gap past the longest hit ever seen and under the tier, when >= 2 such misses
     from >= 2 sessions agree; else None."""
-    longest_hit = max([float(entry.get("longest_hit") or 0.0), *(entry.get("hit_gaps") or ())])
+    in_tier_hits = [
+        float(h)
+        for h in [entry.get("longest_hit") or 0.0, *(entry.get("hit_gaps") or ())]
+        if float(h or 0.0) < tier_s
+    ]
+    longest_hit = max(in_tier_hits) if in_tier_hits else 0.0
     gaps = list(entry.get("miss_gaps") or ())
     keep = [longest_hit < g < tier_s for g in gaps]
     early = [g for g, k in zip(gaps, keep) if k]
