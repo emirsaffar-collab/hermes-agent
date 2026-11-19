@@ -497,6 +497,7 @@ def _run_job_script(
         # in terminal.env_passthrough from that scope (#114209). The factory snapshots the process
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
+        env.pop("__PYVENV_LAUNCHER__", None)
         env.update(env_overlay)
         try:
             from cron.execution_identity import current_cron_execution

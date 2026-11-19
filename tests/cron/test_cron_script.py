@@ -344,9 +344,10 @@ class TestRunJobScript:
         from cron import scheduler_script
         from pm.environments import site_packages
 
+        base_exe = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
         venv = tmp_path / "selected-venv"
         (venv / "bin").mkdir(parents=True)
-        (venv / "bin" / "python").symlink_to(sys.executable)
+        (venv / "bin" / "python").symlink_to(base_exe)
         (venv / "pyvenv.cfg").write_text(
             f"home = {Path(sys.base_prefix) / 'bin'}\ninclude-system-site-packages = false\n",
             encoding="utf-8",
@@ -360,7 +361,7 @@ class TestRunJobScript:
         (deps / "snapshot.pth").write_text(f"{snapshot}\n", encoding="utf-8")
 
         monkeypatch.setattr(
-            "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
+            "hermes_cli._launchers.resolve_store_python", lambda repo: base_exe
         )
         monkeypatch.setattr("pm.environments.selected_venv", lambda repo: venv)
         monkeypatch.delenv("PYTHONPATH", raising=False)
@@ -401,7 +402,7 @@ class TestRunJobScript:
             raise RuntimeError("dependency environment is missing or outside this install")
 
         monkeypatch.setattr(
-            "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
+            "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable).resolve()
         )
         monkeypatch.setattr(
             "pm.environments.selected_venv",
@@ -884,13 +885,15 @@ class TestHcDeadmanSlugs:
             "prompt": "Run ~/.hermes/scripts/hc-ping.sh ops-triage start and ~/.hermes/scripts/hc-ping.sh ops-triage ok",
         }
         fake_db = MagicMock()
+        fake_db.handle.lineage.tip.return_value = "canonical-cron-session"
+        fake_db.handle.sessions.lifecycle_statuses.return_value = {}
         pinged = []
         monkeypatch.setattr(sched, "_ping_hc_deadman_slugs", lambda j: pinged.append(j["id"]))
 
         def _drive(agent_result):
             with patch("cron.scheduler._hermes_home", cron_env), \
                  patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
-                 patch("hermes_state_registry.acquire", return_value=fake_db), \
+                 patch("persistence_assembly.open_persistence", return_value=fake_db.handle), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value={

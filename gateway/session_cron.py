@@ -363,11 +363,10 @@ async def execute(authority, ref, row, policy):
             if _db is not None and hasattr(_db, 'end_session'):
                 await asyncio.to_thread(_db.end_session, ref.session_id, _end_reason)
             else:
-                await asyncio.to_thread(
-                    authority_persistence(authority).sessions.end,
-                    ref.session_id,
-                    _end_reason,
-                )
+                _pers = authority_persistence(authority)
+                _sessions = getattr(_pers, 'sessions', None)
+                if _sessions is not None and hasattr(_sessions, 'end'):
+                    await asyncio.to_thread(_sessions.end, ref.session_id, _end_reason)
         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
         # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
         flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}

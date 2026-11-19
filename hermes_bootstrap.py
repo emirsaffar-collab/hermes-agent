@@ -589,7 +589,11 @@ if not _pm_repair:
     from hermes_cli.venv_sync import prepare_launch, relaunch_command
 
     try:
-        _launch_python = prepare_launch(_root, sys.argv[1:])
+        _launch_python = (
+            None
+            if sys.argv[:1] in (["-"], [""])
+            else prepare_launch(_root, sys.argv[1:])
+        )
         if _launch_python is not None:
             _main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
             _command = relaunch_command(

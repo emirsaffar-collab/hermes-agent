@@ -500,6 +500,13 @@ def activate_dependencies(project_root: Path) -> None:
         if not selected.is_dir():
             return  # External/Nix interpreter owns its original sys.path.
     if not selected.is_dir():
+        if sys.argv[:1] in (["-"], [""]) and any(
+            Path(p).name in ("site-packages", "dist-packages") and Path(p).is_dir()
+            for p in sys.path
+        ):
+            if str(project_root.resolve()) not in sys.path:
+                sys.path.insert(0, str(project_root.resolve()))
+            return
         raise RuntimeError(f"dependency environment has no site-packages: {selected}")
     import site
 
