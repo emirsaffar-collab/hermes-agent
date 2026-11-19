@@ -689,3 +689,58 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
         success=False,
         error="Fire claim ownership lost before terminal completion.",
     )
+
+
+def test_heartbeat_stops_before_terminal_bookkeeping_clears_claim(monkeypatch, caplog):
+    """When mark_job_run clears fire_claim and finish_execution waits on executions.db lock,
+    the heartbeat thread must already be stopped so it never logs false ownership loss."""
+    from cron import scheduler
+
+    @contextlib.contextmanager
+    def owned_fence(*_args, **_kwargs):
+        yield True
+
+    claim_cleared = {"val": False}
+
+    def _heartbeat(*_args, **_kwargs):
+        return not claim_cleared["val"]
+
+    def _mark_job_run(*_args, **_kwargs):
+        claim_cleared["val"] = True
+        return True
+
+    def _slow_finish_execution(*_args, **_kwargs):
+        time.sleep(0.08)
+        return {}
+
+    job = {
+        "id": "bookkeeping-race",
+        "execution_id": "exec-bookkeeping-race",
+        "name": "bookkeeping-race",
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
+    }
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_MISS_CONFIRM_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", _heartbeat)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args: {})
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda *_args, **_kwargs: (True, "output", "response", None),
+    )
+    monkeypatch.setattr(scheduler, "fire_claim_fence", owned_fence, raising=False)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "output.md")
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", _mark_job_run)
+    monkeypatch.setattr(scheduler, "finish_execution", _slow_finish_execution)
+
+    with caplog.at_level("WARNING"), \
+         patch("agent.secret_scope.set_secret_scope", return_value=None), \
+         patch("agent.secret_scope.build_profile_secret_scope", return_value={}), \
+         patch("agent.secret_scope.reset_secret_scope"):
+        assert scheduler.run_one_job(job) is True
+
+    assert claim_cleared["val"] is True
+    assert "fire claim ownership lost; interrupting stale run" not in caplog.text
+

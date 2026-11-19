@@ -353,7 +353,6 @@ def finish_execution(
     Only the owning process may finish its attempt; receipt recovery for a departed owner
     settles through ``recover_receipted_execution``.
     """
-    now = _hermes_now().isoformat()
     status = "cancelled" if cancelled else ("completed" if success else "failed")
     detail = None if success else (str(error) if error else "unknown failure")
     if detail is not None:
@@ -361,6 +360,7 @@ def finish_execution(
         from cron.jobs_error_text import sanitize_persisted_error
         detail = sanitize_persisted_error(detail)
     with _transaction() as conn:
+        now = _hermes_now().isoformat()
         owner = (_PROCESS_ID, os.getpid())
         cur = conn.execute(
             """UPDATE executions
