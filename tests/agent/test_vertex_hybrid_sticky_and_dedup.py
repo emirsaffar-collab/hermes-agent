@@ -602,7 +602,11 @@ def test_overnight_peak_burst_12_concurrent_deep_sessions_zero_cold_spills():
                 with lock:
                     results.append((sid, turn, reg, slot, expected_reg))
             finally:
-                vertex_adapter.release_vertex_hybrid_slot(slot, reg)
+                if slot:
+                    if reg == "asia-southeast1":
+                        vertex_adapter._ASIA_SOUTHEAST1_ARGON_SEMAPHORE.release()
+                    elif reg == "europe-west2":
+                        vertex_adapter._EUROPE_WEST2_ARGON_SEMAPHORE.release()
 
     threads = []
     for i in range(6):
