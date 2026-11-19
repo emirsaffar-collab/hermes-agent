@@ -139,11 +139,21 @@ def record_vertex_regional_429(
     """Trip the europe-west2 429 cooldown so subsequent calls route to locations/global."""
     global _europe_west2_cooldown_until
     now = time.monotonic()
-    with _EUROPE_WEST2_STATE_LOCK:
-        target = now + max(0.0, float(cooldown_seconds))
-        _europe_west2_cooldown_until = max(_europe_west2_cooldown_until, target)
-        until = _europe_west2_cooldown_until
     raw_sid = str(session_id or "").strip()
+    canon_sid = _canonical_affinity_session_id(raw_sid) if raw_sid else None
+    with _EUROPE_WEST2_STATE_LOCK:
+        pinned_before = _session_region_affinity.get(canon_sid) if canon_sid else None
+        is_non_ew2_session = bool(
+            pinned_before != EUROPE_WEST2_VERTEX_REGION
+            and (
+                raw_sid.startswith(("cron_", "subagent_"))
+                or pinned_before in (GLOBAL_VERTEX_REGION, ASIA_SOUTHEAST1_VERTEX_REGION)
+            )
+        )
+        if not is_non_ew2_session:
+            target = now + max(0.0, float(cooldown_seconds))
+            _europe_west2_cooldown_until = max(_europe_west2_cooldown_until, target)
+        until = _europe_west2_cooldown_until
     if raw_sid and ":bg-review:" not in raw_sid and ":bg_review" not in raw_sid and int(last_prompt_tokens or 0) < GLOBAL_STICKY_EPOCH_MIN_TOKENS:
         _record_session_vertex_region_affinity(raw_sid, GLOBAL_VERTEX_REGION)
     return until
@@ -355,6 +365,12 @@ def acquire_vertex_hybrid_region(
                 or (interactive and prompt_tok < GLOBAL_STICKY_EPOCH_MIN_TOKENS)
             ):
                 _record_session_vertex_region_affinity(session_id, GLOBAL_VERTEX_REGION)
+            elif session_id and pinned_region in REGIONAL_VERTEX_REGIONS:
+                canon_sid = _canonical_affinity_session_id(session_id)
+                if canon_sid:
+                    with _EUROPE_WEST2_STATE_LOCK:
+                        if _session_region_affinity.get(canon_sid) == pinned_region:
+                            _session_region_last_seen[canon_sid] = time.monotonic()
         return (GLOBAL_VERTEX_REGION, False)
     return (reg, False)
 

@@ -324,3 +324,35 @@ def test_interactive_desktop_subagent_allowed_under_tier3_but_capped_by_tier1_fa
     assert entry["error"] == breaker_reason
     assert entry["turn_exit_reason"] == breaker_reason
 
+
+def test_cron_or_global_session_429_does_not_poison_europe_west2_cooldown():
+    """A 429 or timeout on a cron_*, subagent_*, or global-pinned session must NOT
+    trip the europe-west2 regional cooldown and evict warm europe-west2 sessions."""
+    vertex_adapter.reset_vertex_hybrid_router_state()
+    ew2_sid = "20261118_desktop_ew2"
+    vertex_adapter._record_session_vertex_region_affinity(
+        ew2_sid, vertex_adapter.EUROPE_WEST2_VERTEX_REGION
+    )
+    global_sid = "20261118_desktop_global"
+    vertex_adapter._record_session_vertex_region_affinity(
+        global_sid, vertex_adapter.GLOBAL_VERTEX_REGION
+    )
+
+    # Cron and global-pinned 429s must leave europe-west2 cooldown at 0.0
+    vertex_adapter.record_vertex_regional_429(cooldown_seconds=15.0, session_id="cron_chat247_1")
+    vertex_adapter.record_vertex_regional_429(cooldown_seconds=15.0, session_id="subagent_worker_1")
+    vertex_adapter.record_vertex_regional_429(cooldown_seconds=15.0, session_id=global_sid)
+    assert vertex_adapter.vertex_regional_cooldown_remaining() == 0.0
+
+    # Warm europe-west2 session continues on europe-west2 without spilling
+    r, acq = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id=ew2_sid,
+        last_prompt_tokens=95_000,
+    )
+    assert (r, acq) == (vertex_adapter.EUROPE_WEST2_VERTEX_REGION, True)
+    assert vertex_adapter.release_vertex_hybrid_slot(SimpleNamespace(_vertex_regional_slot_held=True)) is True
+
+
