@@ -235,6 +235,31 @@ def apply_stop_gates(
             "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"
         )
         return verdict
+
+    # Incomplete turn stop guard: detect cut-off sentences/words on clean EOF
+    # 2026-11-12 (daily-retro Förslag 3, DQ #2150): detect cut-off sentences/words when finish_reason=='stop' without tool_calls
+    if (
+        isinstance(final_response, str)
+        and final_response.strip()
+        and not final_msg.get("tool_calls")
+        and getattr(agent, "_incomplete_turn_nudges", 0) < 2
+    ):
+        import re
+        _trailing = final_response.strip()
+        if re.search(r'(\b[a-zA-Z]{1,4}\.\.\.|\b[a-zA-Z]+,\s*|\b(?:and|the|including|with|for|to)\s*\.\.\.)$', _trailing):
+            agent._incomplete_turn_nudges = getattr(agent, "_incomplete_turn_nudges", 0) + 1
+            final_msg["finish_reason"] = "length"
+            _append_interim_answer(
+                agent, final_msg, messages, conversation_history, "incomplete-turn interim flush failed",
+                final_response=final_response,
+            )
+            verdict = _continue(
+                "[System note: your last response was cut off mid-sentence. Continue directly from where you stopped.]",
+                "_continuation_synthetic",
+            )
+            logger.debug("incomplete turn continuation nudge issued (attempt %d)", agent._incomplete_turn_nudges)
+            return verdict
+
     return StopGateVerdict(
         continue_turn=False, final_response=final_response,
         pending_verification_response=pending_verification_response,

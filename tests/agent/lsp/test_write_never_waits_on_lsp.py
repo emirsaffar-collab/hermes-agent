@@ -169,3 +169,46 @@ def test_each_session_is_checked_on_the_bytes_it_wrote(mock_workspace):
     assert not notes_a and "lsp_diagnostics" not in result_a, f"A was told about B's error: {notes_a or result_a}"
     told_b = " ".join(text for _path, text in notes_b) + str(result_b.get("lsp_diagnostics") or "")
     assert "MOCK001" in told_b, f"session B never heard about its own error: {notes_b}"
+
+
+def test_incomplete_turn_stop_nudge_polarity(monkeypatch):
+    """Cut-off responses ending mid-word/clause trigger continuation up to 2 times; complete responses pass."""
+    from types import SimpleNamespace
+
+    from agent.turn_stop_gates import apply_stop_gates
+
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+    agent = SimpleNamespace(
+        session_id="S-inc",
+        _current_task_id="t-S-inc",
+        _interim_content_was_streamed=lambda _text: False,
+        _emit_interim_assistant_message=lambda _msg: None,
+        _flush_messages_to_session_db=lambda *_a: None,
+    )
+    messages = [{"role": "user", "content": "summarize"}]
+    # Positive leg: cut-off word ending in '...' triggers continuation nudge
+    v1 = apply_stop_gates(
+        agent,
+        {"role": "assistant", "content": "My latest pass confirms all numerical and exa..."},
+        final_response="My latest pass confirms all numerical and exa...",
+        messages=messages,
+        conversation_history=[],
+        pending_verification_response=None,
+        pending_verification_response_previewed=False,
+    )
+    assert v1.continue_turn is True
+    assert agent._incomplete_turn_nudges == 1
+    assert "cut off mid-sentence" in messages[-1]["content"]
+
+    # Negative leg: complete sentence does not trigger nudge
+    v2 = apply_stop_gates(
+        agent,
+        {"role": "assistant", "content": "All numerical checks passed cleanly."},
+        final_response="All numerical checks passed cleanly.",
+        messages=messages,
+        conversation_history=[],
+        pending_verification_response=None,
+        pending_verification_response_previewed=False,
+    )
+    assert v2.continue_turn is False
+
