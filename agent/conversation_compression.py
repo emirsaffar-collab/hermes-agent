@@ -1379,10 +1379,21 @@ def _restore_messages_snapshot(messages: list, snapshot: Optional[list]) -> None
 
 
 def _restore_prune_rearm_tokens(compressor: Any, snapshot: dict) -> None:
-    """Restore ONLY the prune runway (and its cold credit) from the attempt snapshot.
+    """Restore ONLY the prune runway (and its cold credit) plus rolled-back compaction counters from the attempt snapshot.
     compress() zeroes it in memory while the durable copy only clears on a successful commit; a kept
     transcript keeps its cached prefix, and 0 would let the next prune break that cache."""
-    for key in (k for k in ("_proactive_prune_rearm_tokens", "_proactive_prune_cold_credit") if k in snapshot):
+    for key in (
+        k
+        for k in (
+            "_proactive_prune_rearm_tokens",
+            "_proactive_prune_cold_credit",
+            "compression_count",
+            "_previous_summary",
+            "_summary_has_user_turn",
+            "_last_compression_made_progress",
+        )
+        if k in snapshot
+    ):
         setattr(compressor, key, snapshot[key])
 
 
@@ -3547,9 +3558,16 @@ def _finish_compaction_boundary(
             )
 
     # A warning, not progress: store it on _compression_warning so a late-bound status_callback can replay it.
+    # Skip when a DB-backed commit aborted and rolled the transcript back to messages_before_compression.
     compressor = agent.context_compressor
+    commit_rolled_back = (
+        not compression_made_progress
+        and not compacted_in_place
+        and not session_commit_succeeded
+        and bool(getattr(agent, "_session_db", None) and getattr(agent, "session_id", None))
+    )
     _cc = compressor.compression_count
-    if _cc >= 2:
+    if _cc >= 2 and not commit_rolled_back:
         _cc_msg = (
             f"{agent.log_prefix}⚠️  Session compressed {_cc} times — accuracy may degrade. Consider /new to start fresh."
         )
@@ -3558,7 +3576,7 @@ def _finish_compaction_boundary(
 
     # session:compress lets hooks ingest the old session before it's lost;
     # in_place=True tells them the same id was compacted rather than rotated.
-    if getattr(agent, "event_callback", None):
+    if getattr(agent, "event_callback", None) and not commit_rolled_back:
         with _swallow('event_callback error on session:compress: %s'):
             agent.event_callback(
                 "session:compress",
@@ -3579,13 +3597,14 @@ def _finish_compaction_boundary(
     _compressed_est = estimate_request_tokens_rough(
         compressed, system_prompt=new_system_prompt or "", tools=agent.tools or None
     )
-    compressor.last_compression_rough_tokens = _compressed_est
-    compressor.last_prompt_tokens = -1
-    compressor.last_completion_tokens = 0
-    compressor.awaiting_real_usage_after_compression = True
-    # Transcript rewritten: invalidate the usage anchor's base snapshot explicitly
-    # (its structural check would fail closed anyway); estimate until re-anchored.
-    set_usage_anchor(agent, None)
+    if not commit_rolled_back:
+        compressor.last_compression_rough_tokens = _compressed_est
+        compressor.last_prompt_tokens = -1
+        compressor.last_completion_tokens = 0
+        compressor.awaiting_real_usage_after_compression = True
+        # Transcript rewritten: invalidate the usage anchor's base snapshot explicitly
+        # (its structural check would fail closed anyway); estimate until re-anchored.
+        set_usage_anchor(agent, None)
     # Arm the effectiveness verdict only after a completed rewrite crosses the
     # boundary so later usage isn't charged to an attempt that changed nothing.
     if compression_made_progress:
@@ -3907,6 +3926,10 @@ def _commit_compaction(
                 # See #97948.
                 agent.context_compressor._record_compression_failure_cooldown(
                     _SPLIT_FAILURE_COOLDOWN_SECONDS, f"session_split_failed: {e}"
+                )
+            if not made_progress and compressed is messages:
+                _mark_compression_blocked_transient(
+                    agent, agent.context_compressor, f"cooldown:{_SPLIT_FAILURE_COOLDOWN_SECONDS}"
                 )
     return _CommitOutcome(
         compressed=compressed, commit_started_at=commit_started_at, old_session_id=old_session_id,

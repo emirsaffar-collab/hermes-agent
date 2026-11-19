@@ -34,7 +34,7 @@ from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_messag
 from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
 from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
-from session_rules.turns import _msg_has_payload, repair_message_sequence
+from session_rules.turns import _merge_consecutive_assistants, _msg_has_payload, repair_message_sequence
 logger = logging.getLogger(__name__)
 
 _TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls", "toolcall")
@@ -3317,6 +3317,7 @@ def force_close_tcp_sockets(client: Any) -> int:
 
 __all__ = [
     "_iter_pool_sockets",
+    "_merge_consecutive_assistants",
     "anthropic_prompt_cache_policy",
     "apply_pending_steer_to_tool_results",
     "blank_cache_policy_stub",

@@ -1936,3 +1936,60 @@ class TestAbortedRotationDoesNotGrowParent:
 
         assert calls["n"] == 1, "the pre-flush guard never read the parent row"
         assert agent.session_id != parent  # rotation still happened
+
+    def test_aborted_rotation_rollback_restores_count_and_preserves_usage_anchor(
+        self, tmp_path: Path
+    ):
+        """RCA 2026-11-19: when rotation aborts on a deliberately ended parent, rollback must:
+        (1) restore compression_count so aborted attempts do not emit phantom 'compressed 15/16 times' warnings,
+        (2) keep last_prompt_tokens and awaiting_real_usage_after_compression intact,
+        (3) mark compression_blocked_transiently so post-tool preflight refunds the attempt."""
+        from agent.conversation_compression import compression_blocked_transiently
+
+        db = storage_handle(tmp_path)
+        parent = "PARENT_ROLLBACK_STATE"
+        seed_session(db, parent, "cli")
+        agent = _build_agent_with_db(db, parent)
+        compressor = agent.context_compressor
+        compressor.compression_count = 13
+        compressor.last_prompt_tokens = 356_419
+        compressor.awaiting_real_usage_after_compression = False
+
+        def _compress_incrementing_count(msgs, *_a, **_kw):
+            compressor.compression_count += 1
+            return [
+                {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY]\nsummary"},
+                {"role": "user", "content": "tail"},
+            ]
+
+        compressor.compress.side_effect = _compress_incrementing_count
+        db.sessions.end(parent, "session_reset")
+
+        warnings: list[str] = []
+        agent._emit_warning = lambda message: warnings.append(message)
+
+        returned, _sp = agent._compress_context(_msgs(), "sys", approx_tokens=356_419)
+        assert returned is not None
+        assert compressor.compression_count == 13
+        assert compressor.last_prompt_tokens == 356_419
+        assert compressor.awaiting_real_usage_after_compression is False
+        assert not any("Session compressed" in w for w in warnings)
+        assert compression_blocked_transiently(agent) is True
+
+    def test_summary_seam_consecutive_assistants_folds_without_import_error(
+        self, tmp_path: Path
+    ):
+        """RCA 2026-11-19: _fold_compaction_summary_seam must import _merge_consecutive_assistants
+        cleanly when two adjacent assistant turns meet at the compaction summary seam."""
+        from agent.context_compressor import SUMMARY_PREFIX
+        from persistence.sqlite.conversation._store.messages import _fold_compaction_summary_seam
+
+        seam_msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": f"{SUMMARY_PREFIX}hand-off summary"},
+            {"role": "assistant", "content": "follow-up assistant turn"},
+        ]
+        merged = _fold_compaction_summary_seam(seam_msgs)
+        assert merged == 1
+        assert len(seam_msgs) == 2
+        assert seam_msgs[1]["role"] == "assistant"

@@ -69,6 +69,7 @@ class TestAutomaticEndReasonPredicate:
             "agent_close",
             "startup_orphan_reap",
             "superseded_by_resume",
+            "wrapped",
         ):
             assert is_automatic_end_reason(reason), reason
         for reason in (
@@ -84,7 +85,7 @@ class TestAutomaticEndReasonPredicate:
 
 class TestPublishHealsAutomaticStamp:
     @pytest.mark.parametrize(
-        "reason", ["tui_shutdown", "ws_disconnect", "ws_orphan_reap", "idle_timeout"]
+        "reason", ["tui_shutdown", "ws_disconnect", "ws_orphan_reap", "idle_timeout", "wrapped"]
     )
     def test_rotation_publishes_through_automatic_stamp(
         self, db: StoreHolder, reason: str

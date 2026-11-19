@@ -206,3 +206,32 @@ def test_compute_host_child_turn_reopens_a_finalized_row(tmp_path, monkeypatch):
         server._sessions.pop("child-sid", None)
         host.close()
         db.close()
+
+
+def test_reopen_if_finalized_heals_wrapped_and_rotated_agent_tip_without_touching_compression_parent(tmp_path):
+    """RCA 2026-11-19 (20261119_155949_7a5f79): a background wrap script stamping end_reason='wrapped'
+    (with or without ended_at) on a rotated agent.session_id tip must be reopened on submit, while a
+    compression-ended parent row (end_reason='compression') must never be reopened."""
+    import sqlite3
+
+    db, home = _finalized_db(tmp_path)
+    seed_session(db, "root_compressed", "desktop")
+    seed_session(db, "tip_wrapped", "desktop", parent_session_id="root_compressed")
+    db.sessions.end("root_compressed", "compression")
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute(
+            "UPDATE sessions SET ended_at = NULL, end_reason = 'wrapped' WHERE id = 'tip_wrapped'"
+        )
+        conn.commit()
+
+    session = {
+        "session_key": "root_compressed",
+        "agent": types.SimpleNamespace(session_id="tip_wrapped"),
+    }
+    server._reopen_session_and_agent_if_finalized(db, session)
+
+    root_row = session_row(db, "root_compressed")
+    tip_row = session_row(db, "tip_wrapped")
+    assert root_row is not None and root_row["end_reason"] == "compression" and root_row["ended_at"] is not None
+    assert tip_row is not None and tip_row["end_reason"] is None and tip_row["ended_at"] is None
+    db.close()

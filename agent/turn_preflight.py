@@ -386,9 +386,13 @@ def compress_after_tool_results(
                 _real_tokens = _anchored_after
             elif isinstance(getattr(_compressor, "last_prompt_tokens", 0), int) and _compressor.last_prompt_tokens > 0:
                 _real_tokens = _compressor.last_prompt_tokens
+    _post_tool_cooldown = getattr(
+        _compressor, "get_active_compression_failure_cooldown", lambda: None
+    )()
     if (
         agent.compression_enabled
         and compression_attempts < max_compression_attempts
+        and not _post_tool_cooldown
         and not bool(
             getattr(_compressor, "awaiting_real_usage_after_compression", False)
         )

@@ -62,7 +62,7 @@ _RECOVERABLE_END_REASONS = ("agent_close", "ws_orphan_reap", "superseded_by_resu
 # accident class but were historically only known to tui_gateway's _AUTOMATIC_SESSION_END_REASONS. See
 # #88197.
 _AUTOMATIC_END_REASONS = frozenset(_RECOVERABLE_END_REASONS) | {
-    "tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict"}
+    "tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict", "wrapped"}
 
 
 def is_automatic_end_reason(reason) -> bool:

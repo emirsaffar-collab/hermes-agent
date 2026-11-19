@@ -656,7 +656,10 @@ def _fold_compaction_summary_seam(messages: list[dict[str, Any]]) -> int:
         for i in range(len(messages) - 1)
     ):
         return 0
-    from agent.agent_runtime_helpers import _merge_consecutive_assistants
+    try:
+        from session_rules.turns import _merge_consecutive_assistants
+    except ImportError:
+        from agent.agent_runtime_helpers import _merge_consecutive_assistants
     from agent.conversation_compression_archive import (
         ABSORBED_ROW_IDS, MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS,
     )

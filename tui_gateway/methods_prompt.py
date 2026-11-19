@@ -634,8 +634,21 @@ def _reopen_if_finalized(db, session_id: str) -> None:
         except Exception:
             logger.debug("finalized-session reopen check failed for %s", session_id, exc_info=True)
             return
-        if row is not None and row.ended_at is not None:
+        if (
+            row is not None
+            and (row.ended_at is not None or row.end_reason == "wrapped")
+            and row.end_reason != "compression"
+        ):
             persistence.sessions.reopen(session_id)
+
+
+def _reopen_session_and_agent_if_finalized(db, session: dict) -> None:
+    """Reopen both the gateway session_key and any rotated agent.session_id tip."""
+    primary_sid = str(session.get("session_key") or "")
+    _reopen_if_finalized(db, primary_sid)
+    agent_sid = str(getattr(session.get("agent"), "session_id", "") or "")
+    if agent_sid and agent_sid != primary_sid:
+        _reopen_if_finalized(db, agent_sid)
 
 
 def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
@@ -657,7 +670,7 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
             # an ended_at set at mount time is cleared HERE, before the turn's first write.
             with _session_db(session) as db:
                 if db is not None:
-                    _reopen_if_finalized(db, str(session.get("session_key") or ""))
+                    _reopen_session_and_agent_if_finalized(db, session)
             _persist_submit_user_row(session, text, display_kind)
             return None
     except Exception as exc:
@@ -1013,7 +1026,7 @@ def _(rid, params: dict) -> dict:
         try:
             with _session_db(session) as db:
                 if db is not None:
-                    _reopen_if_finalized(db, str(session.get("session_key") or ""))
+                    _reopen_session_and_agent_if_finalized(db, session)
         except Exception:
             logger.debug("finalized-session reopen before isolated dispatch failed for %s",
                          sid, exc_info=True)

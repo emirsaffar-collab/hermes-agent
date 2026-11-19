@@ -107,7 +107,7 @@ RECOVERABLE_END_REASONS: frozenset[str] = frozenset(
 
 #: End stamps written by automatic cleanup; a writer that proves liveness may clear them.
 AUTOMATIC_END_REASONS: frozenset[str] = RECOVERABLE_END_REASONS | frozenset(
-    {"tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict"}
+    {"tui_shutdown", "ws_disconnect", "idle_timeout", "lru_evict", "wrapped"}
 )
 
 #: The end reason that makes a later child a compression continuation.

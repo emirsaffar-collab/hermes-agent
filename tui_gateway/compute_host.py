@@ -268,7 +268,13 @@ class ComputeHost:
                 # row still marked ended_at. Same best-effort shape as the row binding above.
                 with server._session_db(session) as db:
                     if db is not None:
-                        server._reopen_if_finalized(db, str(session.get("session_key") or ""))
+                        _reopen_fn = getattr(server, "_reopen_session_and_agent_if_finalized", None)
+                        if callable(_reopen_fn):
+                            _reopen_fn(db, session)
+                        else:
+                            _fallback_reopen = getattr(server, "_reopen_if_finalized", None)
+                            if callable(_fallback_reopen):
+                                _fallback_reopen(db, str(session.get("session_key") or ""))
             with contextlib.suppress(Exception):
                 import hermes_undo
                 hermes_undo.on_user_message_appended(session["session_key"])
