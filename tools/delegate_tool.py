@@ -747,7 +747,7 @@ def delegate_task(
     # (with a warning — that fallback is exactly the #91996 failure mode).
     _live_home = _parent_live_home(parent_agent)
 
-    from tools.delegation_live_log import create_live_transcripts
+    from tools.delegation_live_log import create_live_transcripts, update_manifest_statuses
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
         task_list, context, model=creds.get("model"), provider=creds.get("provider"),
         home=_live_home,
@@ -762,13 +762,22 @@ def delegate_task(
         live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
     )
     if err:
+        update_manifest_statuses(
+            live_deleg_id, [{"task_index": i, "status": "failed"} for i in range(len(task_list or ()))], home=_live_home,
+        )
         return tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
         live_home=_live_home, refused=refused,
     )
-    return _run_batch(batch, background)
+    try:
+        return _run_batch(batch, background)
+    except BaseException:
+        update_manifest_statuses(
+            live_deleg_id, [{"task_index": i, "status": "failed"} for i in range(len(task_list or ()))], home=_live_home,
+        )
+        raise
 
 
 # ── OpenAI function-calling schema ──────────────────────────────────────────

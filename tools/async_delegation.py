@@ -175,7 +175,10 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
             parent_session_id=record.get("parent_session_id"), dispatched_at=record["dispatched_at"],
             owner=OwnerStamp(pid=os.getpid(), started_at=owner_started_at), task=task_payload,
             origin_session_id=record.get("origin_session_id", ""))
-    _prune_durable_records()
+    try:
+        _prune_durable_records()
+    except Exception:
+        logger.warning("Async delegation durable ledger prune failed during dispatch", exc_info=True)
 
 
 def _prune_durable_records() -> None:
@@ -764,6 +767,50 @@ def _prune_completed_locked() -> None:
         _records.pop(rid, None)
 
 
+def _settle_live_manifest_best_effort(record: dict[str, Any], status: str) -> None:
+    """Ensure ``cache/delegation/live/<id>/manifest.json`` is never left with ``status='running'``
+    when a background unit fails at dispatch, crashes in ``_worker``, or is reaped as a zombie."""
+    try:
+        from pathlib import Path
+        import json as _json
+        mp = None
+        transcripts = record.get("task_transcripts") or {}
+        if isinstance(transcripts, dict) and transcripts:
+            first_log = next(iter(transcripts.values()), None)
+            if first_log:
+                cand = Path(str(first_log)).parent / "manifest.json"
+                if cand.is_file():
+                    mp = cand
+        if mp is None:
+            did = str(record.get("slot_key") or record.get("delegation_id") or "")
+            base_did = did.rsplit("-", 1)[0] if (did.startswith("deleg_") and "-" in did) else did
+            home = record.get("_home") or get_hermes_home()
+            if base_did and home:
+                cand = Path(str(home)) / "cache" / "delegation" / "live" / base_did / "manifest.json"
+                if cand.is_file():
+                    mp = cand
+        if mp is None:
+            return
+        manifest = _json.loads(mp.read_text(encoding="utf-8-sig"))
+        idxs = record.get("task_indexes")
+        idx_set = set(idxs) if isinstance(idxs, list) else None
+        changed = False
+        mapped_status = "failed" if status == "error" else status
+        for t in manifest.get("tasks", []):
+            if (idx_set is None or t.get("index") in idx_set) and t.get("status") == "running":
+                t["status"] = mapped_status
+                changed = True
+        if not any(t.get("status") == "running" for t in manifest.get("tasks", [])) and not manifest.get("completed"):
+            manifest["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            changed = True
+        if changed:
+            tmp = mp.with_suffix(".json.tmp")
+            tmp.write_text(_json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(mp)
+    except Exception:
+        logger.debug("Best-effort live manifest settle failed for %s", record.get("delegation_id"), exc_info=True)
+
+
 def _reap_zombies_locked(now: float) -> None:
     """Evict or mark terminal any in-memory record whose worker future already finished without
     flipping status out of ``_LIVE_STATES``, or whose dispatch failed before attaching a future.
@@ -782,6 +829,7 @@ def _reap_zombies_locked(now: float) -> None:
             r["progress_fn"] = None
             r.pop("_context", None)
             r.pop("_finished_children", None)
+            _settle_live_manifest_best_effort(r, "error")
         elif fut is None and st in _ACTIVE_STATES and disp_ts and (now - disp_ts) > 15.0:
             r["status"] = "error"
             r["completed_at"] = now
@@ -789,6 +837,7 @@ def _reap_zombies_locked(now: float) -> None:
             r["progress_fn"] = None
             r.pop("_context", None)
             r.pop("_finished_children", None)
+            _settle_live_manifest_best_effort(r, "error")
 
 
 def _current_origin_session_id() -> str:
@@ -882,6 +931,7 @@ def _dispatch_admitted(
     except BaseException:
         with _records_lock:
             _records.pop(delegation_id, None)
+        _settle_live_manifest_best_effort(record, "error")
         raise
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
@@ -1055,6 +1105,7 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
                 _records[delegation_id].pop("_context", None)
                 _records[delegation_id].pop("_finished_children", None)
             _prune_completed_locked()
+        _settle_live_manifest_best_effort(snapshot, status)
 
 
 def completion_event(record: dict[str, Any], result: dict[str, Any], status: str) -> tuple[dict, dict, bool]:

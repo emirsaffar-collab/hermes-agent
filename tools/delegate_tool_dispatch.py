@@ -535,9 +535,16 @@ def _dispatch_background(batch: _Batch) -> str:
 
 def _refuse_detached_only(batch: _Batch, why: str) -> str:
     """A detached-only batch that cannot detach: nothing ran, its children are released."""
+    from tools.delegation_live_log import update_manifest_statuses
     from tools.registry import tool_error
     for _, _, child in batch.children:
         _release_unstarted_child(batch, child)
+    if batch.live_deleg_id:
+        update_manifest_statuses(
+            batch.live_deleg_id,
+            [{"task_index": i, "status": "failed"} for i, _, _ in batch.children],
+            home=batch.live_home,
+        )
     return tool_error(f"Not continued: {why}.")
 
 

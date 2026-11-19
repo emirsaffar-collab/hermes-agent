@@ -382,3 +382,38 @@ def test_reap_zombies_frees_slot_and_finalize_survives_push_exception(runtime, m
         }
     bg._finalize("z_fin", {"status": "completed"}, "completed")
     assert bg._records["z_fin"]["status"] == "completed"
+
+
+def test_settle_live_manifest_on_finalize_and_zombie_reap(runtime, tmp_path):
+    """When a background unit terminates via ``_finalize`` (e.g. runner crash or stall interrupt)
+    or ``_reap_zombies_locked``, ``cache/delegation/live/<id>/manifest.json`` is settled out of
+    ``status='running'`` and stamped with ``completed`` so external monitors never see a ghost."""
+    import json
+    import time
+    from tools import async_delegation as bg
+
+    live_dir = tmp_path / "cache" / "delegation" / "live" / "deleg_ghost1"
+    live_dir.mkdir(parents=True)
+    mp = live_dir / "manifest.json"
+    mp.write_text(json.dumps({
+        "delegation_id": "deleg_ghost1",
+        "started": "2026-11-19 12:00:00",
+        "tasks": [{"index": 0, "goal": "g", "status": "running", "log": "task-0.log"}],
+    }), encoding="utf-8")
+
+    now = time.time()
+    with bg._records_lock:
+        bg._records["deleg_ghost1"] = {
+            "delegation_id": "deleg_ghost1",
+            "slot_key": "deleg_ghost1",
+            "status": "running",
+            "dispatched_at": now - 30.0,
+            "_future": None,
+            "task_transcripts": {"0": str(live_dir / "task-0.log")},
+        }
+        bg._reap_zombies_locked(now)
+
+    settled = json.loads(mp.read_text(encoding="utf-8"))
+    assert settled["tasks"][0]["status"] == "failed"
+    assert settled.get("completed")
+
