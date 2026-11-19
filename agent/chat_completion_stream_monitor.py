@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 # Kills of one dispatched attempt whose worker never unwinds before the monitor gives up on it.
 _STALE_ABANDON_KILLS = 3
+# Phase-1 (pre-first-chunk TTFB) stale cap on regional Vertex endpoints (europe-west2 /
+# asia-southeast1): wedged regional TPU slots fail over to locations/global in 150s instead of 600s.
+VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS = 150.0
 
 
 class StreamingWaitMonitor:
@@ -49,6 +52,19 @@ class StreamingWaitMonitor:
             post_chunk = getattr(self, "_stream_post_chunk_stale_timeout", None)
             if post_chunk is not None and post_chunk > 0:
                 return min(stale, post_chunk)
+            return stale
+        agent = getattr(self, "agent", None)
+        if getattr(agent, "provider", None) == "vertex":
+            routed = str(
+                getattr(agent, "_last_routed_base_url", None)
+                or getattr(agent, "base_url", None)
+                or ""
+            )
+            if (
+                "europe-west2-aiplatform.googleapis.com" in routed
+                or "asia-southeast1-aiplatform.googleapis.com" in routed
+            ):
+                return min(stale, VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS)
         return stale
 
     def _claims_liveness(self) -> bool:

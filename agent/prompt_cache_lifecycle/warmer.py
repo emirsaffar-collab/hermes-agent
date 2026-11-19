@@ -190,7 +190,7 @@ class PromptCacheWarmer:
         self._budget: Optional[_Budget] = None
         #: Whether the armed request carries ``cache_control`` markers (Anthropic spec: a miss is a priced
         #: write) or not (OpenAI spec: a miss re-reads the prefix at the input rate).
-        self._marked = True
+        self._marked = getattr(agent, "api_mode", "anthropic_messages") == "anthropic_messages"
         #: The route ``(provider, base_url, model)`` whose keep-alive missed: the cache does not live as
         #: long as assumed there, so nothing is warmed again this session (new user messages and
         #: compactions included). A model/provider switch is a different cache and clears it.
@@ -623,7 +623,31 @@ class PromptCacheWarmer:
         client = run.client
         with_options = getattr(client, "with_options", None)
         if callable(with_options):
-            client = with_options(max_retries=0, timeout=WARM_REQUEST_TIMEOUT_S)
+            opts: dict[str, Any] = {"max_retries": 0, "timeout": WARM_REQUEST_TIMEOUT_S}
+            if str(run.billing.get("provider") or "").strip().lower() == "vertex":
+                try:
+                    import agent.vertex_adapter as _va_mod
+
+                    routed_url = (
+                        getattr(self.agent, "_last_routed_base_url", None)
+                        or run.billing.get("base_url")
+                        or getattr(self.agent, "base_url", None)
+                    )
+                    _get_vcfg = getattr(_va_mod, "get_vertex_config", None)
+                    if callable(_get_vcfg):
+                        _cred_pair: Any = _get_vcfg()
+                        if isinstance(_cred_pair, tuple) and len(_cred_pair) == 2:
+                            token, resolved_url = _cred_pair
+                            if token:
+                                opts["api_key"] = token
+                            if routed_url or resolved_url:
+                                opts["base_url"] = routed_url or resolved_url
+                except Exception:
+                    logger.debug("vertex keep-alive credential refresh skipped", exc_info=True)
+            try:
+                client = with_options(**opts)
+            except TypeError:
+                client = with_options(max_retries=0, timeout=WARM_REQUEST_TIMEOUT_S)
         kwargs = dict(run.api_kwargs)
         kwargs.pop("stream", None)
         kwargs.pop("timeout", None)  # the warm request keeps its own short timeout
@@ -832,7 +856,20 @@ class PromptCacheWarmer:
             from agent.usage_pricing import normalize_usage
 
             u = normalize_usage(usage, provider=self.agent.provider, api_mode=self.agent.api_mode)
-            return int(u.cache_read_tokens + u.cache_write_tokens), int(u.input_tokens)
+            cached = int(u.cache_read_tokens + u.cache_write_tokens)
+            uncached = int(u.input_tokens)
+            # Vertex implicit prefix caching never reports cache_write_tokens; once a turn has
+            # established a cached prefix (or sent >=2,048 tokens on a warm window), the entire
+            # prompt up to its 256-token block boundary is cached for subsequent replays.
+            if (
+                str(getattr(self.agent, "provider", "") or "").strip().lower() == "vertex"
+                and int(u.cache_write_tokens) == 0
+                and (cached + uncached) >= 2048
+            ):
+                total = cached + uncached
+                tail = total % 256
+                return total - tail, tail
+            return cached, uncached
         except Exception:  # health: allow BLE001 -- unknown size means never warm; logged
             logger.debug("prompt cache warm size unavailable", exc_info=True)
             return 0, 0

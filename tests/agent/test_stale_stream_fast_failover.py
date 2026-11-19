@@ -72,3 +72,123 @@ def test_should_skip_fallback_candidate_uses_last_routed_base_url():
         "google/gemini-4-argon",
         unavailable,
     ) is False
+
+
+def test_vertex_regional_ttfb_stale_cap_is_150s_while_post_chunk_and_global_stay_600s():
+    """Regional Vertex endpoints (europe-west2 / asia-southeast1) cap Phase-1 pre-first-chunk
+    TTFB stale timeout at 150s so wedged regional TPU slots fail over to global in 150s instead
+    of 600s, while Phase-2 post-chunk and global endpoints retain the full 600s floor.
+    """
+    from typing import Any
+    from types import SimpleNamespace
+
+    call: Any = _StreamingCall.__new__(_StreamingCall)
+    call.agent = SimpleNamespace(
+        provider="vertex",
+        model="google/gemini-4-argon",
+        base_url="https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi",
+        _last_routed_base_url="https://europe-west2-aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/europe-west2/endpoints/openapi",
+        _stream_stale_timeout=None,
+        _stream_inter_event_timeout=None,
+    )
+    call.api_kwargs = {"model": "google/gemini-4-argon", "messages": [{"role": "user", "content": "hi"}]}
+    diag: dict[str, float | None] = {"first_chunk_at": None}
+    call.clients = SimpleNamespace(diag=diag)
+    call._resolve_stale_timeout()
+
+    assert call._stream_stale_timeout == 600.0
+    assert call._effective_stale_timeout() == 150.0
+
+    # Once first chunk arrives (Phase 2), full 600s reasoning floor applies.
+    diag["first_chunk_at"] = 1001.0
+    assert call._effective_stale_timeout() == 600.0
+
+    # On locations/global, Phase 1 also retains the full 600s floor.
+    diag["first_chunk_at"] = None
+    call.agent._last_routed_base_url = call.agent.base_url
+    assert call._effective_stale_timeout() == 600.0
+
+
+def test_vertex_warmer_prompt_split_and_credential_refresh(monkeypatch):
+    """Vertex implicit prefix caching never reports cache_write_tokens; _prompt_split treats
+    the completed prompt (>=2048 tokens) as cached up to its 256-token boundary, and _send
+    refreshes the Vertex OAuth token and uses _last_routed_base_url.
+    """
+    from types import SimpleNamespace
+    import agent.prompt_cache_lifecycle as pcl
+    import agent.vertex_adapter as va
+
+    ew2_url = "https://europe-west2-aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/europe-west2/endpoints/openapi"
+    captured_opts = {}
+
+    class _VertexClient:
+        def with_options(self, **kw):
+            captured_opts.update(kw)
+            return self
+
+        @property
+        def chat(self):
+            return SimpleNamespace(completions=SimpleNamespace(create=lambda **_k: SimpleNamespace(choices=[], usage=None)))
+
+    agent = SimpleNamespace(
+        provider="vertex",
+        model="google/gemini-4-argon",
+        api_mode="chat_completions",
+        base_url="https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi",
+        _last_routed_base_url=ew2_url,
+        api_key="stale-token",
+        client=_VertexClient(),
+        session_id="sess_vertex_warm",
+        _session_reset_epoch=0,
+    )
+    warmer = pcl.PromptCacheWarmer(agent)
+    resp = SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=75_000,
+            completion_tokens=100,
+            total_tokens=75_100,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=30_000),
+        )
+    )
+    cached, uncached = warmer._prompt_split(resp)
+    assert cached == 74_752
+    assert uncached == 248
+    decision = warmer._decide(cached, uncached)
+    assert decision.action == "warm"
+
+    monkeypatch.setattr(va, "get_vertex_config", lambda **_kw: ("fresh-oauth-token", ew2_url))
+    run: object = SimpleNamespace(
+        client=agent.client,
+        api_kwargs={"model": "google/gemini-4-argon", "messages": [{"role": "user", "content": "hi"}]},
+        model="google/gemini-4-argon",
+        api_mode="chat_completions",
+        billing={"provider": "vertex", "base_url": agent.base_url, "api_key": "stale-token"},
+    )
+    warmer._send(run)  # type: ignore[arg-type]
+    assert captured_opts.get("api_key") == "fresh-oauth-token"
+    assert captured_opts.get("base_url") == ew2_url
+
+
+def test_subagent_and_cron_never_acquire_regional_slot_via_bg_review_branch():
+    """A subagent_* or cron_* session with interactive=False must never match
+    is_bg_review_for_ew2_parent even if its session_id was pre-pinned in _SESSION_STICKY_REGION.
+    """
+    from typing import Any
+    import agent.vertex_adapter as va
+
+    va_any: Any = va
+    for sid in ("subagent_child_1", "cron_job_1"):
+        with va_any._EUROPE_WEST2_STATE_LOCK:
+            va_any._session_region_affinity[sid] = va.EUROPE_WEST2_VERTEX_REGION
+        try:
+            region, held = va.acquire_vertex_hybrid_region(
+                "google/gemini-4-argon",
+                configured_region="global",
+                interactive=False,
+                session_id=sid,
+            )
+            assert region == "global"
+            assert held is False
+        finally:
+            va.reset_vertex_sticky_region(sid)
+

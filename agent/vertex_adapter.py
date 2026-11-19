@@ -365,6 +365,7 @@ def acquire_vertex_hybrid_region(
     is_bg_review_for_ew2_parent = (
         pinned_region in REGIONAL_VERTEX_REGIONS
         and (bool(raw_sid) or ":bg-review:" in raw_sid)
+        and not raw_sid.startswith(("cron_", "subagent_"))
     )
     if is_vertex_argon_model(model) and reg in (GLOBAL_VERTEX_REGION, *REGIONAL_VERTEX_REGIONS):
         if (interactive or is_bg_review_for_ew2_parent) and pinned_region != GLOBAL_VERTEX_REGION:

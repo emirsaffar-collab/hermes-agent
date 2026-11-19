@@ -498,17 +498,27 @@ class ClientLifecycleMixin:
             req_model = (api_kwargs or {}).get("model") or getattr(self, "model", None)
             _plat_str = str(getattr(self, "platform", "") or "").strip().lower()
             _sid_str = str(getattr(self, "session_id", "") or "")
+            _in_delegated_child = False
+            try:
+                import tools.delegate_tool as _dt_mod
+                _in_delegated_child_fn = getattr(_dt_mod, "is_delegated_child_context", None)
+                if callable(_in_delegated_child_fn):
+                    _in_delegated_child = bool(_in_delegated_child_fn())
+            except Exception:
+                _in_delegated_child = False
             is_interactive = (
                 getattr(self, "_write_origin", None) != "background_review"
                 and getattr(self, "_memory_write_origin", None) != "background_review"
                 and getattr(self, "_turn_origin", None) != "background_review"
                 and ":bg-review:" not in _sid_str
                 and _plat_str not in ("cron", "subagent")
+                and not bool(getattr(self, "side_agent", False))
+                and not _in_delegated_child
                 and int(getattr(self, "_delegate_depth", 0) or 0) <= 0
                 and not bool(getattr(self, "cron_job_name", None))
-                and not _sid_str.startswith("cron_")
+                and not _sid_str.startswith(("cron_", "subagent_"))
                 and not bool(_os_cl.environ.get("HERMES_CRON_JOB_ID") or _os_cl.environ.get("HERMES_CRON_JOB_NAME"))
-                and str(_os_cl.environ.get("HERMES_SESSION_SOURCE", "") or "").strip().lower() != "cron"
+                and str(_os_cl.environ.get("HERMES_SESSION_SOURCE", "") or "").strip().lower() not in ("cron", "subagent")
             )
             parsed_vertex = parse_vertex_base_url(raw_base_url)
             if parsed_vertex is not None:
