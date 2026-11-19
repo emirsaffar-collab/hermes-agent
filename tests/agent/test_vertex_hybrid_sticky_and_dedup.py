@@ -567,6 +567,58 @@ def test_deep_regional_session_survives_overlapping_cooldown_and_clears_recovere
     assert vertex_adapter.get_session_vertex_region_affinity("deep_overlap") == "europe-west2"
 
 
+def test_overnight_peak_burst_12_concurrent_deep_sessions_zero_cold_spills():
+    """Stress-tests the overnight 00:00-06:30 CET peak burst profile: 12 concurrent deep-cache
+    (180k-token) sessions (6 on europe-west2 across 5 slots, 6 on asia-southeast1 across 8 slots)
+    executing 3 turns each (36 acquisitions) while overlapping regional 429 cooldown waves fire."""
+    import threading
+    import time
+
+    vertex_adapter.reset_vertex_hybrid_router_state()
+    for i in range(6):
+        vertex_adapter._record_session_vertex_region_affinity(f"ew2_batch_{i}", "europe-west2")
+        vertex_adapter._record_session_vertex_region_affinity(f"ase1_batch_{i}", "asia-southeast1")
+
+    results = []
+    lock = threading.Lock()
+
+    def _worker(sid: str, expected_reg: str):
+        for turn in range(3):
+            if turn == 1 and sid.endswith("_0"):
+                vertex_adapter.record_vertex_regional_429(
+                    cooldown_seconds=0.03,
+                    session_id=sid,
+                    last_prompt_tokens=180_000,
+                )
+            reg, slot = vertex_adapter.acquire_vertex_hybrid_region(
+                "google/gemini-4-argon",
+                configured_region="global",
+                interactive=True,
+                session_id=sid,
+                last_prompt_tokens=180_000,
+            )
+            try:
+                time.sleep(0.015)
+                with lock:
+                    results.append((sid, turn, reg, slot, expected_reg))
+            finally:
+                vertex_adapter.release_vertex_hybrid_slot(slot, region=reg)
+
+    threads = []
+    for i in range(6):
+        threads.append(threading.Thread(target=_worker, args=(f"ew2_batch_{i}", "europe-west2")))
+        threads.append(threading.Thread(target=_worker, args=(f"ase1_batch_{i}", "asia-southeast1")))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert len(results) == 36
+    cold_spills = [r for r in results if r[2] != r[4] or not r[3]]
+    assert cold_spills == [], f"Expected 0 cold spills across 36 burst turns, got: {cold_spills}"
+
+
+
 
 
 
