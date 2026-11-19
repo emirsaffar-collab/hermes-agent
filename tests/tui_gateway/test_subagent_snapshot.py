@@ -324,3 +324,26 @@ def test_list_surfaces_failed_delegations_that_outlived_the_live_roster(runtime)
     assert snapshot["subagents"] == []
     assert [(d["delegation_id"], d["goal"], d["status"]) for d in snapshot["delegations"]] == [
         ("d-mine", "d-mine goal", "error")]
+
+
+def test_persist_dispatch_failure_rolls_back_in_memory_record(runtime, monkeypatch):
+    """If ``_persist_dispatch`` raises during ``dispatch_async_delegation_batch``, the tentative
+    ``_records[delegation_id]`` entry is rolled back so failed dispatches cannot leak active slots."""
+    from tools import async_delegation as bg
+
+    def _boom(_record):
+        raise RuntimeError("simulated _persist_dispatch failure")
+
+    monkeypatch.setattr(bg, "_persist_dispatch", _boom)
+    with pytest.raises(RuntimeError, match="simulated _persist_dispatch failure"):
+        bg.dispatch_async_delegation_batch(
+            goals=["task that fails persist"],
+            context="ctx",
+            toolsets=None,
+            role="leaf",
+            model="test",
+            session_key="parent",
+            origin_ui_session_id="ui-owner",
+            runner=lambda: {"results": []},
+        )
+    assert bg._records == {}
