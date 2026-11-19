@@ -806,6 +806,8 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
 
 _PRESERVED_WATCHDOG_KEYS: tuple[str, ...] = (
     "bq_mtd",
+    "parity",
+    "promo_expiry_guard",
     "log_tail_ingest",
     "openrouter_credits_remaining_usd",
     "may_2027_sparplan_targets",

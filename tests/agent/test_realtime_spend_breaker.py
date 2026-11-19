@@ -834,6 +834,31 @@ def test_monitor_rollback_on_spend_breaker_suppression(tmp_path, monkeypatch):
     )
 
 
+def test_preserved_watchdog_keys_across_snapshot(tmp_path, monkeypatch):
+    import json
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+
+    status_file.write_text(
+        json.dumps({
+            "bq_mtd": {"ok": True},
+            "parity": {"status": "ok", "drift": 0},
+            "promo_expiry_guard": {"active": True},
+            "volatile_transient_key": "discard_me",
+        }),
+        encoding="utf-8",
+    )
+
+    snap = rsb.write_realtime_status_snapshot()
+    assert snap["bq_mtd"] == {"ok": True}
+    assert snap["parity"] == {"status": "ok", "drift": 0}
+    assert snap["promo_expiry_guard"] == {"active": True}
+    assert "volatile_transient_key" not in snap
+
+
 
 
 
