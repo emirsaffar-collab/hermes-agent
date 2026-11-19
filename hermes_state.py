@@ -122,6 +122,13 @@ def _media_root() -> "str":
     return str(native_inputs_root())
 
 
+def _default_db_path() -> "Path":
+    from persistence_assembly import profile_scope, store_location
+
+    scope = profile_scope()
+    return store_location(scope) or (scope.profile_dir / "state.db")
+
+
 def _scope_of(db_path: "Any") -> "Any":
     from persistence_assembly import profile_scope
 

@@ -959,10 +959,12 @@ def _owner_store_for(request: Request, profile: Optional[str]):
 
 def _live_gateway_owns_profile(profile: Optional[str]) -> bool:
     """Whether a live gateway daemon answers on the control socket for *profile*."""
+    import hermes_state
     from hermes_cli.gateway_runtime_discovery import DiscoveryError, query_identify
     from hermes_cli.gateway_runtime_multiplex import multiplexer_root_for
-    from hermes_state import _default_db_path
-    home = Path(_cron_profile_home(profile)[1]) if profile else Path(_default_db_path()).parent
+    _db_path_fn = getattr(hermes_state, "_default_db_path", None)
+    default_home = Path(str(_db_path_fn())).parent if callable(_db_path_fn) else profile_scope().profile_dir
+    home = Path(_cron_profile_home(profile)[1]) if profile else default_home
     for candidate in (home, multiplexer_root_for(home)):
         if candidate is None:
             continue
@@ -974,6 +976,21 @@ def _live_gateway_owns_profile(profile: Optional[str]) -> bool:
                 PermissionError, OSError, ValueError, TypeError):
             continue
     return False
+
+
+def _has_unowned_session_rows(store) -> bool:
+    sql = "SELECT 1 AS pending FROM sessions WHERE profile_name IS NULL OR TRIM(profile_name) = '' LIMIT 1"
+    read_one = getattr(store, "_read_one", None)
+    if callable(read_one):
+        return read_one(sql) is not None
+    sessions_repo = getattr(store, "sessions", None)
+    inner_store = getattr(sessions_repo, "_store", None)
+    holder_fn = getattr(inner_store, "holder", None)
+    if callable(holder_fn):
+        holder_read_one = getattr(holder_fn(), "_read_one", None)
+        if callable(holder_read_one):
+            return holder_read_one(sql) is not None
+    return True
 
 
 @manage_router.post("/api/sessions/owner-backfill")
@@ -1002,9 +1019,7 @@ async def backfill_session_owner_profiles(body: SessionOwnerBackfill, request: R
             stamped = await asyncio.to_thread(owner_store.sessions.backfill_session_owners, stamp=stamp)
         elif await asyncio.to_thread(_live_gateway_owns_profile, body.profile) and not await asyncio.to_thread(
             _with_db, body.profile,
-            lambda db: db._read_one(
-                "SELECT 1 AS pending FROM sessions WHERE profile_name IS NULL OR TRIM(profile_name) = '' LIMIT 1"
-            ) is not None,
+            _has_unowned_session_rows,
             read_only=True,
         ):
             stamped = 0

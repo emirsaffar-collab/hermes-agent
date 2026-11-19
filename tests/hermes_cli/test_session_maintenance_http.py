@@ -62,8 +62,8 @@ async def test_owner_backfill_skips_exclusive_maintenance_when_no_unowned_rows_e
     )
     app = FastAPI()
     app.include_router(manage_router)
-    with SessionDB(db_path=tmp_path / 'state.db') as db:
-        db.create_session('already-owned', source='cli')
+    with open_persistence(profile_scope(home=tmp_path)) as store:
+        seed_session(store, 'already-owned', 'cli')
         owner = ProfileOwnership()
         owner.reserve([tmp_path])
         try:
@@ -74,7 +74,7 @@ async def test_owner_backfill_skips_exclusive_maintenance_when_no_unowned_rows_e
                 assert response.json() == {'ok': True, 'stamped': 0, 'profile': 'default'}
 
                 # Polarity 2 (legacy NULL row present): must not falsely report stamped=0; hits write lock -> 409
-                db._execute_write(
+                store.sessions._store.holder()._execute_write(
                     lambda conn: conn.execute("UPDATE sessions SET profile_name = NULL WHERE id = 'already-owned'")
                 )
                 refused = await client.post('/api/sessions/owner-backfill', json={})
