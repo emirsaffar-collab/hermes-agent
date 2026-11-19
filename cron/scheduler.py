@@ -2239,6 +2239,14 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         _cron_title = f"{_title_base} · {safe_strftime(_hermes_now(), '%b %d %H:%M')}"
         if not _set_cron_session_title(_sessions, _final_cron_session_id, _cron_title):
             _set_cron_session_title(_sessions, _final_cron_session_id, f"cron {job_id}")
+        if _final_cron_session_id != cron_session_id:
+            with contextlib.suppress(Exception, KeyboardInterrupt):
+                _ancestors = [
+                    str(_sid) for _sid in (_lineage.chain(cron_session_id) or ())
+                    if isinstance(_sid, str) and _sid and _sid != _final_cron_session_id
+                ]
+                for _idx, _anc_id in enumerate(_ancestors, start=1):
+                    _set_cron_session_title(_sessions, _anc_id, f"{_cron_title} (seg {_idx})")
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
         # Never leave the session untitled.
@@ -2734,6 +2742,7 @@ def run_job(
 
         # Open state.db only after every early-return gate has passed.
         _session_db = _open_cron_session_db(job)
+        _stamp_early_owner_session_title(owner_execution, job_id, job_name)
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db, persistence=_session_db)

@@ -16,6 +16,32 @@ class TestSetCronSessionTitle:
         assert out == "Nightly Synthesis #2"
         sessions.next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
 
+    def test_early_owner_exit_stamps_session_title(self):
+        from types import SimpleNamespace
+        from cron.scheduler import _stamp_early_owner_session_title
+        sessions = MagicMock()
+        sessions.set_title.return_value = True
+        authority = SimpleNamespace(persistence=SimpleNamespace(sessions=sessions))
+        owner_exec = (authority, "local-early-123", "job-42", "exec-1")
+        _stamp_early_owner_session_title(owner_exec, "job-42", "chat247-responder")
+        sessions.set_title.assert_called_once()
+        sid, title = sessions.set_title.call_args[0]
+        assert sid == "local-early-123"
+        assert title.startswith("chat247-responder · ")
+
+    def test_finalize_cron_session_stamps_compressed_ancestors(self):
+        from cron.scheduler import _finalize_cron_session
+        session_db = MagicMock()
+        session_db.lineage.tip.return_value = "20261119_tip"
+        session_db.lineage.chain.return_value = ("local-root", "20261119_mid", "20261119_tip")
+        session_db.sessions.set_title.return_value = True
+        session_db.sessions.lifecycle_statuses.return_value = {}
+        _finalize_cron_session(session_db, MagicMock(), "job-99", "lager-builder-owner", "local-root")
+        titled = {call.args[0]: call.args[1] for call in session_db.sessions.set_title.call_args_list}
+        assert "20261119_tip" in titled
+        assert titled["local-root"] == f"{titled['20261119_tip']} (seg 1)"
+        assert titled["20261119_mid"] == f"{titled['20261119_tip']} (seg 2)"
+
 class TestFailureStreakNudge:
     """Poke-inspired repeated-failure review nudge (_failure_streak_nudge)."""
 
