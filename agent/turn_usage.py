@@ -132,6 +132,54 @@ def _with_declared_write_tier(usage: Any, event: Any) -> Any:
     return with_write_tier(usage, declared_write_tier(event))
 
 
+def maybe_rotate_vertex_flash_keepalive_pool(
+    agent: Any,
+    *,
+    prompt_tokens: int,
+    cache_read_tokens: int,
+    completed_compaction_pending: bool = False,
+) -> bool:
+    """Close pooled HTTP keep-alive connections when a Vertex ``locations/global`` Flash
+    session receives 0 cached tokens on Call #2+ (>= 16,384 prompt tokens), so the next
+    request dials a fresh global frontend instead of staying pinned to a non-caching socket."""
+    if completed_compaction_pending:
+        return False
+    calls = int(getattr(agent, "session_api_calls", 0) or 0)
+    if calls < 2 or int(prompt_tokens or 0) < 16_384 or int(cache_read_tokens or 0) > 0:
+        return False
+    model_low = str(getattr(agent, "model", "") or "").lower()
+    prov_low = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "")
+    if "flash" not in model_low or prov_low not in ("vertex", "google", ""):
+        return False
+    if base_url and "locations/global" not in base_url and "aiplatform.googleapis.com" in base_url:
+        return False
+    last_rot = int(getattr(agent, "_vertex_flash_pool_rotated_call", 0) or 0)
+    rot_count = int(getattr(agent, "_vertex_flash_pool_rotation_count", 0) or 0)
+    if calls - last_rot < 2 or rot_count >= 4:
+        return False
+    client = getattr(agent, "client", None)
+    hc = getattr(client, "_client", None)
+    tr = getattr(hc, "_transport", None)
+    pool = getattr(tr, "_pool", None)
+    close_fn = getattr(pool, "close", None)
+    if not callable(close_fn):
+        return False
+    try:
+        close_fn()
+        agent._vertex_flash_pool_rotated_call = calls
+        agent._vertex_flash_pool_rotation_count = rot_count + 1
+        logger.info(
+            "Rotated Vertex global Flash keep-alive pool after 0-cache response on call #%d (prompt=%d)",
+            calls,
+            prompt_tokens,
+        )
+        return True
+    except Exception as exc:
+        logger.debug("Vertex Flash keep-alive pool rotation failed: %s", exc)
+        return False
+
+
 def with_write_tier(usage: Any, tier: str | None) -> Any:
     """*usage* with its unsplit cache writes named as *tier* when that is ``1h`` (priced at the 1h rate)."""
     if usage.cache_write_by_ttl or not usage.cache_write_tokens or tier != "1h":
@@ -296,6 +344,13 @@ def record_response_usage(
         with suppress(Exception):
             from agent.nous_wire import maybe_switch_wire_after_first_response
             maybe_switch_wire_after_first_response(agent, response, agent.session_api_calls)
+    with suppress(Exception):
+        maybe_rotate_vertex_flash_keepalive_pool(
+            agent,
+            prompt_tokens=int(usage_dict.get("prompt_tokens") or prompt_tokens or 0),
+            cache_read_tokens=int(canonical_usage.cache_read_tokens or 0),
+            completed_compaction_pending=_completed_compaction_pending,
+        )
 
     # MoA: agent.model/provider are the virtual preset/"moa" with no pricing entry, silently
     # dropping aggregator spend. Price at the REAL model/provider from the aggregator slot.

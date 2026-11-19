@@ -1122,4 +1122,136 @@ def test_mid_turn_spend_breaker_over_max_iterations_completes_cleanly_in_cron(tm
     rsb._HC_JOBS_CACHE = (0.0, frozenset())
     assert rsb.is_tier0_critical_cron("custom-ops-sentinel") is True
     assert rsb.is_tier0_critical_cron("plane-triage-daily") is True
+    assert rsb.is_tier0_critical_cron("italerts-triage-guard") is True
+
+
+def test_tier0_critical_cache_reset_ceiling_and_flash_keepalive_pool_rotation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from agent.turn_usage import maybe_rotate_vertex_flash_keepalive_pool
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+
+    # Prime 2 uncached Flash calls (>= 45k) so each subsequent 0-cache call registers cache_reset=1
+    for seed_idx in range(2):
+        rsb.record_realtime_llm_call(
+            session_id="cron_tier0_loop",
+            source="cron",
+            job_name="newintra-chat-responder",
+            provider="vertex",
+            model="google/gemini-3.8-flash",
+            prompt_tokens=300_000,
+            uncached_input_tokens=300_000,
+            cache_read_tokens=0,
+            output_tokens=400,
+            request_id=f"rid_t0_seed_{seed_idx}",
+        )
+
+    # Tier-0 tolerates up to 7 cache resets (normal 4-7 turn responder runs),
+    # but trips at >= 8 cache resets once spend reaches TIER0_CRITICAL_CACHE_RESET_MIN_EUR (€1.50).
+    for idx in range(7):
+        r_call = rsb.record_realtime_llm_call(
+            session_id="cron_tier0_loop",
+            source="cron",
+            job_name="newintra-chat-responder",
+            provider="vertex",
+            model="google/gemini-3.8-flash",
+            prompt_tokens=600_000,
+            uncached_input_tokens=600_000,
+            cache_read_tokens=0,
+            output_tokens=400,
+            request_id=f"rid_t0_{idx + 1}",
+        )
+        assert r_call["cache_reset"] == 1
+    ev_7 = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_tier0_loop",
+        source="cron",
+        job_name="newintra-chat-responder",
+        model="google/gemini-3.8-flash",
+        provider="vertex",
+    )
+    assert ev_7["allowed"] is True
+
+    rsb.record_realtime_llm_call(
+        session_id="cron_tier0_loop",
+        source="cron",
+        job_name="newintra-chat-responder",
+        provider="vertex",
+        model="google/gemini-3.8-flash",
+        prompt_tokens=600_000,
+        uncached_input_tokens=600_000,
+        cache_read_tokens=0,
+        output_tokens=400,
+        request_id="rid_t0_8",
+    )
+    ev_8 = rsb.evaluate_realtime_spend_breaker(
+        session_id="cron_tier0_loop",
+        source="cron",
+        job_name="newintra-chat-responder",
+        model="google/gemini-3.8-flash",
+        provider="vertex",
+    )
+    assert ev_8["allowed"] is False
+    assert "tier1_cache_reset_storm" in ev_8["reason"]
+
+    # Vertex locations/global Flash keep-alive pool rotation on Turn-2+ 0-cache response
+    closed_calls: list[int] = []
+
+    class _FakePool:
+        def close(self) -> None:
+            closed_calls.append(1)
+
+    dummy_agent = SimpleNamespace(
+        session_api_calls=2,
+        model="google/gemini-3.8-flash",
+        provider="vertex",
+        base_url="https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi",
+        client=SimpleNamespace(_client=SimpleNamespace(_transport=SimpleNamespace(_pool=_FakePool()))),
+    )
+    # Cache hit > 0 -> never rotates
+    assert (
+        maybe_rotate_vertex_flash_keepalive_pool(
+            dummy_agent, prompt_tokens=48_000, cache_read_tokens=40_000
+        )
+        is False
+    )
+    assert len(closed_calls) == 0
+    # Compaction turn -> never rotates
+    assert (
+        maybe_rotate_vertex_flash_keepalive_pool(
+            dummy_agent,
+            prompt_tokens=48_000,
+            cache_read_tokens=0,
+            completed_compaction_pending=True,
+        )
+        is False
+    )
+    # Turn 2 with 0 cache on global Flash -> rotates pool
+    assert (
+        maybe_rotate_vertex_flash_keepalive_pool(
+            dummy_agent, prompt_tokens=48_000, cache_read_tokens=0
+        )
+        is True
+    )
+    assert len(closed_calls) == 1
+    # Immediate next call (#3) is debounced (requires >= 2 calls spacing)
+    dummy_agent.session_api_calls = 3
+    assert (
+        maybe_rotate_vertex_flash_keepalive_pool(
+            dummy_agent, prompt_tokens=48_000, cache_read_tokens=0
+        )
+        is False
+    )
+    # Call #4 rotates again if still 0 cache
+    dummy_agent.session_api_calls = 4
+    assert (
+        maybe_rotate_vertex_flash_keepalive_pool(
+            dummy_agent, prompt_tokens=48_000, cache_read_tokens=0
+        )
+        is True
+    )
+    assert len(closed_calls) == 2
+
 

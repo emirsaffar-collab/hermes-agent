@@ -106,6 +106,8 @@ TIER1_NON_INTERACTIVE_15M_CAP_EUR = 4.00
 TIER1_NON_INTERACTIVE_1H_CAP_EUR = 10.00
 TIER1_NON_INTERACTIVE_CACHE_RESET_COUNT = 4
 TIER1_NON_INTERACTIVE_CACHE_RESET_MIN_EUR = 2.50
+TIER0_CRITICAL_CACHE_RESET_COUNT = 8
+TIER0_CRITICAL_CACHE_RESET_MIN_EUR = 1.50
 
 TIER1_STALLED_DESKTOP_MIN_CALLS = 35
 TIER1_STALLED_DESKTOP_15M_CAP_EUR = 6.00
@@ -208,6 +210,7 @@ _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "hermes-carried",
     "carried-fixes",
     "cron-failure-watch",
+    "italerts-",
     "checkpoints-prune",
     "plane-triage",
     "verify-nutanix",
@@ -1109,10 +1112,19 @@ def evaluate_realtime_spend_breaker(
             if p_sid and src == "subagent" and not is_interactive_subagent:
                 quarantine_session(p_sid, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_1h": s_eur_1h}
+        reset_cap = (
+            TIER0_CRITICAL_CACHE_RESET_COUNT
+            if is_tier0
+            else TIER1_NON_INTERACTIVE_CACHE_RESET_COUNT
+        )
+        reset_min_eur = (
+            TIER0_CRITICAL_CACHE_RESET_MIN_EUR
+            if is_tier0
+            else TIER1_NON_INTERACTIVE_CACHE_RESET_MIN_EUR
+        )
         if (
-            not is_tier0
-            and s_resets_15m >= TIER1_NON_INTERACTIVE_CACHE_RESET_COUNT
-            and s_eur_15m >= TIER1_NON_INTERACTIVE_CACHE_RESET_MIN_EUR
+            s_resets_15m >= reset_cap
+            and s_eur_15m >= reset_min_eur
         ):
             reason = f"tier1_cache_reset_storm (resets={s_resets_15m}, €{s_eur_15m:.2f} in 15m)"
             quarantine_session(effective_session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)

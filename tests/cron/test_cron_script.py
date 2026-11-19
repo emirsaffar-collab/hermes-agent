@@ -936,4 +936,36 @@ class TestHcDeadmanSlugs:
         )
         assert pinged == []
 
+    def test_reconcile_pending_ignores_concurrently_unlinked_journal(
+        self, cron_env, monkeypatch, caplog
+    ):
+        """When an admission journal is unlinked by a finishing firer between glob() and read_text(),
+        reconcile_pending must skip it silently without logging a FileNotFoundError traceback."""
+        import logging
+        from pathlib import Path
+        from cron import scheduler_authority
+
+        admissions = cron_env / "cron" / "admissions"
+        admissions.mkdir(parents=True, exist_ok=True)
+        ghost = admissions / "ghost.json"
+        ghost.write_text("{}", encoding="utf-8")
+        corrupt = admissions / "corrupt.json"
+        corrupt.write_text("{not-valid-json", encoding="utf-8")
+
+        orig_read_text = Path.read_text
+
+        def _racy_read_text(self, *args, **kwargs):
+            if self.name == "ghost.json":
+                raise FileNotFoundError(2, "No such file or directory", str(self))
+            return orig_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _racy_read_text)
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler_authority"):
+            scheduler_authority.reconcile_pending(allow_connect=False)
+
+        warned_files = [r.getMessage() for r in caplog.records]
+        assert not any("ghost.json" in m for m in warned_files)
+        assert any("corrupt.json" in m for m in warned_files)
+
+
 

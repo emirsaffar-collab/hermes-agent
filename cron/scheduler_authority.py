@@ -187,7 +187,13 @@ def reconcile_pending(*, allow_connect=True):
     root = get_hermes_home() / 'cron' / 'admissions'
     for journal in sorted(root.glob('*.json')):
         try:
-            record = json.loads(journal.read_text(encoding='utf-8-sig'))
+            try:
+                raw_journal = journal.read_text(encoding='utf-8-sig')
+            except FileNotFoundError:
+                # A finishing firer or sibling reconciler unlinked the admission journal between
+                # root.glob('*.json') and read_text(); skip without logging a traceback.
+                continue
+            record = json.loads(raw_journal)
             params = record['params']
             if journal != journal_path(params['job_id'], params['request_id']):
                 raise ValueError('cron journal identity conflict')
