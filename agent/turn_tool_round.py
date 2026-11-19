@@ -440,7 +440,9 @@ def _rehydrate_scrubbed_assistant_msg(
             return
         db = getattr(agent, "_session_db", None)
         sid = getattr(agent, "session_id", None)
-        read_all = getattr(db, "_read_all", None) if db is not None else None
+        bound = db._bound_store() if db is not None and callable(getattr(db, "_bound_store", None)) else db
+        holder = bound.holder() if bound is not None and callable(getattr(bound, "holder", None)) else None
+        read_all = getattr(db, "_read_all", None) or getattr(holder, "_read_all", None)
         if not sid or not callable(read_all):
             return
         rows = read_all(
@@ -468,7 +470,7 @@ def _rehydrate_scrubbed_assistant_msg(
         from typing import cast
         from agent.message_metadata import DB_ROW_SNAPSHOT
         if DB_ROW_SNAPSHOT in assistant_msg:
-            read_one = getattr(db, "_read_one", None)
+            read_one = getattr(db, "_read_one", None) or getattr(holder, "_read_one", None)
             full_row = (
                 read_one(
                     "SELECT * FROM messages WHERE session_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1",

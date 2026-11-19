@@ -197,12 +197,6 @@ def _pet_method(name: str, *, fail_open=None, slug: bool = False, scoped: bool =
     return deco
 
 
-def _active_pet():
-    """``(pet, scale)`` when the pet display is enabled and the pet exists, else None."""
-    enabled, pet, scale = _pet_active_selection()
-    return None if not enabled or pet is None or not pet.exists else (pet, scale)
-
-
 def _billing_call(rid, fn, extra: dict | None = None) -> dict:
     """Portal call → ok; BillingError → serialized envelope, else generic; ``extra`` rides both ERROR envelopes."""
     from hermes_cli.nous_billing import BillingError

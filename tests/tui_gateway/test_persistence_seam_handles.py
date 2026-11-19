@@ -125,3 +125,28 @@ def test_rpc_helpers_hand_the_handle_to_cross_area_callees(launch, tmp_path, mon
     ctx.db, ctx.persistence = db, server._launch_persistence()
     assert "error" in server._resume_guard(ctx)
     assert refusals == [ctx.persistence]
+
+
+def test_reload_split_modules_preserves_persistence_for_and_detects_first_collision(launch):
+    from tui_gateway.method_ctx import bind_module, reload_split_modules
+
+    info = reload_split_modules(server)
+    assert info["reloaded_modules"] >= 30
+    db = server._get_db()
+    with server._persistence_for(db) as p:
+        assert p is db
+    assert getattr(server._active_pet, "_hermes_split_module", None) == "tui_gateway.change_watcher"
+
+    def _colliding_fn():
+        return None
+
+    _colliding_fn.__name__ = "_active_pet"
+    _colliding_fn.__module__ = "tui_gateway.fake_collision_mod"
+    try:
+        with pytest.raises(RuntimeError, match="split-module name collision"):
+            bind_module({"__name__": "tui_gateway.fake_collision_mod", "_active_pet": _colliding_fn}, server)
+    finally:
+        from tui_gateway.method_ctx import _REGISTERED_SPLIT_MODULES
+        if "tui_gateway.fake_collision_mod" in _REGISTERED_SPLIT_MODULES:
+            _REGISTERED_SPLIT_MODULES.remove("tui_gateway.fake_collision_mod")
+

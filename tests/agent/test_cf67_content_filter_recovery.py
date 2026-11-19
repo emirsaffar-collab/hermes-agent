@@ -462,6 +462,19 @@ def test_mid_turn_secret_value_guard_scrub_refreshes_db_row_snapshot_for_proacti
     assert db.rewritten_held_row_ids(sid, messages) == []
     db.close()
 
+    # Verify against Persistence wrapper (where _read_all/_read_one live on _bound_store().holder())
+    from persistence_assembly import open_persistence, profile_scope
+    with open_persistence(profile_scope(home=tmp_path), eager=True) as p_db:
+        assistant_msg["tool_calls"] = list(raw_tc)
+        assistant_msg["reasoning"] = "raw secret_token_value"
+        assistant_msg[DB_ROW_SNAPSHOT] = pre_scrub_snapshot
+        p_agent = SimpleNamespace(session_id=sid, _session_db=p_db)
+        _rehydrate_scrubbed_assistant_msg(p_agent, assistant_msg, messages)
+        assert assistant_msg["tool_calls"] == scrubbed_tc
+        assert assistant_msg["reasoning"] == "scrubbed [REDACTED]"
+        assert assistant_msg[DB_ROW_SNAPSHOT] == transcript_row_snapshot(cast(Mapping[str, Any], stored_row))
+
+
 
 def test_cf76_openrouter_gemini4_disable_clamps_to_low_and_emits_thinking_config():
     from agent.gemini_native_adapter import GEMINI_SAFETY_SETTINGS_OFF

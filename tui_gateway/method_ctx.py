@@ -80,7 +80,7 @@ class HandlerRegistry:
             server.register_method(name, real)
 
 
-_PLUMBING = {"HandlerRegistry", "method", "_profile_scoped", "register", "rebind", "reload_split_modules", "logger"}
+_PLUMBING = {"HandlerRegistry", "method", "_profile_scoped", "register", "rebind", "reload_split_modules", "logger", "_"}
 
 
 def bind_module(module_globals: dict, server, *, skip=()) -> None:
@@ -132,12 +132,13 @@ def bind_module(module_globals: dict, server, *, skip=()) -> None:
         prev = g.get(name)
         if isinstance(obj, contextvars.ContextVar) and isinstance(prev, contextvars.ContextVar):
             obj = module_globals[name] = prev
-        if isinstance(prev, types.FunctionType) and isinstance(obj, types.FunctionType):
-            owner = getattr(prev, "_hermes_split_module", None)
-            if owner and owner != mod_name:
-                raise RuntimeError(
-                    f"split-module name collision: {mod_name}.{name} would overwrite {owner}.{name}"
-                )
+        if isinstance(obj, types.FunctionType):
+            if isinstance(prev, types.FunctionType):
+                owner = getattr(prev, "_hermes_split_module", None)
+                if owner and owner != mod_name:
+                    raise RuntimeError(
+                        f"split-module name collision: {mod_name}.{name} would overwrite {owner}.{name}"
+                    )
             obj._hermes_split_module = mod_name
         setattr(server, name, obj)
     registry = module_globals.get("_registry")

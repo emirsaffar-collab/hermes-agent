@@ -15,10 +15,6 @@ from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
 
-def _persistence_for(_db):
-    from contextlib import nullcontext
-    return nullcontext(None)
-
 
 def _bot_mode_delivery_text(response: Any, *, successful: bool) -> Any:
     """Return the text Bot Mode may render or relay after a completed turn.

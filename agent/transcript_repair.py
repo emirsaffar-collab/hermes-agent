@@ -72,6 +72,13 @@ def sync_flushed_message_markers(batch_msgs: list[dict[str, Any]], batch_rows: l
 
 def transcript_row_snapshot(row: Any) -> str:
     """Stable compare-and-swap fingerprint of a durable ``messages`` row's payload."""
+    try:
+        from persistence.sqlite.conversation._store.transcript_repair import (
+            transcript_row_snapshot as _store_transcript_row_snapshot,
+        )
+        return _store_transcript_row_snapshot(row)
+    except (KeyError, IndexError, TypeError):
+        pass
     import json
     def _val(key: str) -> Any:
         try:
