@@ -113,3 +113,17 @@ class TestMissedWindowCatchUp:
         S.tick(verbose=False, sync=True)
         assert slot_env["fires"]() == 1
         assert "pending_slot" not in J.get_job(slot_env["job_id"])
+
+    def test_inflight_recurring_job_does_not_stamp_pending_slot(self, slot_env):
+        """When a recurring job is already running in this process, _submit_with_guard will skip
+        dispatch; get_due_jobs() must not stamp pending_slot on that skipped due scan."""
+        S, J = slot_env["S"], slot_env["J"]
+        job_id = slot_env["job_id"]
+        assert S.try_register_running_job(job_id)
+        try:
+            due = J.get_due_jobs()
+            assert any(j["id"] == job_id for j in due)
+            rec = J.get_job(job_id)
+            assert "pending_slot" not in rec
+        finally:
+            S.release_running_job(job_id)

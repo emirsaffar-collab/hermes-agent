@@ -3296,8 +3296,10 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
 
     # Missed-run visibility: persist scheduled-vs-actual timing so separate CLI processes can show a
     # late catch-up. Recurring only — expired one-shots were retired above; manual triggers aren't
-    # late.
-    if not manual_run and recurring:
+    # late. Skip stamping when a prior run of this job is already in flight in this process:
+    # _submit_with_guard will skip dispatch, so stamping pending_slot here would leave an unclaimed
+    # slot that falsely restores after the running job finishes or if the registration is swept.
+    if not manual_run and recurring and not _job_running_in_this_process(str(job.get("id", ""))):
         lateness = max(0.0, _elapsed_seconds(now, d.next_run_dt))
         # See #99879.
         dispatch_stamp = {
