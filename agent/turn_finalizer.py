@@ -680,6 +680,19 @@ def finalize_turn(
         logger=logger,
     )
 
+    if (
+        str(_turn_exit_reason or "").startswith("realtime_spend_breaker:")
+        and not final_response
+        and (
+            (getattr(agent, "platform", "") or "").lower() == "cron"
+            or bool(getattr(agent, "cron_job_name", None))
+            or getattr(agent, "_write_origin", None) == "background_review"
+            or getattr(agent, "_turn_origin", None) == "background_review"
+            or str(getattr(agent, "session_id", "")).startswith("cron_")
+        )
+    ):
+        final_response = "[SILENT]"
+
     # A non-interrupted turn that fell out of the loop after a tool result, with no
     # follow-up assistant text, is the Desktop/TUI "silent stop" (#55316, #54756): the
     # composer returns to ready (or keeps spinning) while the durable transcript ends
@@ -696,6 +709,8 @@ def finalize_turn(
         and isinstance(messages[-1], dict)
         and messages[-1].get("role") == "tool"
         and not (getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
+        and not str(_turn_exit_reason or "").startswith("realtime_spend_breaker:")
+        and _turn_exit_reason != "review_input_budget_exhausted"
     ):
         _turn_exit_reason = "pending_tool_result"
         failed = True
@@ -722,17 +737,6 @@ def finalize_turn(
     _exit_failure = None if interrupted else exit_reason_failure(_turn_exit_reason)
     if _exit_failure is not None and _exit_failure.fails_turn:
         failed = True
-
-    if (
-        str(_turn_exit_reason or "").startswith("realtime_spend_breaker:")
-        and not final_response
-        and (
-            (getattr(agent, "platform", "") or "").lower() == "cron"
-            or getattr(agent, "_write_origin", None) == "background_review"
-            or str(getattr(agent, "session_id", "")).startswith("cron_")
-        )
-    ):
-        final_response = "[SILENT]"
 
     # Sibling producers (``turn_recovery``, ``codex_runtime``) return ``completed=False`` for an
     # interrupted turn; the gateway stream gate and the API run status rely on that contract.

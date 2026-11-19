@@ -859,6 +859,105 @@ def test_preserved_watchdog_keys_across_snapshot(tmp_path, monkeypatch):
     assert "volatile_transient_key" not in snap
 
 
+def test_background_review_and_subagent_never_quarantine_desktop_parent_and_update_autorescue_tier0(
+    tmp_path, monkeypatch
+):
+    import sqlite3
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+
+    # 1) update-autorescue and checkpoints-prune are Tier-0 critical crons (exempt from tier1_cache_reset_storm)
+    assert rsb.is_tier0_critical_cron("update-autorescue", "local-635eaaf0") is True
+    assert rsb.is_tier0_critical_cron("checkpoints-prune", "local-fdaa091d") is True
+    assert rsb.is_tier0_critical_cron("cron-failure-watch", "local-cronwatch") is True
+
+    # 2) Desktop session with 6 resets + €2.25 spend followed by a background_review call (+€0.28, 1 reset)
+    #    on the same session_id does NOT sum Desktop resets/spend into background_review or quarantine Desktop.
+    desk_sid = "20261119_014245_d6c708"
+    rids = (
+        "K3P8aqzEB_Cxg7QP5O6x-D0",
+        "CN_3atLcDrqFg7QPgvDv8D1",
+        "K3P8aqzEB_Cxg7QP5O6x-D2",
+        "CN_3atLcDrqFg7QPgvDv8D3",
+        "K3P8aqzEB_Cxg7QP5O6x-D4",
+        "CN_3atLcDrqFg7QPgvDv8D5",
+        "K3P8aqzEB_Cxg7QP5O6x-D6",
+    )
+    for idx, rid in enumerate(rids):
+        rsb.record_realtime_llm_call(
+            session_id=desk_sid,
+            source="desktop",
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=190_000,
+            uncached_input_tokens=30_000 if idx == 0 else 152_000,
+            cache_read_tokens=160_000 if idx == 0 else 38_000,
+            output_tokens=400,
+            request_id=rid,
+        )
+    rsb.record_realtime_llm_call(
+        session_id=desk_sid,
+        source="background_review",
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=188_000,
+        uncached_input_tokens=150_000,
+        cache_read_tokens=38_000,
+        output_tokens=50,
+        request_id="gen-1795050680-bg0",
+    )
+    v_bg = rsb.evaluate_realtime_spend_breaker(
+        session_id=desk_sid,
+        source="background_review",
+        model="google/gemini-4-argon",
+        provider="vertex",
+    )
+    assert v_bg["allowed"] is True
+    assert v_bg["session_net_eur_15m"] < 0.60
+
+    # 3) Subagent spawned from Desktop parent (even with parent_source="" omitted) auto-detects
+    #    p_src='desktop' from llm_call_ledger and NEVER quarantines the parent Desktop session ID.
+    sub_sid = "20261118_020949_bf9404"
+    sub_rids = (
+        "K3P8aqzEB_Cxg7QP5O6x-S0",
+        "CN_3atLcDrqFg7QPgvDv8S1",
+        "K3P8aqzEB_Cxg7QP5O6x-S2",
+        "CN_3atLcDrqFg7QPgvDv8S3",
+        "K3P8aqzEB_Cxg7QP5O6x-S4",
+    )
+    for idx, rid in enumerate(sub_rids):
+        rsb.record_realtime_llm_call(
+            session_id=sub_sid,
+            source="subagent",
+            job_name=f"parent:{desk_sid}",
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=360_000,
+            uncached_input_tokens=50_000 if idx == 0 else 350_000,
+            cache_read_tokens=310_000 if idx == 0 else 10_000,
+            output_tokens=400,
+            request_id=rid,
+        )
+    v_sub = rsb.evaluate_realtime_spend_breaker(
+        session_id=sub_sid,
+        source="subagent",
+        parent_session_id=desk_sid,
+        parent_source="",  # omitted by caller — inferred from llm_call_ledger
+        job_name=f"parent:{desk_sid}",
+    )
+    assert v_sub["allowed"] is False
+    assert "tier1_cache_reset_storm" in v_sub["reason"]
+
+    con = sqlite3.connect(str(db_file))
+    q_sids = {r[0] for r in con.execute("SELECT session_id FROM quarantined_sessions").fetchall()}
+    con.close()
+    assert sub_sid in q_sids
+    assert desk_sid not in q_sids
+
+
 
 
 

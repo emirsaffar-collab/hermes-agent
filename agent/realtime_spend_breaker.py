@@ -203,6 +203,11 @@ _TIER0_CRITICAL_PREFIXES: tuple[str, ...] = (
     "svea-",
     "cart-",
     "store-support-",
+    "update-autorescue",
+    "hermes-update",
+    "carried-fixes",
+    "cron-failure-watch",
+    "checkpoints-prune",
 )
 
 _LAST_STATUS_WRITE_TS: float = 0.0
@@ -888,14 +893,46 @@ def evaluate_realtime_spend_breaker(
         and bool(p_sid)
     )
     is_tier0 = is_tier0_critical_cron(job_name, session_id)
-    family_job_tag = f"parent:{p_sid}" if (src == "subagent" and p_sid) else ""
-    all_lineage_sids = _resolve_lineage_session_ids(session_id, p_sid, lineage_session_ids)
-    spend_sids = (session_id,) if is_interactive_subagent else all_lineage_sids
+    is_bg_review = src == "background_review"
+    effective_session_id = f"background_review:{session_id}" if is_bg_review else session_id
+    all_lineage_sids = (
+        (effective_session_id,)
+        if is_bg_review
+        else _resolve_lineage_session_ids(session_id, p_sid, lineage_session_ids)
+    )
 
     try:
         con = _connect()
         try:
             cur = con.cursor()
+            if src == "subagent" and p_sid and not p_src:
+                cur.execute(
+                    """
+                    SELECT source FROM llm_call_ledger
+                    WHERE session_id = ? AND source NOT IN ('log_tail', 'background_review', 'subagent')
+                    ORDER BY ts DESC LIMIT 1
+                    """,
+                    (p_sid,),
+                )
+                p_row = cur.fetchone()
+                if p_row and p_row[0]:
+                    p_src = str(p_row[0]).strip().lower()
+            is_interactive_subagent = (
+                src == "subagent"
+                and p_src in ("desktop", "mobile", "tui", "tui_gateway", "gui", "web")
+                and bool(p_sid)
+            )
+            family_job_tag = (
+                f"parent:{p_sid}"
+                if (src == "subagent" and p_sid and not is_interactive_subagent)
+                else ""
+            )
+            spend_sids = (
+                (session_id,)
+                if (is_interactive_subagent or is_bg_review)
+                else all_lineage_sids
+            )
+
             # 1) Check explicit quarantine table (including full parent/compaction lineage)
             q_placeholders = ",".join("?" for _ in all_lineage_sids)
             cur.execute(
@@ -905,13 +942,22 @@ def evaluate_realtime_spend_breaker(
             q_row = cur.fetchone()
             # 2) Per-session (and subagent-family / compression-rotation lineage) 15m and 1h spend + cache resets
             s_placeholders = ",".join("?" for _ in spend_sids)
-            if family_job_tag:
+            if is_bg_review:
+                cur.execute(
+                    f"""
+                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
+                    FROM llm_call_ledger
+                    WHERE session_id IN ({s_placeholders}) AND source = 'background_review' AND ts >= ?
+                    """,
+                    (*spend_sids, ts_now - 900.0),
+                )
+            elif family_job_tag:
                 cur.execute(
                     f"""
                     SELECT COALESCE(SUM(net_eur), 0.0),
                            COALESCE(SUM(CASE WHEN session_id IN ({s_placeholders}) THEN cache_reset ELSE 0 END), 0)
                     FROM llm_call_ledger
-                    WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND ts >= ?
+                    WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND source != 'background_review' AND ts >= ?
                     """,
                     (
                         *spend_sids,
@@ -924,7 +970,7 @@ def evaluate_realtime_spend_breaker(
                 cur.execute(
                     f"""
                     SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
-                    FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND ts >= ?
+                    FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source != 'background_review' AND ts >= ?
                     """,
                     (*spend_sids, ts_now - 900.0),
                 )
@@ -932,14 +978,19 @@ def evaluate_realtime_spend_breaker(
             s_eur_15m = float(s_eur_15m or 0.0)
             s_resets_15m = int(s_resets_15m or 0)
 
-            if family_job_tag:
+            if is_bg_review:
                 cur.execute(
-                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND ts >= ?",
+                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source = 'background_review' AND ts >= ?",
+                    (*spend_sids, ts_now - 3600.0),
+                )
+            elif family_job_tag:
+                cur.execute(
+                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND source != 'background_review' AND ts >= ?",
                     (*spend_sids, family_job_tag, ts_now - 3600.0),
                 )
             else:
                 cur.execute(
-                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND ts >= ?",
+                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source != 'background_review' AND ts >= ?",
                     (*spend_sids, ts_now - 3600.0),
                 )
             s_eur_1h = float(cur.fetchone()[0] or 0.0)
@@ -1036,14 +1087,14 @@ def evaluate_realtime_spend_breaker(
         cap_15m = TIER0_CRITICAL_CRON_15M_SAFETY_CAP_EUR if is_tier0 else TIER1_NON_INTERACTIVE_15M_CAP_EUR
         if s_eur_15m >= cap_15m:
             reason = f"tier1_session_15m_cap (€{s_eur_15m:.2f} >= €{cap_15m:.2f})"
-            quarantine_session(session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
-            if p_sid and src == "subagent":
+            quarantine_session(effective_session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+            if p_sid and src == "subagent" and not is_interactive_subagent:
                 quarantine_session(p_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
         if not is_tier0 and s_eur_1h >= TIER1_NON_INTERACTIVE_1H_CAP_EUR:
             reason = f"tier1_session_1h_cap (€{s_eur_1h:.2f} >= €{TIER1_NON_INTERACTIVE_1H_CAP_EUR:.2f})"
-            quarantine_session(session_id, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
-            if p_sid and src == "subagent":
+            quarantine_session(effective_session_id, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
+            if p_sid and src == "subagent" and not is_interactive_subagent:
                 quarantine_session(p_sid, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_1h": s_eur_1h}
         if (
@@ -1052,8 +1103,8 @@ def evaluate_realtime_spend_breaker(
             and s_eur_15m >= TIER1_NON_INTERACTIVE_CACHE_RESET_MIN_EUR
         ):
             reason = f"tier1_cache_reset_storm (resets={s_resets_15m}, €{s_eur_15m:.2f} in 15m)"
-            quarantine_session(session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
-            if p_sid and src == "subagent":
+            quarantine_session(effective_session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+            if p_sid and src == "subagent" and not is_interactive_subagent:
                 quarantine_session(p_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
 
