@@ -355,12 +355,20 @@ def _sync_session_key_after_compress(
     old_key = session.get("session_key", "") or ""
     if not new_session_id or new_session_id == old_key:
         return
-    if not _transfer_active_session_slot(sid, session, new_session_id=new_session_id):
+    try:
+        transferred = _transfer_active_session_slot(sid, session, new_session_id=new_session_id)
+    except Exception:
+        logger.warning(
+            "Compression session lease transfer raised: sid=%s old_session_id=%s new_session_id=%s",
+            sid, old_key, new_session_id, exc_info=True,
+        )
+        transferred = False
+    if not transferred:
         logger.warning(
             "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
             sid, old_key, new_session_id,
         )
-    # Even if the approval module fails to import, anchor session_key on the continuation id.
+    # Even if the approval or lease module fails, anchor session_key on the continuation id.
     session["session_key"] = new_session_id
     with contextlib.suppress(Exception):
         from pathlib import Path

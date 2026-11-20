@@ -370,3 +370,86 @@ def test_busy_queue_accept_row_lands_with_the_turn_and_is_addressed_there(monkey
     finally:
         server._sessions.pop(sid, None)
         db.close()
+
+
+def test_truncate_history_for_submit_targets_continuation_when_parent_closed_by_compression(
+    monkeypatch, tmp_path
+):
+    """When a turn rotates onto a compression child and then aborts before ``session_key`` re-anchors,
+    ``session["session_key"]`` still names the compression-closed parent while ``agent.session_id``
+    names the live continuation. A retry/edit (``ordinal=0``) must call ``replace_transcript`` on
+    ``_submit_row_target_key(session)`` (the continuation), not the closed parent."""
+    db = open_persistence(profile_scope(home=tmp_path))
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        from tui_gateway import methods_prompt  # ensure rebound helpers are installed on server
+        assert methods_prompt is not None
+        with session["history_lock"]:
+            session["running"] = True
+            server._start_inflight_turn(session, "earlier turn")
+        assert server._ensure_session_db_row(session) is not False
+        agent = _flush_agent(db, key)
+        session["agent"] = agent
+        child = _rotate_to_compression_child(db, key, agent, reopen_parent=False)
+        assert session["session_key"] == key and agent.session_id == child
+
+        with session["history_lock"]:
+            session["running"] = False
+            session["history"] = [
+                dict(r, _row_id=r["_row_id"])
+                for r in conversation(db, child, ConversationRequest(include_row_ids=True))
+            ]
+            session["history_version"] = 1
+
+        err, fields = server._truncate_history_for_submit(
+            "r-trunc",
+            sid,
+            session,
+            {
+                "truncate_before_user_ordinal": 0,
+                "truncate_before_row_id": session["history"][0]["_row_id"],
+                "confirm_truncate": True,
+                "confirm_empty_truncate": True,
+            },
+            None,
+        )
+        assert err is None, f"truncation against rotated session failed with CompressionClosed: {err}"
+        assert fields == {"survivor_user_row_ids": []}
+        assert session["history"] == []
+        assert [r for r in conversation(db, child, ConversationRequest())] == []
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_recover_turn_exception_syncs_session_key_after_mid_turn_compression(monkeypatch, tmp_path):
+    """If a turn completes a mid-turn compression rotation and then raises an unhandled exception on a
+    later step, ``_absorb_turn_result`` is skipped; ``_recover_turn_exception`` must still re-anchor
+    ``session["session_key"]`` onto ``agent.session_id``."""
+    db = open_persistence(profile_scope(home=tmp_path))
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        from tui_gateway import prompt_turn  # ensure rebound helpers are installed on server
+        assert prompt_turn is not None
+        with session["history_lock"]:
+            session["running"] = True
+            server._start_inflight_turn(session, "earlier turn")
+        assert server._ensure_session_db_row(session) is not False
+        agent = _flush_agent(db, key)
+        session["agent"] = agent
+        child = _rotate_to_compression_child(db, key, agent, reopen_parent=False)
+        agent._last_turn_messages = [
+            {"role": "user", "content": "earlier turn"},
+            {"role": "assistant", "content": "earlier reply"},
+        ]
+        monkeypatch.setattr(server, "_emit_terminal_turn_error", lambda *_a, **_kw: None)
+        st = server._TurnRun(agent, None, None, receipt_committed=True)
+        server._recover_turn_exception(sid, session, st, RuntimeError("second compression boom"))
+        assert session["session_key"] == child, (
+            f"_recover_turn_exception left session_key={session['session_key']!r} instead of {child!r}"
+        )
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()

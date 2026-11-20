@@ -1151,6 +1151,12 @@ def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseExcept
     print(f"[gateway-turn] {error_type_name(e)}: {e}", file=sys.stderr, flush=True)
     # A finalizer exception can leave in-memory history at the turn-start snapshot.
     _restore_agent_history_after_turn_error(session, st.agent)
+    # A turn that completed a mid-turn compression rotation and then raised on a later
+    # step skips _absorb_turn_result; sync session_key to the live agent.session_id tip
+    # so subsequent retries/truncations do not target the closed parent session.
+    with contextlib.suppress(Exception):
+        _sync_session_key_after_compress(
+            sid, session, clear_pending_title=False, restart_slash_worker=True)
     if st.terminal_callback is not None and not st.receipt_attempted:
         st.receipt_attempted = True
         try:

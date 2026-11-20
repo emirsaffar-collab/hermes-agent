@@ -553,10 +553,10 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
                 # before they are gone — three reported incidents ended here with nothing to restore from
                 # (#70516, #80763, #82756). Soft-archiving keeps them on disk (active=0) and in the FTS
                 # index, so a mis-aimed cut is recoverable instead of terminal. The live transcript is
-                # unchanged. Fall back to session id when session_key is NULL — CLI-origin sessions created
-                # before the session_key default fix have no key, and a replace under None triggers an FK
-                # violation.
-                truncation_key = session.get("session_key") or sid
+                # unchanged. Target _submit_row_target_key(session) so a retry/edit after a mid-turn
+                # compression rotation writes to the live continuation (matching _load_durable_truncation_history)
+                # rather than a closed parent session_key; fall back to sid when session_key is NULL.
+                truncation_key = _submit_row_target_key(session) or sid
                 old_active_row_ids = _row_ids_of(history)
                 if requested_rebind_ids is not None:
                     # Un-repaired pre-write active-id set: a rewritten row must never be
