@@ -225,6 +225,13 @@ def set_token_delta_applier(applier: Optional[Callable[["StoreHolder", str, dict
 
 
 def _apply_token_delta(holder: "StoreHolder", session_id: str, kwargs: dict[str, Any]) -> None:
+    global _token_delta_applier
+    if _token_delta_applier is None:
+        try:
+            from .conversation.usage import _apply_usage_delta
+            _token_delta_applier = _apply_usage_delta
+        except Exception:
+            pass
     if _token_delta_applier is None:
         raise RuntimeError("no usage delta applier is registered for the accounting queue")
     _token_delta_applier(holder, session_id, kwargs)
