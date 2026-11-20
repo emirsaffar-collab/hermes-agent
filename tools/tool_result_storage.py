@@ -478,6 +478,12 @@ def archive_compaction_drops(
 
 
 ARCHIVE_LIST_HEADING = "Archived tool output (exact originals; read_file a path to recover one):"
+OLDER_ARCHIVE_PREFIX_HEADING = (
+    "Older archived sessions in ~/.hermes/cache/pruned/ "
+    "(use search_files with path='~/.hermes/cache/pruned' and file_glob='<prefix>*' to locate):"
+)
+_OLDER_ARCHIVE_PREFIX_TOKEN_RE = re.compile(r"\b([A-Za-z0-9_-]+)_\*\s*\((\d+)\)")
+_PRUNED_REF_SESSION_RE = re.compile(r"^cache/pruned/([A-Za-z0-9_-]+?)_\d{8}T\d{6}Z_")
 
 
 def _row_text(row: Any) -> str:
@@ -490,19 +496,57 @@ def pruned_archive_refs(rows: Any) -> set[str]:
     return {ref for ref in archive_refs_in_text(*map(_row_text, rows)) if ref.startswith(PRUNED_SUBDIR + "/")}
 
 
-def archive_list_for_summary(named: set[str], kept: list[dict[str, Any]]) -> str:
+def ancestor_archive_prefix_counts(summary_rows: Any, exclude_refs: set[str] | None = None) -> dict[str, int]:
+    """Aggregate ``<session_id> -> count`` for older compaction handoff rows without snowballing verbatim paths."""
+    counts: dict[str, int] = {}
+    excluded = exclude_refs or set()
+    for text in map(_row_text, summary_rows):
+        if not isinstance(text, str) or not text:
+            continue
+        for m in _OLDER_ARCHIVE_PREFIX_TOKEN_RE.finditer(text):
+            counts[m.group(1)] = max(counts.get(m.group(1), 0), int(m.group(2)))
+        per_sid: dict[str, int] = {}
+        for ref in archive_refs_in_text(text):
+            if not ref.startswith(PRUNED_SUBDIR + "/") or ref in excluded:
+                continue
+            sm = _PRUNED_REF_SESSION_RE.match(ref)
+            if not sm:
+                continue
+            sid = sm.group(1)
+            per_sid[sid] = per_sid.get(sid, 0) + 1
+        for sid, cnt in per_sid.items():
+            counts[sid] = max(counts.get(sid, 0), cnt)
+    return counts
+
+
+def archive_list_for_summary(
+    named: set[str],
+    kept: list[dict[str, Any]],
+    ancestor_counts: dict[str, int] | None = None,
+) -> str:
     """The *named* archives no row of *kept* (the committed transcript, summary included) points at, as a
     deterministic list to append to the committed summary; ``""`` when none. The generated summary may drop
     a pointer: this list keeps the model's recovery path, and the reference the retention sweep reads,
-    whatever the summarizer wrote."""
+    whatever the summarizer wrote. Older compaction hops collapse to ``<session_id>_* (N)`` prefixes so
+    multi-hop child sessions do not snowball 80KB+ of ancestor paths while keeping every hop searchable."""
     from hermes_constants import get_hermes_home
 
     missing = named - pruned_archive_refs(kept)
-    if not missing:
+    if not missing and not ancestor_counts:
         return ""
     home = get_hermes_home()
-    return "\n\n" + ARCHIVE_LIST_HEADING + "".join(
-        f"\n- {_archive_stub_path(str(home / ref))}" for ref in sorted(missing))
+    parts: list[str] = []
+    if missing:
+        parts.append(
+            ARCHIVE_LIST_HEADING
+            + "".join(f"\n- {_archive_stub_path(str(home / ref))}" for ref in sorted(missing))
+        )
+    if ancestor_counts:
+        prefix_items = ", ".join(f"{sid}_* ({cnt})" for sid, cnt in sorted(ancestor_counts.items()))
+        if not parts:
+            parts.append(ARCHIVE_LIST_HEADING)
+        parts.append(f"{OLDER_ARCHIVE_PREFIX_HEADING} {prefix_items}")
+    return "\n\n" + "\n".join(parts)
 
 
 def discard_archives(paths: list[str]) -> None:

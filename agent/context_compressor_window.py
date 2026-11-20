@@ -159,12 +159,28 @@ class CompactionWindowMixin:
         """``_assemble_compressed`` with every archive a replaced row named, that neither the kept head and tail
         nor the generated summary still name, listed in the summary row: the summarizer never saw the pointers
         (it read the originals), and the list keeps the model's path back and the reference the retention
-        sweep keeps the file for."""
-        from tools.tool_result_storage import archive_list_for_summary, pruned_archive_refs
+        sweep keeps the file for. Prior compaction summary rows collapse to ``<session_id>_* (N)`` prefixes."""
+        from tools.tool_result_storage import (
+            ancestor_archive_prefix_counts,
+            archive_list_for_summary,
+            pruned_archive_refs,
+        )
 
-        named = pruned_archive_refs(messages)
+        summary_indices = getattr(scan, "summary_indices", None) or set()
+        window_rows = [
+            m for idx, m in enumerate(messages)
+            if idx not in summary_indices and not self._is_context_summary_message(m)
+        ]
+        prior_summary_rows = [
+            m for idx, m in enumerate(messages)
+            if idx in summary_indices or self._is_context_summary_message(m)
+        ]
+        named = pruned_archive_refs(window_rows)
+        ancestor_counts = ancestor_archive_prefix_counts(prior_summary_rows, exclude_refs=named)
         kept = [*messages[:start], *messages[max(end, scan.tail_start):], {"content": summary}]
-        return self._assemble_compressed(messages, start, end, scan, summary + archive_list_for_summary(named, kept))
+        return self._assemble_compressed(
+            messages, start, end, scan, summary + archive_list_for_summary(named, kept, ancestor_counts),
+        )
 
     def _offload_window_results(
         self, plan: list[dict[str, Any]], start: int, end: int,

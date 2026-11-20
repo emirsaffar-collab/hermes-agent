@@ -62,7 +62,7 @@ def _lean_recovery_stub(tool_name: str, content_len: int, session_id: str) -> st
 
 
 def skill_view_names_by_call_id(messages: list[dict[str, Any]]) -> dict[str, str]:
-    """Map each ``skill_view`` tool-call id to the skill name it loaded."""
+    """Map each main ``skill_view`` tool-call id (excluding linked ``file_path`` reads) to the skill name it loaded."""
     from agent.context_compressor import _json_dict, _tc_get
 
     names: dict[str, str] = {}
@@ -71,7 +71,8 @@ def skill_view_names_by_call_id(messages: list[dict[str, Any]]) -> dict[str, str
             continue
         for tc in msg.get("tool_calls") or []:
             fn = _tc_get(tc, "function", {})
-            skill = _json_dict(_tc_get(fn, "arguments")).get("name") if _tc_get(fn, "name") == "skill_view" else None
+            args = _json_dict(_tc_get(fn, "arguments")) if _tc_get(fn, "name") == "skill_view" else {}
+            skill = args.get("name") if not args.get("file_path") else None
             if isinstance(skill, str) and skill:
                 names[str(_tc_get(tc, "id") or "")] = skill
     return names

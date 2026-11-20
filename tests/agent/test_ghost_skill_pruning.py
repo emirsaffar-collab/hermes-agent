@@ -513,4 +513,59 @@ class TestReinjectionBoundsAndRedaction:
         ]
         assert _collect_ghosted_skill_names(turns) == ["real-loaded-skill"]
 
+    def test_linked_reference_file_path_demotes_in_tail_while_main_skill_md_stays_protected(self):
+        """Positive polarity: main `skill_view(name='always-verify')` stays protected across >6 tool rounds.
+        Negative polarity: linked `skill_view(name='always-verify', file_path='references/detail.md')` is
+        demoted once older than `_LEAN_TAIL_KEEP_TOOL_ROUNDS` without emitting `[SKILL_PRUNED]`."""
+        messages = [
+            {"role": "user", "content": "Verify the release"},
+            *_skill_view_pair("call_main_skill", "always-verify", size=4000),
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_ref_doc",
+                        "type": "function",
+                        "function": {
+                            "name": "skill_view",
+                            "arguments": '{"name": "always-verify", "file_path": "references/inline-detail.md"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_ref_doc",
+                "content": "# Inline Reference Detail\n" + ("R" * 16000),
+            },
+        ]
+        for i in range(8):
+            cid = f"call_ro_{i}"
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": cid, "type": "function", "function": {"name": "read_file", "arguments": '{"path":"a.py"}'}}
+                    ],
+                }
+            )
+            messages.append({"role": "tool", "tool_call_id": cid, "content": "line\n" * 200})
+
+        from agent.context_compressor_tail import demote_stale_tail_tools
+
+        demoted_messages, demoted_count = demote_stale_tail_tools(messages, tail_start=0, session_id="test_ref_demote")
+        assert demoted_count >= 1
+        main_tool = next(m for m in demoted_messages if m.get("tool_call_id") == "call_main_skill")
+        ref_tool = next(m for m in demoted_messages if m.get("tool_call_id") == "call_ref_doc")
+        assert len(main_tool["content"]) >= 4000
+        assert len(ref_tool["content"]) < 500
+        assert "demoted at compaction" in ref_tool["content"]
+        assert SKILL_PRUNED_MARKER_PREFIX not in ref_tool["content"]
+        # Negative polarity: a turns slice containing ONLY the linked reference file_path call does not register as a ghosted main skill.
+        assert _collect_ghosted_skill_names(demoted_messages[3:]) == []
+        # Positive polarity: the full slice containing the main SKILL.md call still registers `always-verify` when summarized.
+        assert _collect_ghosted_skill_names(demoted_messages) == ["always-verify"]
+
 

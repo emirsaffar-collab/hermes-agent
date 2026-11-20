@@ -1033,6 +1033,10 @@ def _strip_deterministic_lean_sections(text: str) -> str:
     if not text:
         return text
     cleaned = without_skill_safety_rule(text)
+    from tools.tool_result_storage import ARCHIVE_LIST_HEADING
+    arch_idx = cleaned.find("\n\n" + ARCHIVE_LIST_HEADING)
+    if arch_idx >= 0:
+        cleaned = cleaned[:arch_idx]
     deterministic_headings = {
         _LEAN_ANCHOR_HEADING.strip(),
         _LEAN_USER_MESSAGES_HEADING.strip(),
@@ -1445,6 +1449,8 @@ def _build_anchor_index(turns: list[dict[str, Any]]) -> str:
             val = m.group(0).strip().rstrip(".,;:")
             if val.lower() in _ANCHOR_NOISE:
                 continue
+            if label == "files" and ("cache/pruned/" in val or "cache/spillover/" in val):
+                continue
             counts[val] = counts.get(val, 0) + 1
             last_seen[val] = n
         if not counts:
@@ -1495,7 +1501,8 @@ def _skill_view_call_sites(messages: list[dict[str, Any]]) -> list[tuple[int, st
             args_str = _tc_get(fn, "arguments")
             if _tc_get(fn, "name") != "skill_view" or not isinstance(args_str, str):
                 continue
-            skill = _json_dict(args_str).get("name", "")
+            args = _json_dict(args_str)
+            skill = args.get("name", "") if not args.get("file_path") else ""
             if isinstance(skill, str) and skill:
                 sites.append((i, skill))
     return sites
@@ -2185,8 +2192,11 @@ def _sum_execute_code(name, args, content, content_len, line_count):
 
 def _sum_skill_view(name, args, content, content_len, line_count):
     skill = args.get("name", "?")
+    file_path = args.get("file_path")
     # Ghost-skill defense: any loaded body, however small, leaves the marker saying it is gone and how to reload.
     failed = _result_failure_suffix(content) or (" FAILED" if _skill_view_failed(content) else "")
+    if isinstance(file_path, str) and file_path:
+        return f"[skill_view] name={skill} file_path={file_path}{failed} ({content_len:,} chars)"
     # Re-summarizing a stub (fallback summary) keeps that stub's own verdict instead of re-deciding blind.
     keep = SKILL_PRUNED_MARKER_PREFIX in content if _is_summary_stub(content) else not failed
     marker = " " + _skill_pruned_marker(str(skill)) if skill != "?" and keep else ""
@@ -3702,8 +3712,9 @@ class ContextCompressor(
             return False
         tool_name, tool_args = call_id_to_tool.get(msg.get("tool_call_id", ""), ("unknown", ""))
         if protected_skills and tool_name == "skill_view":
-            _skill = _json_dict(tool_args).get("name", "")
-            if isinstance(_skill, str) and _skill.lower() in protected_skills:
+            _args = _json_dict(tool_args)
+            _skill = _args.get("name", "")
+            if not _args.get("file_path") and isinstance(_skill, str) and _skill.lower() in protected_skills:
                 return False
         payload_urls: list[str] = []
         if tool_name == "web_search":
