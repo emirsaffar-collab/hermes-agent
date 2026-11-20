@@ -151,14 +151,14 @@ def record_aux_usage(
                 ),
                 estimated_cost_usd=estimated_cost,
             )
-            return
-        call_off_event_loop(
-            session_db.record_auxiliary_usage,
-            session_id, task, model=model, billing_provider=provider, billing_base_url=base_url,
-            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
-            cache_read_tokens=usage.cache_read_tokens, cache_write_tokens=usage.cache_write_tokens,
-            reasoning_tokens=usage.reasoning_tokens, estimated_cost_usd=estimated_cost,
-        )
+        else:
+            call_off_event_loop(
+                session_db.record_auxiliary_usage,
+                session_id, task, model=model, billing_provider=provider, billing_base_url=base_url,
+                input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens, cache_write_tokens=usage.cache_write_tokens,
+                reasoning_tokens=usage.reasoning_tokens, estimated_cost_usd=estimated_cost,
+            )
         try:
             from agent.realtime_spend_breaker import record_realtime_llm_call
             _aux_rid = getattr(response, "id", None)

@@ -284,7 +284,10 @@ def get_active_budget_cap(now: float | None = None) -> dict[str, Any] | None:
         data = json.loads(cpath.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or not data.get("active", True):
             return None
-        exp = float(data.get("expires_at") or (float(data.get("ts") or 0.0) + 4 * 3600.0))
+        cap_ts = float(data.get("ts") or 0.0)
+        exp = float(data.get("expires_at") or (cap_ts + 4 * 3600.0))
+        if cap_ts > 0 and exp > cap_ts + 86400.0:
+            exp = cap_ts + 86400.0
         if exp > 0 and ts_now >= exp:
             return None
         has_hourly_cap = any(
@@ -568,6 +571,8 @@ def record_realtime_llm_call(
     cluster_id = extract_vertex_cluster_id(request_id)
     is_live_call = (
         str(source) != "log_tail"
+        and not str(source).startswith("aux:")
+        and str(source) != "background_review"
         and not str(session_id).startswith("log_tail")
     )
     is_argon_live = (
@@ -610,6 +615,8 @@ def record_realtime_llm_call(
         "cache_reset": cache_reset,
         "request_id": req_key,
     }
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("HERMES_AI_SPEND_DB_PATH"):
+        return row_info
     try:
         con = _connect()
         try:
@@ -621,6 +628,7 @@ def record_realtime_llm_call(
                     SELECT prompt_tokens, cached_in
                     FROM llm_call_ledger
                     WHERE session_id = ? AND ts >= ? AND request_id != ?
+                      AND source NOT LIKE 'aux:%' AND source != 'background_review'
                     ORDER BY ts DESC, id DESC LIMIT 2
                     """,
                     (row_info["session_id"], now - 1800.0, req_key),
@@ -947,11 +955,16 @@ def evaluate_realtime_spend_breaker(
     )
     is_tier0 = is_tier0_critical_cron(job_name, session_id)
     is_bg_review = src == "background_review"
+    cron_job_tag = str(job_name or "").strip() if src == "cron" else ""
     effective_session_id = f"background_review:{session_id}" if is_bg_review else session_id
     all_lineage_sids = (
         (effective_session_id,)
         if is_bg_review
-        else _resolve_lineage_session_ids(session_id, p_sid, lineage_session_ids)
+        else _resolve_lineage_session_ids(
+            session_id,
+            p_sid,
+            tuple(lineage_session_ids) + ((f"cron_job:{cron_job_tag}",) if cron_job_tag else ()),
+        )
     )
 
     try:
@@ -978,7 +991,7 @@ def evaluate_realtime_spend_breaker(
             family_job_tag = (
                 f"parent:{p_sid}"
                 if (src == "subagent" and p_sid)
-                else ""
+                else cron_job_tag
             )
             spend_sids = (
                 (session_id,)
@@ -1135,7 +1148,7 @@ def evaluate_realtime_spend_breaker(
                 "estate_net_eur_15m": estate_15m,
             }
 
-    # Tier 1A: Non-interactive per-session (and subagent-family) runaway breaker
+    # Tier 1A: Non-interactive per-session (and subagent-family / cron-job-family) runaway breaker
     if not is_interactive:
         cap_15m = TIER0_CRITICAL_CRON_15M_SAFETY_CAP_EUR if is_tier0 else TIER1_NON_INTERACTIVE_15M_CAP_EUR
         if s_eur_15m >= cap_15m:
@@ -1143,12 +1156,16 @@ def evaluate_realtime_spend_breaker(
             quarantine_session(effective_session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
             if p_sid and src == "subagent" and not is_interactive_subagent:
                 quarantine_session(p_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+            if cron_job_tag:
+                quarantine_session(f"cron_job:{cron_job_tag}", reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
         if not is_tier0 and s_eur_1h >= TIER1_NON_INTERACTIVE_1H_CAP_EUR:
             reason = f"tier1_session_1h_cap (€{s_eur_1h:.2f} >= €{TIER1_NON_INTERACTIVE_1H_CAP_EUR:.2f})"
             quarantine_session(effective_session_id, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
             if p_sid and src == "subagent" and not is_interactive_subagent:
                 quarantine_session(p_sid, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
+            if cron_job_tag:
+                quarantine_session(f"cron_job:{cron_job_tag}", reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_1h": s_eur_1h}
         reset_cap = (
             TIER0_CRITICAL_CACHE_RESET_COUNT

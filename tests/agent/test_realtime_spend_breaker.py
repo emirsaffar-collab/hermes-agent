@@ -1445,6 +1445,133 @@ def test_desktop_turn_usage_records_ledger_and_non_tier0_0cache_breaker_at_060_e
     assert ev_above["session_net_eur_15m"] < 1.20
 
 
+def test_cron_job_name_aggregates_across_fresh_local_session_ids_and_caps_budget_override_ttl(tmp_path, monkeypatch):
+    import json
+    import time
+    from types import SimpleNamespace
+    import agent.aux_accounting as aux_acc
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    cap_file = tmp_path / "ai-budget-cap.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+    monkeypatch.setenv("HERMES_AI_BUDGET_CAP_PATH", str(cap_file))
+
+    now = time.time()
+
+    # 1) Multi-day budget cap override (>24h from ts) is bounded to 24h max TTL
+    cap_file.write_text(
+        json.dumps(
+            {
+                "active": True,
+                "ts": now - 90_000.0,
+                "expires_at": now + 800_000.0,
+                "tier2_daily_soft_cap_eur": 650.0,
+                "tier3_daily_hard_cap_eur": 850.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert rsb.get_active_budget_cap(now=now) is None
+
+    # 2) Three separate local-<uuid> cron runs of the same job_name in 15m (~€1.45 each = €4.35 total)
+    #    must aggregate by job_name and trip Tier 1A (€4.00/15m) on the 4th run
+    for i in range(3):
+        rsb.record_realtime_llm_call(
+            session_id=f"local-cron-run-{i}",
+            source="cron",
+            job_name="newintra-builder-owner",
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=850_000,
+            uncached_input_tokens=850_000,
+            cache_read_tokens=0,
+            output_tokens=1_000,
+            request_id=f"rid_cron_fam_{i}",
+        )
+    ev_cron_trip = rsb.evaluate_realtime_spend_breaker(
+        session_id="local-cron-run-3",
+        source="cron",
+        job_name="newintra-builder-owner",
+        model="google/gemini-4-argon",
+        provider="vertex",
+        now=now + 1.0,
+    )
+    assert ev_cron_trip["allowed"] is False
+    assert "tier1_session_15m_cap" in ev_cron_trip["reason"]
+    assert ev_cron_trip["session_net_eur_15m"] >= 4.00
+
+    # Negative control: a different cron job_name with 0 spend is NOT affected by newintra-builder-owner's Tier 1A trip
+    ev_other_cron = rsb.evaluate_realtime_spend_breaker(
+        session_id="local-other-cron-1",
+        source="cron",
+        job_name="other-clean-cron",
+        model="google/gemini-3.8-flash",
+        provider="vertex",
+        now=now + 1.0,
+    )
+    assert ev_other_cron["allowed"] is True
+
+    # 3) aux:compression via record_aux_usage records into llm_call_ledger even when store is not None,
+    #    and does NOT trigger a false cache_reset=1 on the parent Argon session
+    fake_db = SimpleNamespace(record_auxiliary_usage=lambda *a, **k: None)
+    fake_store = SimpleNamespace(usage=SimpleNamespace(record_auxiliary_usage=lambda *a, **k: None))
+    tok = aux_acc._accounting.set((fake_db, fake_store, "sess-argon-parent"))
+    try:
+        rsb.record_realtime_llm_call(
+            session_id="sess-argon-parent",
+            source="desktop",
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=120_000,
+            uncached_input_tokens=10_000,
+            cache_read_tokens=110_000,
+            output_tokens=500,
+            request_id="rid_argon_before_comp",
+        )
+        comp_resp = SimpleNamespace(
+            id="rid_aux_comp_1",
+            model="google/gemini-3.8-flash",
+            usage=SimpleNamespace(
+                prompt_tokens=60_000,
+                completion_tokens=1_200,
+                total_tokens=61_200,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=0),
+            ),
+        )
+        aux_acc.record_aux_usage(comp_resp, "compression", provider="vertex")
+        r_after = rsb.record_realtime_llm_call(
+            session_id="sess-argon-parent",
+            source="desktop",
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=125_000,
+            uncached_input_tokens=5_000,
+            cache_read_tokens=120_000,
+            output_tokens=400,
+            request_id="rid_argon_after_comp",
+        )
+        assert r_after["cache_reset"] == 0
+    finally:
+        aux_acc.reset_accounting_context(tok)
+
+    con = rsb._connect()
+    try:
+        aux_row = con.execute(
+            "SELECT source, job_name, model, prompt_tokens, cache_reset, net_eur FROM llm_call_ledger WHERE request_id = 'rid_aux_comp_1'"
+        ).fetchone()
+    finally:
+        con.close()
+    assert aux_row is not None
+    assert aux_row[0] == "aux:compression"
+    assert aux_row[1] == "compression"
+    assert aux_row[4] == 0
+    assert float(aux_row[5]) > 0.0
+
+
+
 
 
 
