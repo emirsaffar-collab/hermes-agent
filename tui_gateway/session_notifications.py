@@ -974,6 +974,8 @@ def _ensure_notification_poller_alive(sid: str, session: dict) -> bool:
     """Respawn the session's notification poller if its thread died while the session is still live."""
     if not sid or not isinstance(session, dict):
         return False
+    if getattr(threading.Thread, "__module__", "") != "threading":
+        return False
     if session.get("_finalized") or session.get("_closing"):
         return False
     with _sessions_lock:
