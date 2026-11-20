@@ -72,11 +72,24 @@ def writer_mutex_until(lock, deadline, *, db=None, site=None, quiet: bool = Fals
     recorded: no SQL, parameters or frame locals. Observation-only callers with ``quiet=True``
     yield on their sub-second patience without emitting a WARNING log."""
     if not lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-        if db is not None and not quiet:
-            _log_writer_owner(db, site)
-        raise WriterMutexTimeout(
-            "database is locked (in-process state.db writer mutex exceeded write patience)"
+        owner = getattr(db, "_writer_owner", None) if db is not None else None
+        ckpt_code = getattr(getattr(db, "_try_wal_checkpoint", None), "__code__", None)
+        is_ckpt = (
+            not quiet
+            and ckpt_code is not None
+            and isinstance(owner, tuple)
+            and len(owner) >= 2
+            and isinstance(owner[1], tuple)
+            and len(owner[1]) >= 2
+            and owner[1][1] is ckpt_code
         )
+        ckpt_Wait = max(0.0, (deadline + getattr(db, "_TRANSCRIPT_WRITE_PATIENCE_S", 240.0)) - time.monotonic()) if is_ckpt else 0.0
+        if not (is_ckpt and ckpt_Wait > 0.0 and lock.acquire(timeout=ckpt_Wait)):
+            if db is not None and not quiet:
+                _log_writer_owner(db, site)
+            raise WriterMutexTimeout(
+                "database is locked (in-process state.db writer mutex exceeded write patience)"
+            )
     if db is not None:
         db._writer_owner = (threading.current_thread().name, site, time.monotonic())
     try:

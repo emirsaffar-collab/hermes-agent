@@ -48,12 +48,16 @@ class StreamingWaitMonitor:
         stale = self._stream_stale_timeout
         if stale is None or stale == float("inf"):
             return float("inf")
+        agent = getattr(self, "agent", None)
         if self._in_post_chunk_phase():
             post_chunk = getattr(self, "_stream_post_chunk_stale_timeout", None)
-            if post_chunk is not None and post_chunk > 0:
-                return min(stale, post_chunk)
-            return stale
-        agent = getattr(self, "agent", None)
+            eff = min(stale, post_chunk) if (post_chunk is not None and post_chunk > 0) else stale
+            if (
+                getattr(agent, "provider", None) == "vertex"
+                and (getattr(agent, "run_budget_seconds", None) or getattr(agent, "platform", None) == "cron")
+            ):
+                return min(eff, VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS)
+            return eff
         if getattr(agent, "provider", None) == "vertex":
             routed = str(
                 getattr(agent, "_last_routed_base_url", None)

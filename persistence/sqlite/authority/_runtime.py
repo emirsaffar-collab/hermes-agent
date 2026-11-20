@@ -240,9 +240,10 @@ def terminal_api_admissions(conn, request_id):
     """Retired API admissions that carried *request_id*: a deleted session's tombstones, kept for
     the exact-retry horizon, still spend its Idempotency-Key for every other target."""
     return [json.loads(row[0]) for row in conn.execute(
-        "SELECT value FROM state_meta WHERE key GLOB ? "
-        "AND json_extract(value, '$.principal_id')='api' AND json_extract(value, '$.request_id')=?",
-        (ADMISSION_PREFIX + '*', request_id))]
+        "SELECT value FROM state_meta WHERE key GLOB 'gateway.terminal_admission.v1.*' "
+        "AND json_valid(value) AND json_extract(value, '$.principal_id')='api' "
+        "AND json_extract(value, '$.request_id')=?",
+        (request_id,))]
 
 
 def terminal_admission(conn, admission_id):

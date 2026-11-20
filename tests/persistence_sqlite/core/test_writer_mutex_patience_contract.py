@@ -165,3 +165,89 @@ def test_publish_compression_child_clears_parent_activity_labels_atomically(db, 
     assert write_calls == [], f"Expected zero post-publish write_sql calls, got {write_calls}"
 
 
+def test_checkpoint_holder_extends_writer_mutex_wait_without_timeout(db):
+    """When StoreHolder._try_wal_checkpoint holds self._lock on Darwin (fullfsync barrier),
+    concurrent in-process writers with standard patience extend their wait rather than failing
+    with WriterMutexTimeout."""
+    held, release = threading.Event(), threading.Event()
+
+    def hold_as_checkpoint():
+        with db._lock:
+            db._writer_owner = ("asyncio_7", (None, db._try_wal_checkpoint.__code__), time.monotonic())
+            held.set()
+            try:
+                release.wait(2.0)
+            finally:
+                db._writer_owner = None
+
+    t = threading.Thread(target=hold_as_checkpoint, name="asyncio_7")
+    t.start()
+    assert held.wait(2.0)
+    timer = threading.Timer(0.18, release.set)
+    timer.start()
+    try:
+        db._write_sql("UPDATE sessions SET title = ? WHERE id = ?", ("after-ckpt", "owned"), patience_s=0.05)
+    finally:
+        timer.cancel()
+        release.set()
+        t.join(2.0)
+    row = get_session(db, "owned")
+    assert row is not None and row["title"] == "after-ckpt"
+
+
+def test_terminal_api_admissions_uses_partial_index_without_full_scan(db):
+    """terminal_api_admissions must use idx_state_meta_terminal_api_request rather than scanning
+    non-API gateway.terminal_admission.v1.* rows."""
+    import json
+    from persistence.sqlite.authority._runtime import terminal_api_admissions
+
+    db._write_sql(
+        "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?), (?, ?)",
+        (
+            "gateway.terminal_admission.v1.adm-cron-1",
+            json.dumps({"admission_id": "adm-cron-1", "principal_id": "cron-owner", "request_id": "req-1", "status": "terminal"}),
+            "gateway.terminal_admission.v1.adm-api-1",
+            json.dumps({"admission_id": "adm-api-1", "principal_id": "api", "request_id": "req-api-1", "status": "terminal"}),
+        ),
+    )
+    rows = terminal_api_admissions(db._conn, "req-api-1")
+    assert len(rows) == 1 and rows[0]["admission_id"] == "adm-api-1"
+    plan = db._read_all(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT value FROM state_meta
+        WHERE key GLOB 'gateway.terminal_admission.v1.*'
+          AND json_valid(value)
+          AND json_extract(value, '$.principal_id') = 'api'
+          AND json_extract(value, '$.request_id') = ?
+        """,
+        ("req-api-1",),
+    )
+    detail = " ".join(str(dict(r).get("detail", "")) for r in plan)
+    assert "idx_state_meta_terminal_api_request" in detail, f"Expected index scan, got: {detail}"
+
+
+def test_webhook_script_isolated_runs_on_dedicated_executor_preserving_contextvars():
+    """_run_webhook_script_isolated must execute on the 'webhook-script*' thread pool
+    and preserve contextvars across the thread boundary."""
+    import asyncio
+    import contextvars
+    from gateway.platforms.webhook import _run_webhook_script_isolated
+
+    var = contextvars.ContextVar("webhook_test_scope", default="unset")
+
+    async def _probe():
+        var.set("profile-alpha")
+        return await _run_webhook_script_isolated(
+            lambda x: (True, {"thread": threading.current_thread().name, "scope": var.get(), "x": x}),
+            42,
+        )
+
+    keep, payload = asyncio.run(_probe())
+    assert keep is True
+    assert payload["thread"].startswith("webhook-script")
+    assert payload["scope"] == "profile-alpha"
+    assert payload["x"] == 42
+
+
+

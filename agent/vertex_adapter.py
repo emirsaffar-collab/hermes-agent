@@ -58,10 +58,18 @@ DEFAULT_REGION = "global"
 GLOBAL_VERTEX_REGION = "global"
 EUROPE_WEST2_VERTEX_REGION = "europe-west2"
 ASIA_SOUTHEAST1_VERTEX_REGION = "asia-southeast1"
-REGIONAL_VERTEX_REGIONS = (EUROPE_WEST2_VERTEX_REGION, ASIA_SOUTHEAST1_VERTEX_REGION)
+US_CENTRAL1_VERTEX_REGION = "us-central1"
+REGIONAL_VERTEX_REGIONS = (
+    EUROPE_WEST2_VERTEX_REGION,
+    ASIA_SOUTHEAST1_VERTEX_REGION,
+    US_CENTRAL1_VERTEX_REGION,
+)
 EUROPE_WEST2_ARGON_MAX_CONCURRENCY = 5
+REGIONAL_COLD_PREFILL_MAX_CONCURRENCY = 2
+REGIONAL_COLD_PREFILL_MIN_TOKENS = 25_000
 EUROPE_WEST2_MAX_ACTIVE_SESSIONS = 8
 ASIA_SOUTHEAST1_MAX_ACTIVE_SESSIONS = 8
+US_CENTRAL1_MAX_ACTIVE_SESSIONS = 8
 EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS = 180.0
 EUROPE_WEST2_COOLDOWN_SECONDS = 15.0
 EUROPE_WEST2_COOLDOWN_TAIL_WAIT_SECONDS = 15.0
@@ -82,6 +90,9 @@ _EUROPE_WEST2_ARGON_SEMAPHORE = getattr(
 _ASIA_SOUTHEAST1_ARGON_SEMAPHORE = getattr(
     _prev_vertex_mod, "_ASIA_SOUTHEAST1_ARGON_SEMAPHORE", None
 ) or threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
+_US_CENTRAL1_ARGON_SEMAPHORE = getattr(
+    _prev_vertex_mod, "_US_CENTRAL1_ARGON_SEMAPHORE", None
+) or threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
 _EUROPE_WEST2_STATE_LOCK = getattr(
     _prev_vertex_mod, "_EUROPE_WEST2_STATE_LOCK", None
 ) or threading.Lock()
@@ -90,6 +101,13 @@ _europe_west2_cooldown_until: float = float(
 )
 _asia_southeast1_cooldown_until: float = float(
     getattr(_prev_vertex_mod, "_asia_southeast1_cooldown_until", 0.0) or 0.0
+)
+_us_central1_cooldown_until: float = float(
+    getattr(_prev_vertex_mod, "_us_central1_cooldown_until", 0.0) or 0.0
+)
+_prev_cold_in_flight = getattr(_prev_vertex_mod, "_cold_prefill_in_flight", None)
+_cold_prefill_in_flight: dict[str, int] = (
+    _prev_cold_in_flight if isinstance(_prev_cold_in_flight, dict) else {}
 )
 _prev_affinity = getattr(_prev_vertex_mod, "_session_region_affinity", None)
 _session_region_affinity: dict[str, str] = (
@@ -146,6 +164,84 @@ def is_vertex_global_only_model(model: Optional[str]) -> bool:
     )
 
 
+def _shared_router_state_path() -> str:
+    env_p = os.environ.get("HERMES_VERTEX_SHARED_STATE_PATH")
+    if env_p:
+        return env_p
+    return os.path.expanduser("~/.hermes/cache/scratch/vertex-regional-router-state.json")
+
+
+_peer_cd_cache_ts: float = 0.0
+_peer_cd_cache_data: dict[str, dict[str, float]] = {}
+
+
+def _write_shared_cooldown(region: str, cooldown_seconds: float) -> None:
+    global _peer_cd_cache_ts
+    if cooldown_seconds <= 0.0:
+        return
+    path = _shared_router_state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data: dict[str, Any] = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    data = loaded
+        cd_map = data.get("cooldowns")
+        if not isinstance(cd_map, dict):
+            cd_map = {}
+        cd_map[region] = {
+            "until_wall": time.time() + float(cooldown_seconds),
+            "pid": os.getpid(),
+        }
+        data["cooldowns"] = cd_map
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+        _peer_cd_cache_ts = 0.0
+    except Exception:
+        pass
+
+
+def _clear_shared_cooldowns() -> None:
+    global _peer_cd_cache_ts, _peer_cd_cache_data
+    _peer_cd_cache_ts = 0.0
+    _peer_cd_cache_data = {}
+    path = _shared_router_state_path()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _peer_cooldown_remaining(region: str) -> float:
+    global _peer_cd_cache_ts, _peer_cd_cache_data
+    now_mono = time.monotonic()
+    if (now_mono - _peer_cd_cache_ts) > 0.25:
+        _peer_cd_cache_ts = now_mono
+        path = _shared_router_state_path()
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                cd_map = loaded.get("cooldowns") if isinstance(loaded, dict) else None
+                _peer_cd_cache_data = cd_map if isinstance(cd_map, dict) else {}
+            else:
+                _peer_cd_cache_data = {}
+        except Exception:
+            _peer_cd_cache_data = {}
+    entry = _peer_cd_cache_data.get(region)
+    if not isinstance(entry, dict):
+        return 0.0
+    if int(entry.get("pid", 0) or 0) == os.getpid():
+        return 0.0
+    until_wall = float(entry.get("until_wall", 0.0) or 0.0)
+    return max(0.0, until_wall - time.time())
+
+
 def record_vertex_regional_429(
     cooldown_seconds: float = EUROPE_WEST2_COOLDOWN_SECONDS,
     *,
@@ -153,27 +249,38 @@ def record_vertex_regional_429(
     last_prompt_tokens: int = 0,
 ) -> float:
     """Trip the regional 429 cooldown so subsequent calls route to locations/global."""
-    global _europe_west2_cooldown_until, _asia_southeast1_cooldown_until
+    global _europe_west2_cooldown_until, _asia_southeast1_cooldown_until, _us_central1_cooldown_until
     now = time.monotonic()
     raw_sid = str(session_id or "").strip()
     canon_sid = _canonical_affinity_session_id(raw_sid) if raw_sid else None
     demote_repeat_striker = False
+    tripped_region: Optional[str] = None
     with _EUROPE_WEST2_STATE_LOCK:
         pinned_before = _session_region_affinity.get(canon_sid) if canon_sid else None
         is_ase1_session = pinned_before == ASIA_SOUTHEAST1_VERTEX_REGION
+        is_usc1_session = pinned_before == US_CENTRAL1_VERTEX_REGION
         is_non_ew2_session = bool(
             pinned_before != EUROPE_WEST2_VERTEX_REGION
             and (
                 raw_sid.startswith(("cron_", "subagent_"))
                 or (bool(canon_sid) and canon_sid in _non_interactive_session_ids)
-                or pinned_before in (GLOBAL_VERTEX_REGION, ASIA_SOUTHEAST1_VERTEX_REGION)
+                or pinned_before in (
+                    GLOBAL_VERTEX_REGION,
+                    ASIA_SOUTHEAST1_VERTEX_REGION,
+                    US_CENTRAL1_VERTEX_REGION,
+                )
             )
         )
         target = now + max(0.0, float(cooldown_seconds))
         if is_ase1_session:
             _asia_southeast1_cooldown_until = max(_asia_southeast1_cooldown_until, target)
+            tripped_region = ASIA_SOUTHEAST1_VERTEX_REGION
+        elif is_usc1_session:
+            _us_central1_cooldown_until = max(_us_central1_cooldown_until, target)
+            tripped_region = US_CENTRAL1_VERTEX_REGION
         elif not is_non_ew2_session:
             _europe_west2_cooldown_until = max(_europe_west2_cooldown_until, target)
+            tripped_region = EUROPE_WEST2_VERTEX_REGION
         if canon_sid and pinned_before in REGIONAL_VERTEX_REGIONS:
             prev_count, first_ts = _session_regional_429_strikes.get(canon_sid, (0, now))
             if (now - first_ts) > REGIONAL_429_STRIKE_WINDOW_SECONDS:
@@ -185,6 +292,8 @@ def record_vertex_regional_429(
             if strikes >= REGIONAL_429_MAX_STRIKES:
                 demote_repeat_striker = True
         until = _europe_west2_cooldown_until
+    if tripped_region:
+        _write_shared_cooldown(tripped_region, float(cooldown_seconds))
     if (
         raw_sid
         and ":bg-review:" not in raw_sid
@@ -201,27 +310,41 @@ def record_vertex_regional_429(
 def vertex_regional_cooldown_remaining() -> float:
     """Seconds remaining on the europe-west2 429 cooldown (0.0 when ready)."""
     with _EUROPE_WEST2_STATE_LOCK:
-        return max(0.0, _europe_west2_cooldown_until - time.monotonic())
+        local_rem = max(0.0, _europe_west2_cooldown_until - time.monotonic())
+    return max(local_rem, _peer_cooldown_remaining(EUROPE_WEST2_VERTEX_REGION))
 
 
 def vertex_asia_southeast1_cooldown_remaining() -> float:
     """Seconds remaining on the asia-southeast1 429 cooldown (0.0 when ready)."""
     with _EUROPE_WEST2_STATE_LOCK:
-        return max(0.0, _asia_southeast1_cooldown_until - time.monotonic())
+        local_rem = max(0.0, _asia_southeast1_cooldown_until - time.monotonic())
+    return max(local_rem, _peer_cooldown_remaining(ASIA_SOUTHEAST1_VERTEX_REGION))
+
+
+def vertex_us_central1_cooldown_remaining() -> float:
+    """Seconds remaining on the us-central1 429 cooldown (0.0 when ready)."""
+    with _EUROPE_WEST2_STATE_LOCK:
+        local_rem = max(0.0, _us_central1_cooldown_until - time.monotonic())
+    return max(local_rem, _peer_cooldown_remaining(US_CENTRAL1_VERTEX_REGION))
 
 
 def reset_vertex_hybrid_router_state() -> None:
     """Reset cooldown, session affinity, and semaphore state (used by unit tests)."""
-    global _europe_west2_cooldown_until, _asia_southeast1_cooldown_until, _EUROPE_WEST2_ARGON_SEMAPHORE, _ASIA_SOUTHEAST1_ARGON_SEMAPHORE
+    global _europe_west2_cooldown_until, _asia_southeast1_cooldown_until, _us_central1_cooldown_until
+    global _EUROPE_WEST2_ARGON_SEMAPHORE, _ASIA_SOUTHEAST1_ARGON_SEMAPHORE, _US_CENTRAL1_ARGON_SEMAPHORE
     with _EUROPE_WEST2_STATE_LOCK:
         _europe_west2_cooldown_until = 0.0
         _asia_southeast1_cooldown_until = 0.0
+        _us_central1_cooldown_until = 0.0
         _EUROPE_WEST2_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
         _ASIA_SOUTHEAST1_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
+        _US_CENTRAL1_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
+        _cold_prefill_in_flight.clear()
         _session_region_affinity.clear()
         _session_region_last_seen.clear()
         _session_regional_429_strikes.clear()
         _non_interactive_session_ids.clear()
+    _clear_shared_cooldowns()
 
 
 def _canonical_affinity_session_id(session_id: Optional[str]) -> Optional[str]:
@@ -301,6 +424,54 @@ def get_active_asia_southeast1_session_count(now_monotonic: Optional[float] = No
         )
 
 
+def get_active_us_central1_session_count(now_monotonic: Optional[float] = None) -> int:
+    """Return number of sessions pinned to us-central1 active within the TTL window."""
+    now_val = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    with _EUROPE_WEST2_STATE_LOCK:
+        return sum(
+            1
+            for s, r in _session_region_affinity.items()
+            if r == US_CENTRAL1_VERTEX_REGION
+            and (now_val - _session_region_last_seen.get(s, now_val)) <= EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS
+        )
+
+
+def _region_cooldown_remaining(region: str) -> float:
+    if region == EUROPE_WEST2_VERTEX_REGION:
+        return vertex_regional_cooldown_remaining()
+    if region == ASIA_SOUTHEAST1_VERTEX_REGION:
+        return vertex_asia_southeast1_cooldown_remaining()
+    if region == US_CENTRAL1_VERTEX_REGION:
+        return vertex_us_central1_cooldown_remaining()
+    return 0.0
+
+
+def _region_active_session_count(region: str) -> int:
+    if region == EUROPE_WEST2_VERTEX_REGION:
+        return get_active_europe_west2_session_count()
+    if region == ASIA_SOUTHEAST1_VERTEX_REGION:
+        return get_active_asia_southeast1_session_count()
+    if region == US_CENTRAL1_VERTEX_REGION:
+        return get_active_us_central1_session_count()
+    return 0
+
+
+def _region_max_active_sessions(region: str) -> int:
+    if region == ASIA_SOUTHEAST1_VERTEX_REGION:
+        return ASIA_SOUTHEAST1_MAX_ACTIVE_SESSIONS
+    if region == US_CENTRAL1_VERTEX_REGION:
+        return US_CENTRAL1_MAX_ACTIVE_SESSIONS
+    return EUROPE_WEST2_MAX_ACTIVE_SESSIONS
+
+
+def _region_semaphore(region: str) -> threading.BoundedSemaphore:
+    if region == ASIA_SOUTHEAST1_VERTEX_REGION:
+        return _ASIA_SOUTHEAST1_ARGON_SEMAPHORE
+    if region == US_CENTRAL1_VERTEX_REGION:
+        return _US_CENTRAL1_ARGON_SEMAPHORE
+    return _EUROPE_WEST2_ARGON_SEMAPHORE
+
+
 def _record_session_vertex_region_affinity(session_id: Optional[str], region: str) -> None:
     sid = _canonical_affinity_session_id(session_id)
     if not sid:
@@ -331,43 +502,39 @@ def acquire_vertex_hybrid_region(
     session_id: Optional[str] = None,
     sticky_wait_seconds: Optional[float] = None,
     last_prompt_tokens: int = 0,
+    uncached_prompt_tokens: int = 0,
 ) -> tuple[str, bool]:
     """Select the Vertex region for a single request and optionally acquire a regional slot.
 
     Returns ``(region, slot_acquired)``:
     - ``gemini-3.8-flash`` / ``gemini-3*`` -> always ``("global", False)`` (HTTP 404 on europe-west2).
-    - ``gemini-4-argon`` when ``interactive=True`` (or ``:bg-review:`` for an ``europe-west2`` parent)
-      and configured region is ``global`` or ``europe-west2`` -> tries checkout of
-      ``_EUROPE_WEST2_ARGON_SEMAPHORE`` (max 5) when not in a 429 cooldown window. When *session_id*
-      is already pinned to ``europe-west2``, waits up to ``sticky_wait_seconds`` (default 8.0s) for a
-      regional slot before spilling to ``global``. Once a session runs on ``global``, it stays pinned
-      to ``global`` for the rest of the compaction epoch (until ``last_prompt_tokens == -1`` or
-      ``reset_vertex_sticky_region`` after compaction) so mid-epoch region jumps never wipe KV caches.
+    - ``gemini-4-argon`` when ``interactive=True`` (or ``:bg-review:`` for a regional parent)
+      and configured region is ``global`` or one of ``REGIONAL_VERTEX_REGIONS`` -> tries checkout of
+      a regional semaphore (max 5 per region across europe-west2, asia-southeast1, us-central1 = 24
+      sticky active sessions total) when not in a 429 cooldown window. Cold prefills (>=25k uncached
+      tokens on unpinned/rotated sessions) are capped at 2 concurrent per region before spilling to
+      the next regional macro-cluster.
     - All other models/regions -> ``(configured_region or "global", False)``.
     """
     reg = (configured_region or DEFAULT_REGION).strip() or DEFAULT_REGION
     if is_vertex_global_only_model(model):
         return (GLOBAL_VERTEX_REGION, False)
     prompt_tok = int(last_prompt_tokens or 0)
+    uncached_tok = int(uncached_prompt_tokens or 0)
     raw_sid = str(session_id or "")
     pinned_region = get_session_vertex_region_affinity(session_id)
     if prompt_tok == -1:
-        if pinned_region == GLOBAL_VERTEX_REGION:
-            reset_vertex_sticky_region(session_id)
-            pinned_region = None
-        if (
-            pinned_region == EUROPE_WEST2_VERTEX_REGION
-            and get_active_europe_west2_session_count() > EUROPE_WEST2_MAX_ACTIVE_SESSIONS
-        ):
-            reset_vertex_sticky_region(session_id)
-            pinned_region = None
-        if (
-            pinned_region == ASIA_SOUTHEAST1_VERTEX_REGION
-            and get_active_asia_southeast1_session_count() > ASIA_SOUTHEAST1_MAX_ACTIVE_SESSIONS
+        if pinned_region == GLOBAL_VERTEX_REGION or (
+            pinned_region in REGIONAL_VERTEX_REGIONS
+            and _region_active_session_count(pinned_region) > _region_max_active_sessions(pinned_region)
         ):
             reset_vertex_sticky_region(session_id)
             pinned_region = None
         prompt_tok = 0
+    is_cold_prefill = bool(
+        uncached_tok >= REGIONAL_COLD_PREFILL_MIN_TOKENS
+        and (pinned_region is None or prompt_tok <= 0)
+    )
     canon_sid = _canonical_affinity_session_id(raw_sid) if raw_sid else None
     is_bg_review_for_ew2_parent = (
         pinned_region in REGIONAL_VERTEX_REGIONS
@@ -398,27 +565,30 @@ def acquire_vertex_hybrid_region(
             target_region = (
                 pinned_region
                 if pinned_region in REGIONAL_VERTEX_REGIONS
-                else ASIA_SOUTHEAST1_VERTEX_REGION
-                if reg == ASIA_SOUTHEAST1_VERTEX_REGION
+                else reg
+                if reg in REGIONAL_VERTEX_REGIONS
                 else EUROPE_WEST2_VERTEX_REGION
             )
-            if pinned_region is None and target_region == EUROPE_WEST2_VERTEX_REGION:
-                ew2_active = get_active_europe_west2_session_count()
-                if ew2_active >= EUROPE_WEST2_MAX_ACTIVE_SESSIONS:
-                    target_region = ASIA_SOUTHEAST1_VERTEX_REGION
-            if pinned_region is None and target_region == ASIA_SOUTHEAST1_VERTEX_REGION:
-                ase1_active = get_active_asia_southeast1_session_count()
-                if ase1_active >= ASIA_SOUTHEAST1_MAX_ACTIVE_SESSIONS:
+            if pinned_region is None:
+                candidate_order = [target_region] + [
+                    r for r in REGIONAL_VERTEX_REGIONS if r != target_region
+                ]
+                selected_region: Optional[str] = None
+                for cand in candidate_order:
+                    if _region_active_session_count(cand) >= _region_max_active_sessions(cand):
+                        continue
+                    if is_cold_prefill:
+                        with _EUROPE_WEST2_STATE_LOCK:
+                            if _cold_prefill_in_flight.get(cand, 0) >= REGIONAL_COLD_PREFILL_MAX_CONCURRENCY:
+                                continue
+                    selected_region = cand
+                    break
+                if selected_region is None:
                     if session_id:
                         _record_session_vertex_region_affinity(session_id, GLOBAL_VERTEX_REGION)
                     return (GLOBAL_VERTEX_REGION, False)
-            cd_rem = (
-                vertex_regional_cooldown_remaining()
-                if target_region == EUROPE_WEST2_VERTEX_REGION
-                else vertex_asia_southeast1_cooldown_remaining()
-                if target_region == ASIA_SOUTHEAST1_VERTEX_REGION
-                else 0.0
-            )
+                target_region = selected_region
+            cd_rem = _region_cooldown_remaining(target_region)
             is_deep_regional_sticky = (
                 pinned_region in REGIONAL_VERTEX_REGIONS
                 and prompt_tok >= GLOBAL_STICKY_EPOCH_MIN_TOKENS
@@ -441,19 +611,9 @@ def acquire_vertex_hybrid_region(
                 cd_slept_total += sleep_chunk
                 if sticky_wait_seconds is not None:
                     wait_s = max(0.0, wait_s - sleep_chunk)
-                cd_rem = (
-                    vertex_regional_cooldown_remaining()
-                    if target_region == EUROPE_WEST2_VERTEX_REGION
-                    else vertex_asia_southeast1_cooldown_remaining()
-                    if target_region == ASIA_SOUTHEAST1_VERTEX_REGION
-                    else 0.0
-                )
+                cd_rem = _region_cooldown_remaining(target_region)
             if cd_rem <= 0.0:
-                sem = (
-                    _ASIA_SOUTHEAST1_ARGON_SEMAPHORE
-                    if target_region == ASIA_SOUTHEAST1_VERTEX_REGION
-                    else _EUROPE_WEST2_ARGON_SEMAPHORE
-                )
+                sem = _region_semaphore(target_region)
                 sem_wait_s = (
                     max(wait_s, EUROPE_WEST2_DEEP_SEMAPHORE_WAIT_SECONDS)
                     if (is_deep_regional_sticky and sticky_wait_seconds is None)
@@ -467,28 +627,27 @@ def acquire_vertex_hybrid_region(
                 else:
                     acquired = sem.acquire(blocking=False)
                 if not acquired and pinned_region is None and interactive and bool(session_id):
-                    alt_region = (
-                        ASIA_SOUTHEAST1_VERTEX_REGION
-                        if target_region == EUROPE_WEST2_VERTEX_REGION
-                        else EUROPE_WEST2_VERTEX_REGION
-                    )
-                    alt_ok = (
-                        vertex_asia_southeast1_cooldown_remaining() <= 0.0
-                        and get_active_asia_southeast1_session_count() < ASIA_SOUTHEAST1_MAX_ACTIVE_SESSIONS
-                        if alt_region == ASIA_SOUTHEAST1_VERTEX_REGION
-                        else vertex_regional_cooldown_remaining() <= 0.0
-                        and get_active_europe_west2_session_count() < EUROPE_WEST2_MAX_ACTIVE_SESSIONS
-                    )
-                    if alt_ok:
-                        alt_sem = (
-                            _ASIA_SOUTHEAST1_ARGON_SEMAPHORE
-                            if alt_region == ASIA_SOUTHEAST1_VERTEX_REGION
-                            else _EUROPE_WEST2_ARGON_SEMAPHORE
-                        )
-                        if alt_sem.acquire(blocking=False):
+                    for alt_region in REGIONAL_VERTEX_REGIONS:
+                        if alt_region == target_region:
+                            continue
+                        if _region_cooldown_remaining(alt_region) > 0.0:
+                            continue
+                        if _region_active_session_count(alt_region) >= _region_max_active_sessions(alt_region):
+                            continue
+                        if is_cold_prefill:
+                            with _EUROPE_WEST2_STATE_LOCK:
+                                if _cold_prefill_in_flight.get(alt_region, 0) >= REGIONAL_COLD_PREFILL_MAX_CONCURRENCY:
+                                    continue
+                        if _region_semaphore(alt_region).acquire(blocking=False):
                             target_region = alt_region
                             acquired = True
+                            break
                 if acquired:
+                    if is_cold_prefill:
+                        with _EUROPE_WEST2_STATE_LOCK:
+                            _cold_prefill_in_flight[target_region] = (
+                                _cold_prefill_in_flight.get(target_region, 0) + 1
+                            )
                     _record_session_vertex_region_affinity(session_id, target_region)
                     return (target_region, True)
             if session_id and (
@@ -520,13 +679,16 @@ def release_vertex_hybrid_slot(client: Any) -> bool:
         client._vertex_regional_slot_region = None
     except Exception:
         pass
-    sem = (
-        _ASIA_SOUTHEAST1_ARGON_SEMAPHORE
-        if slot_region == ASIA_SOUTHEAST1_VERTEX_REGION
-        else _EUROPE_WEST2_ARGON_SEMAPHORE
+    resolved_region = (
+        slot_region if slot_region in REGIONAL_VERTEX_REGIONS else EUROPE_WEST2_VERTEX_REGION
     )
+    sem = _region_semaphore(resolved_region)
     try:
         sem.release()
+        with _EUROPE_WEST2_STATE_LOCK:
+            cur_cold = _cold_prefill_in_flight.get(resolved_region, 0)
+            if cur_cold > 0:
+                _cold_prefill_in_flight[resolved_region] = cur_cold - 1
         return True
     except ValueError:
         return False

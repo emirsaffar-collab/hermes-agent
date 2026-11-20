@@ -636,6 +636,11 @@ CREATE INDEX IF NOT EXISTS idx_state_meta_local_policy_lineage
 CREATE INDEX IF NOT EXISTS idx_state_meta_local_policy_special
     ON state_meta(key)
     WHERE {NONDEFAULT_POLICY_WHERE};
+CREATE INDEX IF NOT EXISTS idx_state_meta_terminal_api_request
+    ON state_meta(json_extract(value, '$.request_id'))
+    WHERE key GLOB 'gateway.terminal_admission.v1.*'
+      AND json_valid(value)
+      AND json_extract(value, '$.principal_id') = 'api';
 CREATE INDEX IF NOT EXISTS idx_sessions_end_reason
     ON sessions(end_reason, id)
     WHERE end_reason IS NOT NULL;

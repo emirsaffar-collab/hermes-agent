@@ -111,6 +111,14 @@ def test_vertex_regional_ttfb_stale_cap_is_150s_while_post_chunk_and_global_stay
     diag["first_chunk_at"] = 1002.0
     assert call._effective_stale_timeout() == 600.0
 
+    # On cron / run_budget_seconds-bounded Vertex runs, Phase-2 post_chunk also caps at 150s
+    # so a post-chunk stream stall cannot eat 470s+ and trip the 600s cron wall-clock timeout.
+    call.agent.platform = "cron"
+    assert call._effective_stale_timeout() == 150.0
+    call.agent.platform = "desktop"
+    call.agent.run_budget_seconds = 600.0
+    assert call._effective_stale_timeout() == 150.0
+
 
 def test_vertex_warmer_prompt_split_and_credential_refresh(monkeypatch):
     """Vertex implicit prefix caching never reports cache_write_tokens; _prompt_split treats

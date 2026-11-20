@@ -398,7 +398,8 @@ def test_cron_or_global_session_429_does_not_poison_europe_west2_cooldown():
     assert (r, acq) == (vertex_adapter.EUROPE_WEST2_VERTEX_REGION, True)
     assert vertex_adapter.release_vertex_hybrid_slot(SimpleNamespace(_vertex_regional_slot_held=True)) is True
 
-    # When both europe-west2 (8) and asia-southeast1 (8) hit active-session cap, 17th session spills to global
+    # When both europe-west2 (8) and asia-southeast1 (8) hit active-session cap, 17th session routes to us-central1 (8),
+    # and once all 3 regional pools (24 active sessions) are full, the 25th session spills to global.
     vertex_adapter.reset_vertex_hybrid_router_state()
     for i in range(vertex_adapter.EUROPE_WEST2_MAX_ACTIVE_SESSIONS):
         vertex_adapter._record_session_vertex_region_affinity(
@@ -414,10 +415,126 @@ def test_cron_or_global_session_429_does_not_poison_europe_west2_cooldown():
         interactive=True,
         session_id="overflow_17",
     )
-    assert (r_17, acq_17) == (vertex_adapter.GLOBAL_VERTEX_REGION, False)
+    assert (r_17, acq_17) == (vertex_adapter.US_CENTRAL1_VERTEX_REGION, True)
     assert (
         vertex_adapter.get_session_vertex_region_affinity("overflow_17")
+        == vertex_adapter.US_CENTRAL1_VERTEX_REGION
+    )
+    assert vertex_adapter.release_vertex_hybrid_slot(
+        SimpleNamespace(
+            _vertex_regional_slot_held=True,
+            _vertex_regional_slot_region=vertex_adapter.US_CENTRAL1_VERTEX_REGION,
+        )
+    ) is True
+    for i in range(1, vertex_adapter.US_CENTRAL1_MAX_ACTIVE_SESSIONS):
+        vertex_adapter._record_session_vertex_region_affinity(
+            f"usc1_cap_{i}", vertex_adapter.US_CENTRAL1_VERTEX_REGION
+        )
+    r_25, acq_25 = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="overflow_25",
+    )
+    assert (r_25, acq_25) == (vertex_adapter.GLOBAL_VERTEX_REGION, False)
+    assert (
+        vertex_adapter.get_session_vertex_region_affinity("overflow_25")
         == vertex_adapter.GLOBAL_VERTEX_REGION
     )
+
+
+def test_cold_prefill_gate_distributes_across_three_regional_clusters_and_shares_peer_cooldown(
+    tmp_path, monkeypatch
+):
+    """Simultaneous cold prefills (>=25k uncached tokens) must be capped at 2 per
+    regional cluster (2 in europe-west2, 2 in asia-southeast1, 2 in us-central1 = 6
+    concurrent cold prefills total) before spilling to global, and peer-process 429
+    cooldowns written to HERMES_VERTEX_SHARED_STATE_PATH must be respected cross-process."""
+    import json
+    import time
+
+    shared_file = tmp_path / "vertex-shared-router.json"
+    monkeypatch.setenv("HERMES_VERTEX_SHARED_STATE_PATH", str(shared_file))
+    vertex_adapter.reset_vertex_hybrid_router_state()
+
+    cold_holders = []
+    regions_seen = []
+    for idx in range(6):
+        reg, acq = vertex_adapter.acquire_vertex_hybrid_region(
+            "google/gemini-4-argon",
+            configured_region="global",
+            interactive=True,
+            session_id=f"cold_sess_{idx}",
+            uncached_prompt_tokens=160_000,
+        )
+        assert acq is True
+        regions_seen.append(reg)
+        cold_holders.append(
+            SimpleNamespace(
+                _vertex_regional_slot_held=True,
+                _vertex_regional_slot_region=reg,
+            )
+        )
+
+    assert regions_seen == [
+        vertex_adapter.EUROPE_WEST2_VERTEX_REGION,
+        vertex_adapter.EUROPE_WEST2_VERTEX_REGION,
+        vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION,
+        vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION,
+        vertex_adapter.US_CENTRAL1_VERTEX_REGION,
+        vertex_adapter.US_CENTRAL1_VERTEX_REGION,
+    ]
+
+    # 7th simultaneous cold prefill spills to global because all 3 regions have 2 cold prefills in-flight
+    r7, acq7 = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="cold_sess_7",
+        uncached_prompt_tokens=160_000,
+    )
+    assert (r7, acq7) == (vertex_adapter.GLOBAL_VERTEX_REGION, False)
+
+    # Warm turn on cold_sess_0 (already pinned to europe-west2, uncached_prompt_tokens=0) still acquires slot #3 on europe-west2!
+    r_warm, acq_warm = vertex_adapter.acquire_vertex_hybrid_region(
+        "google/gemini-4-argon",
+        configured_region="global",
+        interactive=True,
+        session_id="cold_sess_0",
+        last_prompt_tokens=160_000,
+        uncached_prompt_tokens=0,
+    )
+    assert (r_warm, acq_warm) == (vertex_adapter.EUROPE_WEST2_VERTEX_REGION, True)
+    assert (
+        vertex_adapter.release_vertex_hybrid_slot(
+            SimpleNamespace(
+                _vertex_regional_slot_held=True,
+                _vertex_regional_slot_region=vertex_adapter.EUROPE_WEST2_VERTEX_REGION,
+            )
+        )
+        is True
+    )
+
+    for h in cold_holders:
+        assert vertex_adapter.release_vertex_hybrid_slot(h) is True
+
+    # Simulate peer process (pid=999999) recording a 429 cooldown on europe-west2
+    shared_file.write_text(
+        json.dumps(
+            {
+                "cooldowns": {
+                    vertex_adapter.EUROPE_WEST2_VERTEX_REGION: {
+                        "until_wall": time.time() + 12.0,
+                        "pid": 999999,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    vertex_adapter._peer_cd_cache_ts = 0.0
+    assert vertex_adapter.vertex_regional_cooldown_remaining() > 5.0
+    vertex_adapter.reset_vertex_hybrid_router_state()
+
 
 

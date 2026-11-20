@@ -525,14 +525,17 @@ class ClientLifecycleMixin:
                 project_id, configured_region = parsed_vertex
                 _cc = getattr(self, "context_compressor", None)
                 _last_prompt_tok = int(getattr(_cc, "last_prompt_tokens", 0) or 0) if _cc is not None else 0
+                _pressure_tok = max(0, int(getattr(self, "_last_assembled_request_pressure_tokens", 0) or 0))
+                _uncached_tok = _pressure_tok if _last_prompt_tok <= 0 else 0
                 if _last_prompt_tok == 0:
-                    _last_prompt_tok = max(0, int(getattr(self, "_last_assembled_request_pressure_tokens", 0) or 0))
+                    _last_prompt_tok = _pressure_tok
                 target_region, slot_held = acquire_vertex_hybrid_region(
                     req_model,
                     configured_region=configured_region,
                     interactive=is_interactive,
                     session_id=getattr(self, "session_id", None),
                     last_prompt_tokens=_last_prompt_tok,
+                    uncached_prompt_tokens=_uncached_tok,
                 )
                 routed_base_url = build_vertex_base_url(project_id, target_region)
                 request_kwargs["base_url"] = routed_base_url
@@ -559,6 +562,7 @@ class ClientLifecycleMixin:
                     for h in (
                         "europe-west2-aiplatform.googleapis.com",
                         "asia-southeast1-aiplatform.googleapis.com",
+                        "us-central1-aiplatform.googleapis.com",
                     )
                 ):
                     target_slot = _OPENAI_GLOBAL_FALLBACK_SLOT
@@ -597,18 +601,15 @@ class ClientLifecycleMixin:
             return client
         except BaseException:
             if slot_held:
-                from agent.vertex_adapter import (
-                    ASIA_SOUTHEAST1_VERTEX_REGION,
-                    _ASIA_SOUTHEAST1_ARGON_SEMAPHORE,
-                    _EUROPE_WEST2_ARGON_SEMAPHORE,
-                )
-                sem = (
-                    _ASIA_SOUTHEAST1_ARGON_SEMAPHORE
-                    if target_region == ASIA_SOUTHEAST1_VERTEX_REGION
-                    else _EUROPE_WEST2_ARGON_SEMAPHORE
-                )
-                with suppress(ValueError):
-                    sem.release()
+                from types import SimpleNamespace as _SimpleNamespace
+                from agent.vertex_adapter import release_vertex_hybrid_slot
+                with suppress(Exception):
+                    release_vertex_hybrid_slot(
+                        _SimpleNamespace(
+                            _vertex_regional_slot_held=True,
+                            _vertex_regional_slot_region=target_region,
+                        )
+                    )
             raise
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:

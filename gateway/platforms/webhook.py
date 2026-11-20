@@ -12,6 +12,9 @@ replay protection; body-only V1 is rejected because its signature never expires.
 import asyncio
 import base64
 import binascii
+from concurrent.futures import ThreadPoolExecutor
+import contextvars
+import functools
 import hashlib
 import hmac
 import json
@@ -78,6 +81,17 @@ _TEMPLATE_KEY_RE = re.compile(r"\{([a-zA-Z0-9_.]+)\}")
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 # Credentials `gh` reads; a routed profile's github_comment must use its own, never the process env's.
 _GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+_WEBHOOK_SCRIPT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="webhook-script")
+
+
+async def _run_webhook_script_isolated(func, *args) -> tuple[bool, Any]:
+    """Run a route script on a dedicated bounded pool so webhook bursts cannot starve
+    the default asyncio thread pool used by state.db authority transactions."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(
+        _WEBHOOK_SCRIPT_EXECUTOR, functools.partial(ctx.run, func, *args)
+    )
 
 
 def _header_delivery_id(headers) -> str:
@@ -867,9 +881,10 @@ class WebhookAdapter(BasePlatformAdapter):
         with self._profile_scope(profile):
             script = route_config.get("script")
             if script:
-                # Shells out (up to its timeout) — worker thread so the loop isn't blocked; to_thread
-                # copies contextvars so the profile scope follows.
-                keep, transformed_payload = await asyncio.to_thread(
+                # Shells out (up to its timeout) — dedicated bounded worker pool so the loop and the
+                # default asyncio thread pool (used by state.db writes) aren't starved; copies
+                # contextvars so the profile scope follows.
+                keep, transformed_payload = await _run_webhook_script_isolated(
                     self._route_processor.run_route_script, script, payload)
                 if not keep:
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
