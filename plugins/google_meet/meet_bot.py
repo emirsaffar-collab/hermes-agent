@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import itertools
+import json
 import os
 import re
 import shutil
@@ -205,6 +206,16 @@ class _BotState:
         elif vcmd == "leave_call":
             self.leave_reason = "voice_command_leave"
             print(f"[meet_bot] voice_control=leave_call by={speaker!r}", flush=True)
+        elif _WAKE_ADDRESS_RE.search(text):
+            try:
+                out_dir_path = getattr(self, "out_dir", None)
+                if isinstance(out_dir_path, Path):
+                    q_path = out_dir_path / "interactive_questions.jsonl"
+                    with q_path.open("a", encoding="utf-8") as qf:
+                        qf.write(json.dumps({"ts": now_ts, "speaker": speaker, "text": text}, ensure_ascii=False) + "\n")
+                    print(f"[meet_bot] interactive_question queued by={speaker!r} text={text!r}", flush=True)
+            except (OSError, TypeError, ValueError):
+                pass
         if getattr(self, "paused_capture", False):
             return
         self.transcript_lines += 1
@@ -251,17 +262,100 @@ class _BotState:
 # plan), so per-stream transcription doubles as speaker separation.
 _RTC_HOOK_JS = r"""
 (() => {
+  if (!navigator.mediaDevices) {
+    try { Object.defineProperty(navigator, 'mediaDevices', { value: {}, configurable: true }); } catch (e) {}
+  }
   if (navigator.mediaDevices && !window.__hermesSynthMedia) {
     window.__hermesSynthMedia = true;
     const makeAudioTrack = () => {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = window.__hermesMicCtx || new (window.AudioContext || window.webkitAudioContext)();
+      window.__hermesMicCtx = ctx;
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       gain.gain.value = 0.0;
-      const dst = ctx.createMediaStreamDestination();
+      const dst = window.__hermesMicDest || ctx.createMediaStreamDestination();
+      window.__hermesMicDest = dst;
       osc.connect(gain);
       gain.connect(dst);
       osc.start();
+      window.__hermesStopTts = () => {
+        try {
+          if (window.__hermesActiveTtsSource) {
+            window.__hermesActiveTtsSource.stop();
+            window.__hermesActiveTtsSource.disconnect();
+            window.__hermesActiveTtsSource = null;
+          }
+          window.__hermesTtsPlaying = false;
+          return true;
+        } catch (e) { return false; }
+      };
+      window.__hermesAutoBargeInState = window.__hermesAutoBargeInState || {
+        triggeredCount: 0,
+        lastSpeaker: null,
+        lastRms: 0.0,
+        stoppedBotSpeech: false
+      };
+      window.__hermesIngestColleagueWavBase64 = async (b64, speakerTag) => {
+        try {
+          if (ctx.state === 'suspended') await ctx.resume();
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const audioBuf = await ctx.decodeAudioData(bytes.buffer.slice(0));
+          const chan = audioBuf.getChannelData(0);
+          let sumSq = 0.0;
+          const step = Math.max(1, Math.floor(chan.length / 4000));
+          let count = 0;
+          for (let i = 0; i < chan.length; i += step) {
+            sumSq += chan[i] * chan[i];
+            count++;
+          }
+          const rms = count > 0 ? Math.sqrt(sumSq / count) : 0.0;
+          let autoStopped = false;
+          if (rms > 0.015 && window.__hermesTtsPlaying) {
+            window.__hermesStopTts();
+            autoStopped = !window.__hermesTtsPlaying;
+            window.__hermesAutoBargeInState.triggeredCount += 1;
+            window.__hermesAutoBargeInState.lastSpeaker = speakerTag || 'remote_colleague';
+            window.__hermesAutoBargeInState.lastRms = Number(rms.toFixed(4));
+            window.__hermesAutoBargeInState.stoppedBotSpeech = autoStopped;
+          }
+          return {
+            ok: true,
+            speaker: speakerTag || 'remote_colleague',
+            rms: Number(rms.toFixed(4)),
+            autoStoppedBotSpeech: autoStopped
+          };
+        } catch (e) {
+          return { ok: false, error: String(e) };
+        }
+      };
+      window.__hermesPlayWavBase64 = async (b64) => {
+        try {
+          if (ctx.state === 'suspended') await ctx.resume();
+          window.__hermesStopTts();
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const audioBuf = await ctx.decodeAudioData(bytes.buffer.slice(0));
+          const src = ctx.createBufferSource();
+          src.buffer = audioBuf;
+          src.connect(dst);
+          window.__hermesActiveTtsSource = src;
+          window.__hermesTtsPlaying = true;
+          src.onended = () => {
+            if (window.__hermesActiveTtsSource === src) {
+              window.__hermesActiveTtsSource = null;
+              window.__hermesTtsPlaying = false;
+            }
+          };
+          src.start(0);
+          return { ok: true, durationSec: audioBuf.duration, sampleRate: audioBuf.sampleRate };
+        } catch (e) {
+          window.__hermesTtsPlaying = false;
+          return { ok: false, error: String(e) };
+        }
+      };
       return dst.stream.getAudioTracks()[0];
     };
     const makeVideoTrack = () => {
@@ -1763,9 +1857,35 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                 if not cfg.rtc_audio:
                     state.record_caption(speaker=speaker, text=str(entry.get("text", "")))
                 # Barge-in: a real human spoke while we may be generating audio.
-                if (rt["session"] is not None and _looks_like_human_speaker(speaker, cfg.guest_name)
-                        and _quiet(rt["session"].cancel_response)):
-                    state.set(last_barge_in_at=now)
+                if _looks_like_human_speaker(speaker, cfg.guest_name):
+                    if rt["session"] is not None and _quiet(rt["session"].cancel_response):
+                        state.set(last_barge_in_at=now)
+                    if _quiet(page.evaluate, "Boolean(window.__hermesTtsPlaying && window.__hermesStopTts && window.__hermesStopTts())"):
+                        state.set(last_barge_in_at=now)
+            for sev in (e for e in (spk_events if isinstance(spk_events, list) else ()) if isinstance(e, dict)):
+                spk_name = str(sev.get("speaker", ""))
+                if _looks_like_human_speaker(spk_name, cfg.guest_name):
+                    if _quiet(page.evaluate, "Boolean(window.__hermesTtsPlaying && window.__hermesStopTts && window.__hermesStopTts())"):
+                        state.set(last_barge_in_at=now)
+            wav_q = cfg.out_dir / "say_wav_queue.jsonl" if cfg.out_dir else None
+            if wav_q and wav_q.is_file() and wav_q.stat().st_size > 0:
+                lines_raw = wav_q.read_text(encoding="utf-8-sig").splitlines()
+                wav_q.write_text("", encoding="utf-8")
+                for raw_line in lines_raw:
+                    if not raw_line.strip():
+                        continue
+                    item = json.loads(raw_line)
+                    b64_wav = str(item.get("wav_b64", "")).strip()
+                    if b64_wav:
+                        _ensure_mic_on(page)
+                        res = _quiet(page.evaluate, "b64 => window.__hermesPlayWavBase64 && window.__hermesPlayWavBase64(b64)", b64_wav)
+                        if isinstance(res, dict) and res.get("ok"):
+                            prev_bytes = int(getattr(state, "audio_bytes_out", 0) or 0)
+                            state.set(
+                                audio_bytes_out=prev_bytes + int(len(b64_wav) * 3 // 4),
+                                last_audio_out_at=now,
+                                realtime_ready=True,
+                            )
         except Exception:
             if page.is_closed():  # Meet reloaded or we got booted — exit rather than spin
                 state.set(leave_reason="page_closed")
