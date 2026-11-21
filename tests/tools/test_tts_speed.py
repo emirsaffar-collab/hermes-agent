@@ -46,6 +46,36 @@ class TestEdgeTtsSpeed:
         kwargs = comm_cls.call_args[1]
         assert "rate" not in kwargs
 
+    def test_auto_voice_swedish_english_polish_and_custom_override(self, tmp_path):
+        """Edge TTS auto-selects sv-SE-SofieNeural / en-US-AvaNeural / pl-PL-ZofiaNeural for
+        default/generic voices while preserving explicit custom voices."""
+        from tools.tts_tool_providers import _select_edge_voice_for_text, _generate_edge_tts
+
+        assert _select_edge_voice_for_text("Hej Emir! Lagret är klart.", "sv-SE-SofieNeural") == "sv-SE-SofieNeural"
+        assert _select_edge_voice_for_text("Hello Emir! The fleet is ready.", "sv-SE-SofieNeural") == "en-US-AvaNeural"
+        assert _select_edge_voice_for_text("Dziękuję bardzo, wszystko jest gotowe.", "sv-SE-SofieNeural") == "pl-PL-ZofiaNeural"
+        assert _select_edge_voice_for_text("Hej Emir!", "en-GB-RyanNeural") == "en-GB-RyanNeural"
+
+        mock_comm = MagicMock()
+        mock_comm.save = AsyncMock()
+        mock_edge = MagicMock()
+        mock_edge.Communicate = MagicMock(return_value=mock_comm)
+
+        with patch("tools.tts_tool._import_edge_tts", return_value=mock_edge):
+            asyncio.run(_generate_edge_tts(
+                "Hej Emir! Lagret är klart.",
+                str(tmp_path / "sv.mp3"),
+                {"edge": {"voice": "en-US-AvaMultilingualNeural"}},
+            ))
+            assert mock_edge.Communicate.call_args[1]["voice"] == "sv-SE-SofieNeural"
+
+            asyncio.run(_generate_edge_tts(
+                "Hello Emir! The fleet is ready.",
+                str(tmp_path / "en.mp3"),
+                {"edge": {"voice": "sv-SE-SofieNeural"}},
+            ))
+            assert mock_edge.Communicate.call_args[1]["voice"] == "en-US-AvaNeural"
+
 
 # ---------------------------------------------------------------------------
 # OpenAI TTS speed

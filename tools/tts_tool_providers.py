@@ -9,18 +9,22 @@ are resolved through :func:`_origin` at call time.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-from tools.tts_tool_delivery import _origin, _section, _wrap_pcm_as_wav, _write_wav_bytes_as
+from tools.tts_tool_delivery import (
+    _ffmpeg_run, _origin, _remove_quietly, _section, _wrap_pcm_as_wav, _write_wav_bytes_as,
+)
 from tools.xai_http import hermes_xai_user_agent
 
 logger = logging.getLogger("tools.tts_tool")
@@ -193,14 +197,93 @@ def _rewrite_with_auxiliary_model(
 
 
 # --- Edge TTS (free default) ---
+_EDGE_AUTO_VOICES = frozenset({
+    "",
+    "auto",
+    "en-US-AriaNeural",
+    "en-US-AvaMultilingualNeural",
+    "sv-SE-SofieNeural",
+    "en-US-AvaNeural",
+    "pl-PL-ZofiaNeural",
+})
+_EDGE_PL_CHAR_RE = re.compile(r"[ąćęłńśźżĄĆĘŁŃŚŹŻ]")
+_EDGE_PL_WORD_RE = re.compile(
+    r"\b(?:jest|nie|tak|czy|się|dla|oraz|przez|tylko|jako|bardzo|gdzie|kiedy|wszystko|proszę|dziękuję|cześć)\b",
+    re.IGNORECASE,
+)
+_EDGE_SV_CHAR_RE = re.compile(r"[åäöÅÄÖ]")
+_EDGE_SV_WORD_RE = re.compile(
+    r"\b(?:och|att|det|som|för|på|är|av|från|med|till|har|inte|om|ett|en|lagret|beslut|flottan|hej|tack|lystring|klart|uppdatering)\b",
+    re.IGNORECASE,
+)
+
+
+def _select_edge_voice_for_text(text: str, configured_voice: str) -> str:
+    """Auto-select sv-SE-SofieNeural (Swedish), en-US-AvaNeural (English), or pl-PL-ZofiaNeural
+    (Polish) when *configured_voice* is one of the default/auto voices; preserve explicit custom
+    voices unchanged."""
+    voice = str(configured_voice or "").strip()
+    if voice not in _EDGE_AUTO_VOICES:
+        return voice
+    sample = text or ""
+    if _EDGE_PL_CHAR_RE.search(sample) or _EDGE_PL_WORD_RE.search(sample):
+        return "pl-PL-ZofiaNeural"
+    if _EDGE_SV_CHAR_RE.search(sample) or _EDGE_SV_WORD_RE.search(sample):
+        return "sv-SE-SofieNeural"
+    return "en-US-AvaNeural"
+
+
+def _normalize_edge_loudness(output_path: str) -> None:
+    """Apply EBU R128 loudness normalization (I=-14 LUFS, TP=-1.0 dBTP, LRA=7, 24 kHz mono) in-place."""
+    if not output_path or not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
+        return
+    ffmpeg = (
+        shutil.which("ffmpeg")
+        or ("/opt/homebrew/bin/ffmpeg" if os.path.isfile("/opt/homebrew/bin/ffmpeg") else None)
+        or (os.path.expanduser("~/.hermes/bin/ffmpeg") if os.path.isfile(os.path.expanduser("~/.hermes/bin/ffmpeg")) else None)
+    )
+    if not ffmpeg:
+        return
+    p = Path(output_path)
+    tmp_out = str(p.with_name(f".{p.stem}.loudnorm.{os.getpid()}{p.suffix or '.mp3'}"))
+    try:
+        proc = _ffmpeg_run(
+            ffmpeg,
+            [
+                "-y", "-i", output_path,
+                "-af", "loudnorm=I=-14:TP=-1.0:LRA=7",
+                "-ar", "24000", "-ac", "1",
+                "-loglevel", "error",
+                tmp_out,
+            ],
+            timeout=30,
+        )
+        if proc.returncode == 0 and os.path.isfile(tmp_out) and os.path.getsize(tmp_out) > 0:
+            os.replace(tmp_out, output_path)
+    except Exception as exc:
+        logger.debug("Edge TTS loudness normalization skipped: %s", exc)
+    finally:
+        _remove_quietly(tmp_out)
+
+
 async def _generate_edge_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     edge_tts = _origin()._import_edge_tts()
     edge_config = tts_config.get("edge") or {}
     speed = float(edge_config.get("speed", tts_config.get("speed", 1.0)))
-    kwargs = {"voice": edge_config.get("voice", DEFAULT_EDGE_VOICE)}
+    configured_voice = str(edge_config.get("voice") or DEFAULT_EDGE_VOICE).strip()
+    kwargs = {"voice": _select_edge_voice_for_text(text, configured_voice)}
     if speed != 1.0:
         kwargs["rate"] = f"{round((speed - 1.0) * 100):+d}%"
-    await edge_tts.Communicate(text, **kwargs).save(output_path)
+    for _attempt in range(3):
+        try:
+            await edge_tts.Communicate(text, **kwargs).save(output_path)
+            break
+        except Exception:
+            if _attempt == 2:
+                raise
+            await asyncio.sleep(0.25)
+    if getattr(edge_tts.Communicate, "__module__", "").startswith("edge_tts"):
+        _normalize_edge_loudness(output_path)
     return output_path
 
 
