@@ -4,7 +4,10 @@ stub — the earlier tool result already carries the content verbatim. Content d
 timestamps, so a same-size rewrite in one coarse mtime tick (or on a host whose clock disagrees with
 the filesystem's) is never mistaken for "unchanged". Cleared via ``reset_skill_view_dedup()`` on
 context compression AND on a committed proactive tool-result prune, because both replace the
-original content with a one-line marker.
+original content with a one-line marker. Each entry also keeps the tool call that served it, so a
+view the model received as anything but that whole result (a spill preview, a guardrail reference
+stub) is released by that call (``release_replaced_skill_view``); a notice appended after the whole
+result keeps it.
 """
 
 import hashlib
@@ -12,7 +15,7 @@ import json
 import threading
 
 _existing_skill_tracker = globals().get("_skill_view_tracker")
-_skill_view_tracker: dict[str, dict[tuple, str]] = (
+_skill_view_tracker: dict[str, dict[tuple, tuple[str, str, int]]] = (
     _existing_skill_tracker if isinstance(_existing_skill_tracker, dict) else {}
 )
 _existing_skill_epoch_history = globals().get("_skill_view_epoch_history")
@@ -73,6 +76,10 @@ def _build_cross_epoch_skill_digest(payload: dict, resolved: str, file_path: str
     )
 
 
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def dedup_skill_view(task_id, name, file_path, payload: dict, result: str) -> str | None:
     """The "unchanged" stub when this task was already served exactly ``result`` for this skill
     file; otherwise record ``result``'s digest and return None (serve the full result)."""
@@ -81,13 +88,15 @@ def dedup_skill_view(task_id, name, file_path, payload: dict, result: str) -> st
     if (not task_id or payload.get("setup_needed")
             or payload.get("readiness_status") == "setup_needed"):
         return None
+    from tools.approval_context import _approval_tool_call_id
+
     tid = str(task_id)
     resolved = str(payload.get("name") or name)
     key = (resolved, file_path or "")
-    digest = hashlib.sha256(result.encode("utf-8")).hexdigest()
+    digest = _digest(result)
     with _skill_view_tracker_lock:
         cache = _skill_view_tracker.setdefault(tid, {})
-        if cache.get(key) == digest:
+        if (entry := cache.get(key)) and entry[0] == digest:
             return json.dumps({
                 "success": True, "status": "unchanged", "name": resolved,
                 "file": file_path or "SKILL.md", "dedup": True, "content_returned": False,
@@ -99,7 +108,7 @@ def dedup_skill_view(task_id, name, file_path, payload: dict, result: str) -> st
         else:
             full_loads = 1
         cache.pop(key, None)  # re-insert at the end: FIFO eviction keeps the recently served
-        cache[key] = digest
+        cache[key] = (digest, _approval_tool_call_id.get(), len(result))
         while len(cache) > _SKILL_VIEW_DEDUP_CAP:  # FIFO eviction
             del cache[next(iter(cache))]
         if full_loads > _SKILL_VIEW_CROSS_EPOCH_FULL_LOAD_LIMIT:
@@ -111,6 +120,29 @@ def dedup_skill_view(task_id, name, file_path, payload: dict, result: str) -> st
         while len(epoch_map) > _SKILL_VIEW_DEDUP_CAP:
             del epoch_map[next(iter(epoch_map))]
     return None
+
+
+def release_replaced_skill_view(task_id, tool_call_id, delivered) -> None:
+    """Forget the view ``tool_call_id`` recorded unless ``delivered`` starts with that whole result: a
+    spill preview or a reference stub in its place leaves the model without the content a later stub
+    would point at, while a guardrail notice appended after it does not."""
+    if not tool_call_id:
+        return
+    with _skill_view_tracker_lock:
+        cache = _skill_view_tracker.get(str(task_id)) or {}
+        key = next((key for key, (_, call_id, _) in cache.items() if call_id == tool_call_id), None)
+        if key is None:
+            return
+        digest, _, length = cache[key]
+        if not isinstance(delivered, str) or _digest(delivered[:length]) != digest:
+            del cache[key]
+
+
+def release_replaced_skill_views(task_id, batch: list[dict], contents_before: list) -> None:
+    """``release_replaced_skill_view`` for each row of a batch whose content the turn budget replaced."""
+    for message, before in zip(batch, contents_before):
+        if message.get("content") is not before:
+            release_replaced_skill_view(task_id, message.get("tool_call_id"), message.get("content"))
 
 
 _JSON_DECODER = json.JSONDecoder()
@@ -155,7 +187,7 @@ def seed_skill_view_dedup_from_messages(task_id: str | None, messages: list | No
     """
     if not task_id or not isinstance(messages, list):
         return
-    entries: list[tuple[tuple[str, str], str]] = []
+    entries: list[tuple[tuple[str, str], str, int]] = []
     for msg in messages:
         if not isinstance(msg, dict):
             continue
@@ -170,7 +202,7 @@ def seed_skill_view_dedup_from_messages(task_id: str | None, messages: list | No
                 continue
             key = (resolved, str(payload.get("file") or ""))
             digest = hashlib.sha256(json_prefix.encode("utf-8")).hexdigest()
-            entries.append((key, digest))
+            entries.append((key, digest, len(json_prefix)))
         elif role == "user":
             raw_user = msg.get("content")
             if not isinstance(raw_user, str) or "[IMPORTANT: The " not in raw_user[:64]:
@@ -191,7 +223,9 @@ def seed_skill_view_dedup_from_messages(task_id: str | None, messages: list | No
                         continue
                     resolved = str(sv_payload.get("name") or norm_name)
                     if resolved:
-                        entries.append(((resolved, ""), hashlib.sha256(sv_prefix.encode("utf-8")).hexdigest()))
+                        entries.append(
+                            ((resolved, ""), hashlib.sha256(sv_prefix.encode("utf-8")).hexdigest(), len(sv_prefix))
+                        )
             except Exception:
                 continue
     if not entries:
@@ -199,9 +233,9 @@ def seed_skill_view_dedup_from_messages(task_id: str | None, messages: list | No
     with _skill_view_tracker_lock:
         cache = _skill_view_tracker.setdefault(str(task_id), {})
         epoch_map = _skill_view_epoch_history.setdefault(str(task_id), {})
-        for key, digest in entries:
+        for key, digest, length in entries:
             cache.pop(key, None)
-            cache[key] = digest
+            cache[key] = (digest, "", length)
             while len(cache) > _SKILL_VIEW_DEDUP_CAP:
                 del cache[next(iter(cache))]
             prev_ep = epoch_map.get(key)

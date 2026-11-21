@@ -83,6 +83,8 @@ export type ChatMessage = {
   rowId?: number
   /** Durable backend `messages.message_uid`, preserved across compactions and session rotations. */
   messageUid?: string
+  /** The send a stored prompt row holds (`display_metadata.submission_id`); its live copy's id is `user-<it>`. */
+  submissionId?: string
   /** Backend transcript rows this message represents — the hydration fold
    *  merges a turn's tool rows into the assistant message they belong to, so a
    *  message is not one backend row. The older-page offset (transcript-tail) is
