@@ -1993,6 +1993,16 @@ def switch_model(
     # was missing; reload failure is logged + swallowed so the switch itself still completes.
     old_norm = (old_provider or "").strip().lower()
     new_norm = (new_provider or "").strip().lower()
+    _prev_primary_rt = getattr(agent, "_primary_runtime", None)
+    _was_in_fallback = bool(
+        getattr(agent, "_fallback_activated", False)
+        or getattr(agent, "_provider_fallback_active", False)
+    )
+    _prune_old_norm = (
+        str(_prev_primary_rt.get("provider") or "").strip().lower()
+        if (_was_in_fallback and isinstance(_prev_primary_rt, dict) and _prev_primary_rt.get("provider"))
+        else old_norm
+    )
     api_mode, base_url, destination_capabilities = _resolve_switch_destination(
         agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm
     )
@@ -2038,7 +2048,7 @@ def switch_model(
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
-    _finish_switch(agent, new_provider, old_norm, new_norm)
+    _finish_switch(agent, new_provider, _prune_old_norm, new_norm)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,

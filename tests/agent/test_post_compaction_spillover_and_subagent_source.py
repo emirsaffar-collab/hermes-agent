@@ -398,9 +398,16 @@ def test_cron_or_global_session_429_does_not_poison_europe_west2_cooldown():
     assert (r, acq) == (vertex_adapter.EUROPE_WEST2_VERTEX_REGION, True)
     assert vertex_adapter.release_vertex_hybrid_slot(SimpleNamespace(_vertex_regional_slot_held=True)) is True
 
-    # When both europe-west2 (8) and asia-southeast1 (8) hit active-session cap, 17th session routes to us-central1 (8),
-    # and once all 3 regional pools (24 active sessions) are full, the 25th session spills to global.
+    # When both europe-west2 (8) and asia-southeast1 (8) hit active-session cap (16 total),
+    # the 17th session spills directly to global (never us-central1, which returns HTTP 404 for gemini-4-argon).
+    assert vertex_adapter.REGIONAL_VERTEX_REGIONS == (
+        vertex_adapter.EUROPE_WEST2_VERTEX_REGION,
+        vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION,
+    )
+    assert vertex_adapter.US_CENTRAL1_VERTEX_REGION not in vertex_adapter.REGIONAL_VERTEX_REGIONS
     vertex_adapter.reset_vertex_hybrid_router_state()
+    vertex_adapter._session_region_affinity["stale_usc1"] = vertex_adapter.US_CENTRAL1_VERTEX_REGION
+    assert vertex_adapter.get_session_vertex_region_affinity("stale_usc1") is None
     for i in range(vertex_adapter.EUROPE_WEST2_MAX_ACTIVE_SESSIONS):
         vertex_adapter._record_session_vertex_region_affinity(
             f"ew2_cap_{i}", vertex_adapter.EUROPE_WEST2_VERTEX_REGION
@@ -415,30 +422,23 @@ def test_cron_or_global_session_429_does_not_poison_europe_west2_cooldown():
         interactive=True,
         session_id="overflow_17",
     )
-    assert (r_17, acq_17) == (vertex_adapter.US_CENTRAL1_VERTEX_REGION, True)
+    assert (r_17, acq_17) == (vertex_adapter.GLOBAL_VERTEX_REGION, False)
     assert (
         vertex_adapter.get_session_vertex_region_affinity("overflow_17")
-        == vertex_adapter.US_CENTRAL1_VERTEX_REGION
+        == vertex_adapter.GLOBAL_VERTEX_REGION
     )
-    assert vertex_adapter.release_vertex_hybrid_slot(
-        SimpleNamespace(
-            _vertex_regional_slot_held=True,
-            _vertex_regional_slot_region=vertex_adapter.US_CENTRAL1_VERTEX_REGION,
-        )
-    ) is True
-    for i in range(1, vertex_adapter.US_CENTRAL1_MAX_ACTIVE_SESSIONS):
-        vertex_adapter._record_session_vertex_region_affinity(
-            f"usc1_cap_{i}", vertex_adapter.US_CENTRAL1_VERTEX_REGION
-        )
-    r_25, acq_25 = vertex_adapter.acquire_vertex_hybrid_region(
-        "google/gemini-4-argon",
-        configured_region="global",
-        interactive=True,
-        session_id="overflow_25",
+    # Regional 404 (force_demote_to_global=True) demotes even a deep >=55k session on strike 1
+    vertex_adapter._record_session_vertex_region_affinity(
+        "deep_404_sid", vertex_adapter.EUROPE_WEST2_VERTEX_REGION
     )
-    assert (r_25, acq_25) == (vertex_adapter.GLOBAL_VERTEX_REGION, False)
+    vertex_adapter.record_vertex_regional_429(
+        cooldown_seconds=15.0,
+        session_id="deep_404_sid",
+        last_prompt_tokens=180_000,
+        force_demote_to_global=True,
+    )
     assert (
-        vertex_adapter.get_session_vertex_region_affinity("overflow_25")
+        vertex_adapter.get_session_vertex_region_affinity("deep_404_sid")
         == vertex_adapter.GLOBAL_VERTEX_REGION
     )
 
@@ -447,9 +447,9 @@ def test_cold_prefill_gate_distributes_across_three_regional_clusters_and_shares
     tmp_path, monkeypatch
 ):
     """Simultaneous cold prefills (>=25k uncached tokens) must be capped at 2 per
-    regional cluster (2 in europe-west2, 2 in asia-southeast1, 2 in us-central1 = 6
-    concurrent cold prefills total) before spilling to global, and peer-process 429
-    cooldowns written to HERMES_VERTEX_SHARED_STATE_PATH must be respected cross-process."""
+    regional cluster (2 in europe-west2, 2 in asia-southeast1 = 4 concurrent cold
+    prefills total) before spilling to global, and peer-process 429 cooldowns written
+    to HERMES_VERTEX_SHARED_STATE_PATH must be respected cross-process."""
     import json
     import time
 
@@ -459,7 +459,7 @@ def test_cold_prefill_gate_distributes_across_three_regional_clusters_and_shares
 
     cold_holders = []
     regions_seen = []
-    for idx in range(6):
+    for idx in range(4):
         reg, acq = vertex_adapter.acquire_vertex_hybrid_region(
             "google/gemini-4-argon",
             configured_region="global",
@@ -481,11 +481,9 @@ def test_cold_prefill_gate_distributes_across_three_regional_clusters_and_shares
         vertex_adapter.EUROPE_WEST2_VERTEX_REGION,
         vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION,
         vertex_adapter.ASIA_SOUTHEAST1_VERTEX_REGION,
-        vertex_adapter.US_CENTRAL1_VERTEX_REGION,
-        vertex_adapter.US_CENTRAL1_VERTEX_REGION,
     ]
 
-    # 7th simultaneous cold prefill spills to global because all 3 regions have 2 cold prefills in-flight
+    # 5th simultaneous cold prefill spills to global because both supported regions have 2 cold prefills in-flight
     r7, acq7 = vertex_adapter.acquire_vertex_hybrid_region(
         "google/gemini-4-argon",
         configured_region="global",
@@ -535,6 +533,52 @@ def test_cold_prefill_gate_distributes_across_three_regional_clusters_and_shares
     vertex_adapter._peer_cd_cache_ts = 0.0
     assert vertex_adapter.vertex_regional_cooldown_remaining() > 5.0
     vertex_adapter.reset_vertex_hybrid_router_state()
+
+
+def test_mid_fallback_switch_model_preserves_openrouter_fallback_chain_and_regional_404_demotes_global():
+    """Calling switch_model(..., new_provider='vertex') while a session is mid-fallback
+    on openrouter (_fallback_activated=True, _primary_runtime.provider='vertex') must NOT
+    wipe the openrouter fallback entry from _fallback_chain in _finish_switch."""
+    from agent.agent_runtime_helpers import _finish_switch
+
+    agent = SimpleNamespace(
+        model="google/gemini-4-argon",
+        provider="openrouter",
+        _fallback_activated=True,
+        _provider_fallback_active=True,
+        _provider_fallback_route={"provider": "openrouter", "model": "google/gemini-4-argon"},
+        _fallback_index=1,
+        _credential_pool_revert_id=None,
+        _primary_runtime={"provider": "vertex", "model": "google/gemini-4-argon"},
+        _fallback_chain=[
+            {"provider": "vertex", "model": "google/gemini-4-argon"},
+            {"provider": "openrouter", "model": "google/gemini-4-argon"},
+        ],
+        _fallback_model={"provider": "vertex", "model": "google/gemini-4-argon"},
+        request_overrides={},
+        _custom_providers=[],
+    )
+    _prev_primary_rt = getattr(agent, "_primary_runtime", None)
+    _was_in_fallback = bool(
+        getattr(agent, "_fallback_activated", False)
+        or getattr(agent, "_provider_fallback_active", False)
+    )
+    old_norm = "openrouter"
+    new_norm = "vertex"
+    _prune_old_norm = (
+        str(_prev_primary_rt.get("provider") or "").strip().lower()
+        if (_was_in_fallback and isinstance(_prev_primary_rt, dict) and _prev_primary_rt.get("provider"))
+        else old_norm
+    )
+    assert _prune_old_norm == "vertex"
+    _finish_switch(agent, "vertex", _prune_old_norm, new_norm)
+    assert agent._fallback_activated is False
+    assert agent._fallback_chain == [
+        {"provider": "vertex", "model": "google/gemini-4-argon"},
+        {"provider": "openrouter", "model": "google/gemini-4-argon"},
+    ]
+    assert any(e.get("provider") == "openrouter" for e in agent._fallback_chain)
+
 
 
 

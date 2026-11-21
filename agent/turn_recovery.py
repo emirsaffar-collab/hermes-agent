@@ -1949,13 +1949,19 @@ def route_classified_error(
         or (_is_transport_failure and retry_count >= 2)
     ) and not (getattr(classified, "error_context", None) or {}).get("usage_window")  # never switch models on a plan limit
     # P0-1 Hybrid Router: trip the europe-west2 15s cooldown and pin the interactive/subagent
-    # session to locations/global on any Vertex 429 or stream-stale timeout, even when
+    # session to locations/global on any Vertex 429, regional 404, or stream-stale timeout, even when
     # _fallback_chain is empty (e.g. delegate_task subagents) or on retry #1 of a timeout.
     _is_stale_kill = bool(getattr(api_error, "_stale_stream_killed", False))
+    _routed_url_str = str(getattr(agent, "_last_routed_base_url", None) or base_url or "")
+    _is_vertex_regional_404 = (
+        status_code == 404
+        and "locations/global" not in _routed_url_str
+    )
     if str(getattr(agent, "provider", "") or "").lower() == "vertex" and (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or classified.reason == FailoverReason.timeout
         or _is_stale_kill
+        or _is_vertex_regional_404
     ):
         try:
             from agent.vertex_adapter import (
@@ -1978,6 +1984,7 @@ def route_classified_error(
                 _tr_prompt_tok >= GLOBAL_STICKY_EPOCH_MIN_TOKENS
                 and retry_count < 2
                 and not _is_stale_kill
+                and not _is_vertex_regional_404
             )
             _is_bg_review_turn = (
                 getattr(agent, "_write_origin", None) == "background_review"
@@ -1995,7 +2002,10 @@ def route_classified_error(
                     last_prompt_tokens=max(_tr_prompt_tok, GLOBAL_STICKY_EPOCH_MIN_TOKENS),
                 )
             else:
-                record_vertex_regional_429(session_id=_v_sid)
+                record_vertex_regional_429(
+                    session_id=_v_sid,
+                    force_demote_to_global=_is_vertex_regional_404,
+                )
         except Exception:
             pass
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):

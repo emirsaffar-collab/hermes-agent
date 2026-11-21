@@ -62,7 +62,6 @@ US_CENTRAL1_VERTEX_REGION = "us-central1"
 REGIONAL_VERTEX_REGIONS = (
     EUROPE_WEST2_VERTEX_REGION,
     ASIA_SOUTHEAST1_VERTEX_REGION,
-    US_CENTRAL1_VERTEX_REGION,
 )
 EUROPE_WEST2_ARGON_MAX_CONCURRENCY = 5
 REGIONAL_COLD_PREFILL_MAX_CONCURRENCY = 2
@@ -117,6 +116,10 @@ _prev_last_seen = getattr(_prev_vertex_mod, "_session_region_last_seen", None)
 _session_region_last_seen: dict[str, float] = (
     _prev_last_seen if isinstance(_prev_last_seen, dict) else {}
 )
+for _stale_sid, _stale_reg in list(_session_region_affinity.items()):
+    if _stale_reg not in (GLOBAL_VERTEX_REGION, *REGIONAL_VERTEX_REGIONS):
+        _session_region_affinity.pop(_stale_sid, None)
+        _session_region_last_seen.pop(_stale_sid, None)
 _prev_strikes = getattr(_prev_vertex_mod, "_session_regional_429_strikes", None)
 _session_regional_429_strikes: dict[str, tuple[int, float]] = (
     _prev_strikes if isinstance(_prev_strikes, dict) else {}
@@ -247,13 +250,14 @@ def record_vertex_regional_429(
     *,
     session_id: Optional[str] = None,
     last_prompt_tokens: int = 0,
+    force_demote_to_global: bool = False,
 ) -> float:
     """Trip the regional 429 cooldown so subsequent calls route to locations/global."""
     global _europe_west2_cooldown_until, _asia_southeast1_cooldown_until, _us_central1_cooldown_until
     now = time.monotonic()
     raw_sid = str(session_id or "").strip()
     canon_sid = _canonical_affinity_session_id(raw_sid) if raw_sid else None
-    demote_repeat_striker = False
+    demote_repeat_striker = bool(force_demote_to_global)
     tripped_region: Optional[str] = None
     with _EUROPE_WEST2_STATE_LOCK:
         pinned_before = _session_region_affinity.get(canon_sid) if canon_sid else None
@@ -397,7 +401,12 @@ def get_session_vertex_region_affinity(session_id: Optional[str]) -> Optional[st
     if not sid:
         return None
     with _EUROPE_WEST2_STATE_LOCK:
-        return _session_region_affinity.get(sid)
+        reg = _session_region_affinity.get(sid)
+        if reg is not None and reg not in (GLOBAL_VERTEX_REGION, *REGIONAL_VERTEX_REGIONS):
+            _session_region_affinity.pop(sid, None)
+            _session_region_last_seen.pop(sid, None)
+            return None
+        return reg
 
 
 def get_active_europe_west2_session_count(now_monotonic: Optional[float] = None) -> int:
@@ -671,7 +680,10 @@ def release_vertex_hybrid_slot(client: Any) -> bool:
         return False
     slot_region = getattr(client, "_vertex_regional_slot_region", None)
     if not slot_region:
-        parsed = parse_vertex_base_url(getattr(client, "_vertex_routed_base_url", None))
+        parsed = parse_vertex_base_url(
+            getattr(client, "_vertex_routed_base_url", None)
+            or getattr(client, "base_url", None)
+        )
         if parsed:
             slot_region = parsed[1]
     try:
