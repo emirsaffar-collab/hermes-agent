@@ -2001,11 +2001,10 @@ def route_classified_error(
                     session_id=_v_sid,
                     last_prompt_tokens=max(_tr_prompt_tok, GLOBAL_STICKY_EPOCH_MIN_TOKENS),
                 )
+            elif _is_vertex_regional_404:
+                record_vertex_regional_429(session_id=_v_sid, force_demote_to_global=True)
             else:
-                record_vertex_regional_429(
-                    session_id=_v_sid,
-                    force_demote_to_global=_is_vertex_regional_404,
-                )
+                record_vertex_regional_429(session_id=_v_sid)
         except Exception:
             pass
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):

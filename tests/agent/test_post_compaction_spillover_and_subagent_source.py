@@ -579,6 +579,32 @@ def test_mid_fallback_switch_model_preserves_openrouter_fallback_chain_and_regio
     ]
     assert any(e.get("provider") == "openrouter" for e in agent._fallback_chain)
 
+    # Regional 404 quarantine (force_demote_to_global=True) must quarantine the broken
+    # region for >=3600s AND demote all sibling sessions pinned to that region to global.
+    vertex_adapter.reset_vertex_hybrid_router_state()
+    vertex_adapter._record_session_vertex_region_affinity(
+        "sess_404_primary", vertex_adapter.EUROPE_WEST2_VERTEX_REGION
+    )
+    vertex_adapter._record_session_vertex_region_affinity(
+        "sess_404_sibling", vertex_adapter.EUROPE_WEST2_VERTEX_REGION
+    )
+    vertex_adapter.record_vertex_regional_429(
+        session_id="sess_404_primary",
+        last_prompt_tokens=90_000,
+        force_demote_to_global=True,
+    )
+    assert (
+        vertex_adapter.get_session_vertex_region_affinity("sess_404_primary")
+        == vertex_adapter.GLOBAL_VERTEX_REGION
+    )
+    assert (
+        vertex_adapter.get_session_vertex_region_affinity("sess_404_sibling")
+        == vertex_adapter.GLOBAL_VERTEX_REGION
+    )
+    assert vertex_adapter.vertex_regional_cooldown_remaining() >= 3000.0
+    vertex_adapter.reset_vertex_hybrid_router_state()
+
+
 
 
 

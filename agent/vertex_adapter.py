@@ -71,6 +71,7 @@ ASIA_SOUTHEAST1_MAX_ACTIVE_SESSIONS = 8
 US_CENTRAL1_MAX_ACTIVE_SESSIONS = 8
 EUROPE_WEST2_ACTIVE_SESSION_TTL_SECONDS = 180.0
 EUROPE_WEST2_COOLDOWN_SECONDS = 15.0
+REGIONAL_404_QUARANTINE_SECONDS = 3600.0
 EUROPE_WEST2_COOLDOWN_TAIL_WAIT_SECONDS = 15.0
 EUROPE_WEST2_COOLDOWN_MAX_TOTAL_WAIT_SECONDS = 45.0
 EUROPE_WEST2_DEEP_SEMAPHORE_WAIT_SECONDS = 90.0
@@ -275,7 +276,12 @@ def record_vertex_regional_429(
                 )
             )
         )
-        target = now + max(0.0, float(cooldown_seconds))
+        effective_cooldown = (
+            max(float(cooldown_seconds), REGIONAL_404_QUARANTINE_SECONDS)
+            if force_demote_to_global
+            else max(0.0, float(cooldown_seconds))
+        )
+        target = now + effective_cooldown
         if is_ase1_session:
             _asia_southeast1_cooldown_until = max(_asia_southeast1_cooldown_until, target)
             tripped_region = ASIA_SOUTHEAST1_VERTEX_REGION
@@ -285,6 +291,11 @@ def record_vertex_regional_429(
         elif not is_non_ew2_session:
             _europe_west2_cooldown_until = max(_europe_west2_cooldown_until, target)
             tripped_region = EUROPE_WEST2_VERTEX_REGION
+        if force_demote_to_global and tripped_region:
+            for _sid_k, _reg_v in list(_session_region_affinity.items()):
+                if _reg_v == tripped_region:
+                    _session_region_affinity[_sid_k] = GLOBAL_VERTEX_REGION
+                    _session_regional_429_strikes.pop(_sid_k, None)
         if canon_sid and pinned_before in REGIONAL_VERTEX_REGIONS:
             prev_count, first_ts = _session_regional_429_strikes.get(canon_sid, (0, now))
             if (now - first_ts) > REGIONAL_429_STRIKE_WINDOW_SECONDS:
@@ -297,7 +308,7 @@ def record_vertex_regional_429(
                 demote_repeat_striker = True
         until = _europe_west2_cooldown_until
     if tripped_region:
-        _write_shared_cooldown(tripped_region, float(cooldown_seconds))
+        _write_shared_cooldown(tripped_region, effective_cooldown)
     if (
         raw_sid
         and ":bg-review:" not in raw_sid
