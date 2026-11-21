@@ -1419,10 +1419,16 @@ _ANCHOR_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
     ("commits", re.compile(r"\b[0-9a-f]{9,40}\b"), 40),
     ("revisions", re.compile(r"\b[a-z][a-z0-9-]+-\d{5}-[a-z0-9]{3}\b"), 30),
     ("branches", re.compile(r"\b(?:fix|feat|docs|refactor|chore|salvage|ent)/[A-Za-z0-9._/-]{3,60}"), 40),
-    ("files", re.compile(r"\b[\w./-]+/[\w.-]+\.(?:py|ts|tsx|js|rs|md|yaml|yml|json|toml|sh|php)\b"), 80),
+    ("files", re.compile(r"\b[\w./-]+/[\w.-]+\.(?:py|ts|tsx|js|rs|md|yaml|yml|json|hujson|sql|csv|xlsx|toml|sh|php)\b"), 80),
     ("urls", re.compile(r"https?://[^\s)\"'\\]{10,110}"), 40),
     ("errors", re.compile(r"\b(?:[A-Z][a-zA-Z]*Error|Exception|ENOSPC|EACCES|SIGKILL|Traceback)\b[^\n]{0,90}"), 40),
-    ("handles", re.compile(r"@[A-Za-z0-9-]{3,30}\b"), 40),
+    ("handles", re.compile(r"(?:[a-z0-9._+-]+@[a-z0-9.-]+\.[a-z]{2,}|@[A-Za-z0-9._-]{3,30})\b", re.IGNORECASE), 40),
+]
+_TOOL_FACT_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
+    ("file_states", re.compile(r"\b(?:lines=\d+\s+sha256=[0-9a-f]{8,64}|total_lines[\"']?\s*[:=]\s*\d+|bytes=\d+\s+lines=\d+)\b"), 25),
+    ("net_anchors", re.compile(r"\b(?:10|100|172|192)\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:/\d{1,2})?\b"), 30),
+    ("tool_rosters", re.compile(r"\b[a-z]{2,20}\.[a-z]{2,24}@(?:uropenn|techzola|2izii)\.[a-z]{2,6}\b", re.IGNORECASE), 35),
+    ("tool_date_windows", re.compile(r"\b202\d-\d{2}-\d{2}\s*(?:\.\.|to|–|—)\s*202\d-\d{2}-\d{2}\b"), 20),
 ]
 _ANCHOR_NOISE = frozenset({
     "@teknium", "@teknium1",  # session owner, in every transcript
@@ -1440,12 +1446,24 @@ def _build_anchor_index(turns: list[dict[str, Any]]) -> str:
     text = "\n".join(c for c in contents if isinstance(c, str) and c)
     if not text:
         return ""
+    tool_text = "\n".join(
+        m.get("content", "")
+        for m in turns
+        if m.get("role") in ("tool", "function") and isinstance(m.get("content"), str)
+    )
     sections: list[str] = []
     used = 0
-    for label, pattern, cap in _ANCHOR_PATTERNS:
+    all_specs: list[tuple[str, re.Pattern[str], int, str]] = [
+        (label, pattern, cap, text) for label, pattern, cap in _ANCHOR_PATTERNS
+    ]
+    if tool_text:
+        all_specs.extend(
+            (label, pattern, cap, tool_text) for label, pattern, cap in _TOOL_FACT_PATTERNS
+        )
+    for label, pattern, cap, src_blob in all_specs:
         counts: dict[str, int] = {}
         last_seen: dict[str, int] = {}
-        for n, m in enumerate(pattern.finditer(text)):
+        for n, m in enumerate(pattern.finditer(src_blob)):
             val = m.group(0).strip().rstrip(".,;:")
             if val.lower() in _ANCHOR_NOISE:
                 continue
