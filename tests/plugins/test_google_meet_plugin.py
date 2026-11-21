@@ -557,3 +557,71 @@ def test_rtc_transcriber_exact_cluster_cursor_mid_cluster_flushes(tmp_path, monk
     assert rtc._last_cluster_off[2] == len(header) + len(cluster1_part1) + len(cluster1_part2)
     assert full_decode_called == 0
 
+
+# ---------------------------------------------------------------------------
+# Screenshare Brief Canvas & Voice Control
+# ---------------------------------------------------------------------------
+
+def test_is_safe_brief_url_accepts_pinned_origins():
+    from plugins.google_meet.meet_bot import _is_safe_brief_url
+
+    assert _is_safe_brief_url("https://meetings.uropenn.se/brief") is True
+    assert _is_safe_brief_url("https://meetings.uropenn.se/studio/brief?mtg=abc") is True
+    assert _is_safe_brief_url("http://100.117.81.127:8096/brief") is True
+    assert _is_safe_brief_url("http://127.0.0.1:8096/studio/brief#section") is True
+
+    # Disallowed domains / ports / paths
+    assert _is_safe_brief_url("https://evil.example.com/brief") is False
+    assert _is_safe_brief_url("http://100.117.81.127:8080/brief") is False
+    assert _is_safe_brief_url("http://192.168.1.50:8096/brief") is False
+    assert _is_safe_brief_url("https://meetings.uropenn.se/other") is False
+    assert _is_safe_brief_url("") is False
+    assert _is_safe_brief_url(None) is False  # type: ignore[arg-type]
+
+
+def test_classify_voice_control_brief_presentation():
+    from plugins.google_meet.meet_bot import _classify_voice_control
+
+    assert _classify_voice_control("agenten, visa brief") == "present_brief"
+    assert _classify_voice_control("botten, dela brief") == "present_brief"
+    assert _classify_voice_control("roboten, presentera brief") == "present_brief"
+    assert _classify_voice_control("notetaker, show brief") == "present_brief"
+    assert _classify_voice_control("mr agent, dela agenda") == "present_brief"
+
+    assert _classify_voice_control("agenten, sluta dela") == "stop_present_brief"
+    assert _classify_voice_control("botten, sluta presentera") == "stop_present_brief"
+    assert _classify_voice_control("roboten, stäng briefen") == "stop_present_brief"
+    assert _classify_voice_control("notetaker, stop sharing") == "stop_present_brief"
+
+
+def test_bot_state_brief_voice_commands(tmp_path):
+    from plugins.google_meet.meet_bot import _BotState
+
+    out = tmp_path / "session_brief"
+    state = _BotState(out_dir=out, meeting_id="abc-defg-hij", url="https://meet.google.com/abc-defg-hij")
+
+    assert state.brief_sharing is False
+    assert state.brief_url is None
+
+    state.record_caption("Alice", "agenten, visa brief")
+    assert state.brief_present_requested is True
+    assert state.brief_stop_requested is False
+
+    state.record_caption("Bob", "agenten, sluta dela")
+    assert state.brief_stop_requested is True
+    assert state.brief_present_requested is False
+
+
+def test_config_from_env_brief_settings(monkeypatch):
+    from plugins.google_meet.meet_bot import _config_from_env
+
+    monkeypatch.setenv("HERMES_MEET_BRIEF_URL", "https://meetings.uropenn.se/brief")
+    monkeypatch.setenv("HERMES_MEET_BRIEF_AUTO_PRESENT", "1")
+    monkeypatch.setenv("HERMES_MEET_BRIEF_MAX_SECONDS", "420")
+
+    cfg = _config_from_env()
+    assert cfg.brief_url == "https://meetings.uropenn.se/brief"
+    assert cfg.brief_auto_present is True
+    assert cfg.brief_max_seconds == 420.0
+
+

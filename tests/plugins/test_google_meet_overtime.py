@@ -6,6 +6,8 @@ import time
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+playwright = pytest.importorskip("playwright")
 from playwright.sync_api import sync_playwright
 from plugins.google_meet import meet_bot
 

@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- carried meet brief screenshare extension
 """Headless Google Meet bot — Playwright + live-caption scraping.
 
 Standalone subprocess spawned by ``process_manager.py``; configured via ``HERMES_MEET_*`` env,
@@ -45,6 +46,16 @@ def _is_safe_meet_url(url: str) -> bool:
     return isinstance(url, str) and bool(MEET_URL_RE.match(url.strip()))
 
 
+BRIEF_URL_RE = re.compile(
+    r"^(?:https://meetings\.uropenn\.se|http://(?:100\.117\.81\.127|127\.0\.0\.1):8096)/(?:brief|studio/brief)(?:[/?#].*)?$"
+)
+
+
+def _is_safe_brief_url(url: str) -> bool:
+    """True if *url* is an origin-pinned U&P Meetings brief surface safe to render & screenshare."""
+    return isinstance(url, str) and bool(BRIEF_URL_RE.match(url.strip()))
+
+
 def _meeting_id_from_url(url: str) -> str:
     """3-segment meeting code, teams-<id>, or a timestamped id for ``/lookup/...`` and ``/new``."""
     m = re.search(r"meet\.google\.com/([a-z0-9]{3,}-[a-z0-9]{3,}-[a-z0-9]{3,})", url or "")
@@ -80,7 +91,8 @@ _STATUS_FIELDS = (
     # rtc capture telemetry
     ("rtcCapturing", "rtc_capturing", False), ("audioFragments", "audio_fragments", 0),
     ("lastAudioActivityAt", "last_audio_activity_at", None),
-    ("whisperModel", "whisper_model", None), ("pausedCapture", "paused_capture", False))
+    ("whisperModel", "whisper_model", None), ("pausedCapture", "paused_capture", False),
+    ("briefSharing", "brief_sharing", False), ("briefUrl", "brief_url", None))
 
 
 _WAKE_ADDRESS_RE = re.compile(
@@ -126,6 +138,10 @@ def _classify_voice_control(text: str) -> Optional[str]:
             return "pause_capture"
         if re.search(r"\b(?:fortsätt\s+anteckna|börja\s+anteckna|återuppta\s+anteckning\w*|resume\s+notes)\b", low):
             return "resume_capture"
+        if re.search(r"\b(?:sluta\s+dela|sluta\s+presentera|stäng\s+brief\w*|dölj\s+brief\w*|stop\s+sharing|stop\s+presenting|hide\s+brief)\b", low):
+            return "stop_present_brief"
+        if re.search(r"\b(?:visa\s+brief\w*|dela\s+brief\w*|presentera\s+brief\w*|visa\s+agenda\w*|dela\s+agenda\w*|visa\s+skärm\w*|present\s+brief|show\s+brief|share\s+brief)\b", low):
+            return "present_brief"
     return None
 
 
@@ -206,6 +222,14 @@ class _BotState:
         elif vcmd == "leave_call":
             self.leave_reason = "voice_command_leave"
             print(f"[meet_bot] voice_control=leave_call by={speaker!r}", flush=True)
+        elif vcmd == "present_brief":
+            self.brief_present_requested = True
+            self.brief_stop_requested = False
+            print(f"[meet_bot] voice_control=present_brief by={speaker!r}", flush=True)
+        elif vcmd == "stop_present_brief":
+            self.brief_stop_requested = True
+            self.brief_present_requested = False
+            print(f"[meet_bot] voice_control=stop_present_brief by={speaker!r}", flush=True)
         elif _WAKE_ADDRESS_RE.search(text):
             try:
                 out_dir_path = getattr(self, "out_dir", None)
@@ -365,6 +389,43 @@ _RTC_HOOK_JS = r"""
       g.fillStyle = "#111"; g.fillRect(0, 0, 640, 360);
       return c.captureStream(1).getVideoTracks()[0];
     };
+    const makeBriefDisplayTrack = () => {
+      let c = window.__hermesBriefCanvas;
+      if (!c) {
+        c = document.createElement("canvas");
+        c.width = 1920; c.height = 1080;
+        const g = c.getContext("2d");
+        g.fillStyle = "#EBF1FF"; g.fillRect(0, 0, 1920, 1080);
+        window.__hermesBriefCanvas = c;
+      }
+      window.__hermesUpdateBriefFrame = (dataUrl) => {
+        try {
+          const img = window.__hermesBriefImg || new Image();
+          window.__hermesBriefImg = img;
+          img.onload = () => {
+            try {
+              const ctx2d = c.getContext("2d");
+              ctx2d.drawImage(img, 0, 0, 1920, 1080);
+            } catch (e) {}
+          };
+          img.src = dataUrl;
+          return true;
+        } catch (e) { return false; }
+      };
+      const stream = c.captureStream(4);
+      const track = stream.getVideoTracks()[0];
+      window.__hermesBriefDisplayTrack = track;
+      window.__hermesStopBriefDisplay = () => {
+        try {
+          if (window.__hermesBriefDisplayTrack) {
+            window.__hermesBriefDisplayTrack.stop();
+            window.__hermesBriefDisplayTrack = null;
+          }
+          return true;
+        } catch (e) { return false; }
+      };
+      return track;
+    };
     navigator.mediaDevices.enumerateDevices = async () => [
       { deviceId: "default", kind: "audioinput", label: "Virtual Mic", groupId: "g1", toJSON() { return this; } },
       { deviceId: "default", kind: "videoinput", label: "Virtual Cam", groupId: "g2", toJSON() { return this; } },
@@ -375,6 +436,9 @@ _RTC_HOOK_JS = r"""
       if (constraints && constraints.audio) tracks.push(makeAudioTrack());
       if (constraints && constraints.video) tracks.push(makeVideoTrack());
       return new MediaStream(tracks);
+    };
+    navigator.mediaDevices.getDisplayMedia = async (constraints) => {
+      return new MediaStream([makeBriefDisplayTrack()]);
     };
   }
   window.__hermesRtcStreams = new Map();
@@ -1617,7 +1681,10 @@ def _config_from_env() -> _BotConfig:
         rtc_audio=env("HERMES_MEET_RTC_AUDIO", "1").strip().lower() not in {"0", "false", "no"},
         whisper_model=env("HERMES_MEET_WHISPER_MODEL", "small"),
         realtime_instructions=env("HERMES_MEET_REALTIME_INSTRUCTIONS", ""),
-        lobby_timeout=float(env("HERMES_MEET_LOBBY_TIMEOUT", "300")))
+        lobby_timeout=float(env("HERMES_MEET_LOBBY_TIMEOUT", "300")),
+        brief_url=env("HERMES_MEET_BRIEF_URL", "").strip(),
+        brief_auto_present=env("HERMES_MEET_BRIEF_AUTO_PRESENT", "0").strip().lower() in {"1", "true", "yes", "on"},
+        brief_max_seconds=float(env("HERMES_MEET_BRIEF_MAX_SECONDS", "300") or 300))
 
 
 def _click_nowait(el, timeout: int = 2_000) -> bool:
@@ -1761,7 +1828,99 @@ def _ensure_mic_muted(page) -> str:
     return "unknown"
 
 
-def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: dict) -> None:
+_HUMAN_PRESENTING_PROBE_JS = """() => {
+  const txt = (document.body && document.body.innerText) || "";
+  if (/(?:presenterar|is presenting)/i.test(txt) && !/(?:du presenterar|you are presenting)/i.test(txt)) {
+    return true;
+  }
+  return false;
+}"""
+
+
+def _refresh_brief_canvas(page, brief_state: dict, cfg: _BotConfig, state: _BotState) -> bool:
+    """Render the brief URL in a 1920x1080 background tab and push its frame to Meet's display canvas."""
+    b_url = getattr(cfg, "brief_url", "") or getattr(state, "brief_url", "") or ""
+    if not b_url or not _is_safe_brief_url(b_url):
+        return False
+    try:
+        b_page = brief_state.get("page")
+        if b_page is None or b_page.is_closed():
+            b_page = page.context.new_page()
+            b_page.set_viewport_size({"width": 1920, "height": 1080})
+            b_api_key = os.environ.get("UOP_MEETINGS_API_KEY", "").strip() or "uop-meetings-local-dev-key"
+            b_actor = os.environ.get("HERMES_MEET_BRIEF_ACTOR", "").strip() or "moten@uropenn.se"  # health: allow HX002 -- optional actor override for meetings brief screenshare
+            _quiet(b_page.set_extra_http_headers, {"X-Api-Key": b_api_key, "X-Actor-Email": b_actor})
+            b_page.goto(b_url, wait_until="domcontentloaded", timeout=15_000)
+            b_page.evaluate("document.body && document.body.classList.add('screenshare')")
+            brief_state["page"] = b_page
+        jpeg_bytes = b_page.screenshot(type="jpeg", quality=84)
+        data_url = "data:image/jpeg;base64," + base64.b64encode(jpeg_bytes).decode("ascii")
+        ok = _quiet(page.evaluate, "u => window.__hermesUpdateBriefFrame && window.__hermesUpdateBriefFrame(u)", data_url)
+        brief_state["last_frame_at"] = time.time()
+        return bool(ok)
+    except Exception as exc:  # health: allow BLE001 -- best effort background canvas refresh
+        print(f"[meet_bot] brief_canvas_refresh failed: {exc}", flush=True)
+        return False
+
+
+def _start_brief_presentation(page, brief_state: dict, cfg: _BotConfig, state: _BotState) -> bool:
+    """Start sharing the 1920x1080 pre-meeting brief canvas inside Google Meet."""
+    if not _refresh_brief_canvas(page, brief_state, cfg, state):
+        return False
+    for sel in (
+        'button[aria-label*="Present now" i]',
+        'button[aria-label*="Presentera nu" i]',
+        'button[aria-label*="Share screen" i]',
+        'button[aria-label*="Dela skärm" i]',
+    ):
+        btn = _visible(page.locator(sel))
+        if btn is not None and _quiet(_click_nowait, btn, 2_000):
+            _quiet(page.wait_for_timeout, 800)
+            for item_sel in (
+                '[role="menuitem"]:has-text("entire screen")',
+                '[role="menuitem"]:has-text("hela skärmen")',
+                '[role="menuitem"]:has-text("fönster")',
+                '[role="menuitem"]:has-text("window")',
+                '[role="menuitem"]:has-text("flik")',
+                '[role="menuitem"]:has-text("tab")',
+            ):
+                m_item = _visible(page.locator(item_sel))
+                if m_item is not None:
+                    _quiet(_click_nowait, m_item, 2_000)
+                    break
+            brief_state["started_at"] = time.time()
+            state.set(brief_sharing=True, brief_url=getattr(cfg, "brief_url", None))
+            print(f"[meet_bot] brief_presentation=started url={getattr(cfg, 'brief_url', '')!r}", flush=True)
+            return True
+    # Even if toolbar button is hidden, warm the display track so manual/API trigger works
+    brief_state["started_at"] = time.time()
+    state.set(brief_sharing=True, brief_url=getattr(cfg, "brief_url", None))
+    return True
+
+
+def _stop_brief_presentation(page, brief_state: dict, state: _BotState, reason: str = "stopped") -> None:
+    """Stop sharing the pre-meeting brief canvas and close the helper tab."""
+    _quiet(page.evaluate, "window.__hermesStopBriefDisplay && window.__hermesStopBriefDisplay()")
+    for stop_sel in (
+        'button:has-text("Stop presenting")',
+        'button:has-text("Sluta presentera")',
+        'button:has-text("Stop sharing")',
+        'button:has-text("Sluta dela")',
+    ):
+        s_btn = _visible(page.locator(stop_sel))
+        if s_btn is not None:
+            _quiet(_click_nowait, s_btn, 2_000)
+            break
+    b_page = brief_state.get("page")
+    if b_page is not None:
+        _quiet(b_page.close)
+        brief_state["page"] = None
+    brief_state["started_at"] = None
+    state.set(brief_sharing=False)
+    print(f"[meet_bot] brief_presentation=stopped reason={reason!r}", flush=True)
+
+
+def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: dict) -> None:  # health: allow CC -- brief screenshare auto-present and yield branches in meet drain loop
     """Admission + caption drain loop until SIGTERM, duration expiry, lobby timeout/denial or page loss.
     Sets ``leave_reason`` for every exit but SIGTERM; triggers barge-in; mirrors realtime counters."""
     deadline = (time.time() + cfg.duration_s) if cfg.duration_s else None
@@ -1769,6 +1928,9 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
     last_admission_check = 0.0
     had_other_participants = False
     alone_since = None
+    brief_state = {"page": None, "started_at": None, "last_frame_at": 0.0, "auto_triggered": False}
+    if getattr(cfg, "brief_url", ""):
+        state.set(brief_url=cfg.brief_url)
     while not stop_flag["stop"]:
         now = time.time()
         if getattr(state, "leave_reason", None) == "voice_command_leave":
@@ -1824,6 +1986,15 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             if isinstance(pcount, int) and pcount >= 2:
                 had_other_participants = True
                 alone_since = None
+                if (
+                    getattr(cfg, "brief_auto_present", False)
+                    and getattr(cfg, "brief_url", "")
+                    and not brief_state["auto_triggered"]
+                    and not getattr(state, "brief_sharing", False)
+                ):
+                    brief_state["auto_triggered"] = True
+                    if not _probe(page, _HUMAN_PRESENTING_PROBE_JS):
+                        _start_brief_presentation(page, brief_state, cfg, state)
             elif isinstance(pcount, int) and pcount <= 1:
                 stay_until = float(getattr(state, "stay_override_until", 0.0) or 0.0)
                 last_act_ts = getattr(state, "last_audio_activity_at", None)
@@ -1867,6 +2038,23 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                 if _looks_like_human_speaker(spk_name, cfg.guest_name):
                     if _quiet(page.evaluate, "Boolean(window.__hermesTtsPlaying && window.__hermesStopTts && window.__hermesStopTts())"):
                         state.set(last_barge_in_at=now)
+            if getattr(state, "brief_present_requested", False):
+                state.brief_present_requested = False
+                if getattr(cfg, "brief_url", ""):
+                    _start_brief_presentation(page, brief_state, cfg, state)
+            if getattr(state, "brief_stop_requested", False):
+                state.brief_stop_requested = False
+                if getattr(state, "brief_sharing", False):
+                    _stop_brief_presentation(page, brief_state, state, reason="voice_command")
+            if getattr(state, "brief_sharing", False):
+                started_at = brief_state.get("started_at") or now
+                max_s = float(getattr(cfg, "brief_max_seconds", 300.0) or 300.0)
+                if _probe(page, _HUMAN_PRESENTING_PROBE_JS):
+                    _stop_brief_presentation(page, brief_state, state, reason="human_presenting_yield")
+                elif (now - started_at) >= max_s:
+                    _stop_brief_presentation(page, brief_state, state, reason="auto_park_timeout")
+                elif (now - float(brief_state.get("last_frame_at") or 0.0)) >= 15.0:
+                    _refresh_brief_canvas(page, brief_state, cfg, state)
             wav_q = cfg.out_dir / "say_wav_queue.jsonl" if cfg.out_dir else None
             if wav_q and wav_q.is_file() and wav_q.stat().st_size > 0:
                 lines_raw = wav_q.read_text(encoding="utf-8-sig").splitlines()
