@@ -266,12 +266,105 @@ def _normalize_edge_loudness(output_path: str) -> None:
         _remove_quietly(tmp_out)
 
 
+def _try_gcp_chirp3_tts(text: str, selected_edge_voice: str, speed: float, output_path: str) -> bool:
+    """Primary natural neural synthesis via Google Cloud Chirp3-HD-Kore (unified with mobile/warehouse)."""
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    tok_file = Path(os.path.expanduser("~/.hermes/cache/scratch/fleet-tts-cache/.gcp-tts-token.json"))
+    if selected_edge_voice.startswith("pl-"):
+        lang_code, gcp_voice = "pl-PL", "pl-PL-Chirp3-HD-Kore"
+    elif selected_edge_voice.startswith("sv-"):
+        lang_code, gcp_voice = "sv-SE", "sv-SE-Chirp3-HD-Kore"
+    else:
+        lang_code, gcp_voice = "en-US", "en-US-Chirp3-HD-Kore"
+
+    def _mint_tok() -> str:
+        for gcloud_bin in ("/Users/emirsaffar/google-cloud-sdk/bin/gcloud", "/opt/homebrew/bin/gcloud"):
+            if os.path.exists(gcloud_bin):
+                r = subprocess.run(
+                    [gcloud_bin, "auth", "print-access-token", "--account=posq-readonly@uop-pos.iam.gserviceaccount.com"],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    t = r.stdout.strip()
+                    with contextlib.suppress(Exception):
+                        tok_file.parent.mkdir(parents=True, exist_ok=True)
+                        tmp = tok_file.with_name(f".gcp-tts-token.{os.getpid()}.tmp")
+                        tmp.write_text(json.dumps({"token": t, "exp": time.time() + 1800.0}), encoding="utf-8")
+                        os.chmod(tmp, 0o600)
+                        os.replace(tmp, tok_file)
+                    return t
+        return ""
+
+    tok = ""
+    if tok_file.is_file():
+        with contextlib.suppress(Exception):
+            td = json.loads(tok_file.read_text(encoding="utf-8"))
+            if float(td.get("exp") or 0.0) - time.time() > 60.0:
+                tok = str(td.get("token") or "").strip()
+    if not tok:
+        tok = _mint_tok()
+    if not tok:
+        return False
+
+    for attempt in range(2):
+        try:
+            body = json.dumps({
+                "input": {"text": text.strip()},
+                "voice": {"languageCode": lang_code, "name": gcp_voice},
+                "audioConfig": {
+                    "audioEncoding": "MP3",
+                    "sampleRateHertz": 24000,
+                    "speakingRate": max(0.5, min(2.0, float(speed))),
+                    "volumeGainDb": 2.0,
+                },
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://texttospeech.googleapis.com/v1/text:synthesize",
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {tok}",
+                    "x-goog-user-project": "uop-pos",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=4.5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            b64 = data.get("audioContent") or ""
+            if b64:
+                Path(output_path).write_bytes(base64.b64decode(b64))
+                if os.path.isfile(output_path) and os.path.getsize(output_path) > 200:
+                    return True
+        except urllib.error.HTTPError as he:
+            if he.code == 401 and attempt == 0:
+                tok = _mint_tok()
+                if tok:
+                    continue
+            break
+        except Exception:
+            break
+    return False
+
+
 async def _generate_edge_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     edge_tts = _origin()._import_edge_tts()
     edge_config = tts_config.get("edge") or {}
     speed = float(edge_config.get("speed", tts_config.get("speed", 1.0)))
     configured_voice = str(edge_config.get("voice") or DEFAULT_EDGE_VOICE).strip()
-    kwargs = {"voice": _select_edge_voice_for_text(text, configured_voice)}
+    selected_voice = _select_edge_voice_for_text(text, configured_voice)
+    is_real_edge = getattr(edge_tts.Communicate, "__module__", "").startswith("edge_tts")
+    if is_real_edge and configured_voice in _EDGE_AUTO_VOICES:
+        if _try_gcp_chirp3_tts(text, selected_voice, speed, output_path):
+            return output_path
+    kwargs = {"voice": selected_voice}
     if speed != 1.0:
         kwargs["rate"] = f"{round((speed - 1.0) * 100):+d}%"
     for _attempt in range(3):
@@ -282,7 +375,7 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: dict[str, 
             if _attempt == 2:
                 raise
             await asyncio.sleep(0.25)
-    if getattr(edge_tts.Communicate, "__module__", "").startswith("edge_tts"):
+    if is_real_edge:
         _normalize_edge_loudness(output_path)
     return output_path
 
