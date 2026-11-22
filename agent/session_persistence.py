@@ -570,6 +570,8 @@ class SessionPersistenceMixin:
         # a write here would land the curator's turn in the user's real history.
         if getattr(self, "_persist_disabled", False) or not self._session_db:
             return None
+        if getattr(self, "_compression_adoption_failed", False):
+            return False
         batch_rows: list[dict[str, Any]] = []
         try:
             if not self._session_db_created:  # retry row creation if the earlier attempt failed transiently

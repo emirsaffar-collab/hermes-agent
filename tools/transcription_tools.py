@@ -417,7 +417,11 @@ def _transcribe_local(
             _start_idle_unload_watcher(idle_timeout)
         return _ok_result(transcript, "local")
     except Exception as e:
-        logger.error("Local transcription failed: %s", e, exc_info=True)
+        err_str = str(e)
+        if "moov atom not found" in err_str.lower() or "end of file" in err_str.lower():
+            logger.warning("Local transcription skipped unfinalized or truncated audio container (%s): %s", Path(file_path).name, e)
+        else:
+            logger.error("Local transcription failed: %s", e, exc_info=True)
         return _error_result(f"Local transcription failed: {e}")
 
 

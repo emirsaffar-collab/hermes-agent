@@ -575,3 +575,34 @@ def test_real_fixture_plugins_thread_prompt_in_registration_order(
     _, kwargs = mock_model.transcribe.call_args
     assert kwargs["initial_prompt"] == PROMPT  # last writer won
     assert kwargs["language"] == "en"  # earlier hook's field preserved
+
+
+def test_transcribe_local_moov_atom_logs_warning_while_other_errors_log_error(tmp_path, caplog):
+    audio = _make_audio(tmp_path)
+    mock_model = MagicMock()
+    mock_model.transcribe.side_effect = RuntimeError("Invalid data found when processing input: moov atom not found")
+
+    with caplog.at_level(logging.WARNING, logger="tools.transcription_tools"), \
+         patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+         patch("tools.transcription_tools._load_local_whisper_model", return_value=mock_model), \
+         patch("tools.transcription_tools._local_model", None), \
+         patch("tools.transcription_tools._resolve_stt_language", return_value="sv"):
+        res_moov = transcription_tools._transcribe_local(audio, "base")
+
+    assert res_moov["success"] is False
+    assert "moov atom not found" in res_moov["error"]
+    assert any(r.levelname == "WARNING" and "unfinalized or truncated audio container" in r.message for r in caplog.records)
+    assert not any(r.levelname == "ERROR" for r in caplog.records)
+
+    caplog.clear()
+    mock_model.transcribe.side_effect = RuntimeError("unexpected decoder failure")
+    with caplog.at_level(logging.WARNING, logger="tools.transcription_tools"), \
+         patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+         patch("tools.transcription_tools._load_local_whisper_model", return_value=mock_model), \
+         patch("tools.transcription_tools._local_model", None), \
+         patch("tools.transcription_tools._resolve_stt_language", return_value="sv"):
+        res_err = transcription_tools._transcribe_local(audio, "base")
+
+    assert res_err["success"] is False
+    assert any(r.levelname == "ERROR" and r.exc_info is not None for r in caplog.records)
+

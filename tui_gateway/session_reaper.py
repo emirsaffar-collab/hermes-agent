@@ -29,6 +29,8 @@ def _session_has_pending_flush(session: dict | None) -> bool:
     """Would :func:`_flush_session_messages` write anything for this session? (The exit flush counts
     these to tell a complete flush from a budget overrun.)"""
     agent = session.get("agent") if isinstance(session, dict) else None
+    if getattr(agent, "_compression_adoption_failed", False):
+        return False
     return bool(hasattr(agent, "_persist_session") and getattr(agent, "_session_messages", None))
 
 
@@ -39,6 +41,8 @@ def _flush_session_messages(session: dict | None) -> bool:
     See #13121.
     """
     agent = session.get("agent") if session else None
+    if getattr(agent, "_compression_adoption_failed", False):
+        return False
     snapshot = getattr(agent, "_session_messages", None) if hasattr(agent, "_persist_session") else None
     if not snapshot:
         return False

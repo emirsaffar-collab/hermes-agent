@@ -211,3 +211,37 @@ def test_compression_closed_error_classifies_as_compression_closed() -> None:
         classify_persistence_error(str(CompressionSessionClosedError("session-abc")))
         == "compression_closed"
     )
+
+
+def test_subsequent_flush_and_reaper_short_circuit_after_adoption_failed(tmp_path: Path) -> None:
+    """Once _compression_adoption_failed is True, subsequent _flush_messages_to_session_db
+    and tui_gateway.session_reaper flush helpers must short-circuit without hitting SQLite again."""
+    from tui_gateway import session_reaper
+
+    store = open_persistence(profile_scope(home=tmp_path))
+    try:
+        seed_session(store, "parent", "tui")
+        seed_messages(store, "parent", {"role": "user", "content": "before split"})
+        store.sessions.end("parent", "compression")
+        seed_session(store, "stale", "tui", parent_session_id="parent")
+        store.sessions.end("stale", "ws_orphan_reap")
+
+        agent = _flush_agent(store, "parent")
+        messages = [{"role": "user", "content": "steered after compression"}]
+        assert agent._flush_messages_to_session_db(messages, []) is False
+        assert agent._compression_adoption_failed is True
+
+        # Replace _session_db with a failing stub to prove second flush short-circuits before DB access
+        agent._session_db = SimpleNamespace(
+            append_messages_batch=lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not hit DB"))
+        )
+        assert agent._flush_messages_to_session_db(messages, []) is False
+
+        agent._persist_session = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("reaper must not call _persist_session"))
+        agent._session_messages = messages
+        sess = {"agent": agent}
+        assert session_reaper._session_has_pending_flush(sess) is False
+        assert session_reaper._flush_session_messages(sess) is False
+    finally:
+        store.close()
+
