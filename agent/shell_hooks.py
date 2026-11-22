@@ -575,35 +575,35 @@ _HOMO_MAP = {
 
 _FAST_ACCEPT_ABSENT_RE: dict[str, re.Pattern[str]] = {
     "destructive-guard.sh": re.compile(
-        r"\b(rm|rmdir|unlink|find|rsync|git|mkfs|dd|drop|truncate|delete|gcloud|kubectl|gsutil|gh|approve\.sh|docker|vitest|jest|next|pytest|cargo|shred|wipe)\b"
+        r"(\b(rm|rmdir|unlink|find|rsync|git|mkfs|dd|drop|truncate|delete|gcloud|kubectl|gsutil|gh|approve\.sh|docker|vitest|jest|next|pytest|cargo|shred|wipe|shutil|rmtree|launchctl|bootout|unload|remove|disable|killall|pkill|curl|wget|bash|sh|zsh|ngrok|cloudflared|tailscale|socat|nc|ncat|ssh|setiampolicy|gam|chmod|chown|diskutil|srm|clean|reset|branch)\b|http\.server|workspace_user|workspace_group|\.sh)"
     ),
     "sibling-lease-guard.sh": re.compile(
-        r"\b(git|gcloud|gsutil|decision-queue|fleet_health_monitor|remote_call_lane|scratch|state\.db|vitest|jest|next|rm|send_message|create_draft|update_draft|send_draft|gmail|google_chat|sendemail|spaces/|iam|policy|access_grant|gam|write_file|patch|edit)\b"
+        r"(\b(git|gcloud|gsutil|decision-queue|fleet_health_monitor|remote_call_lane|scratch|state\.db|vitest|jest|next|rm|send_message|create_draft|update_draft|send_draft|gmail|google_chat|sendemail|iam|policy|access_grant|gam|write_file|patch|edit)\b|spaces/|workspace_user|workspace_group)"
     ),
     "ledger-write-guard-hermes.sh": re.compile(
         r"(approved-shas|base64|openssl|xxd|gunzip|gpg|unzip|uudecode|eval)"
     ),
     "github-review-gate.sh": re.compile(r"\b(git|gh)\b"),
     "config-write-guard-hermes.sh": re.compile(
-        r"(config\.yaml|soul\.md|agents\.md|authorization-matrix|hooks-hermes|hooks/|base64|openssl|xxd|gunzip|gpg|unzip|uudecode)"
+        r"(config\.yaml|soul\.md|agents\.md|authorization-matrix|ops-runbook\.md|surfaces\.md|intent-registry\.md|gotchas\.md|master-persona\.md|memory\.md|user\.md|plane-guard-allow-once|hooks-hermes|hooks/|base64|openssl|xxd|gunzip|gpg|unzip|uudecode)"
     ),
     "recipient-guard.sh": re.compile(r"(gmail|send|draft|himalaya|chat|mail|spaces/|@)"),
     "release-note-gate.py": re.compile(r"\b(gh|git|merge|pr|pull)\b"),
     "gmail-draft-delete-guard.sh": re.compile(r"(draft|gmail)"),
     "upstream-post-guard.py": re.compile(r"\b(gh|curl|api\.github\.com|issue|pr|discussion|comment)\b"),
     "prod-db-write-guard.py": re.compile(
-        r"\b(update|delete|insert|drop|alter|truncate|create|replace|grant|revoke|psql|mysql|roq|sql|cloud-sql-proxy)\b"
+        r"(\b(update|delete|insert|drop|alter|truncate|create|replace|grant|revoke|psql|mysql|roq|posq|sql|cloud-sql-proxy|pg_restore|pg_dump|5432|5433|3306|3307|1433|psycopg|pymysql|sqlalchemy)\b|uropenn-db|one-prod-db|prod-db-password)"
     ),
     "poll-guard.sh": re.compile(r"\b(sleep|watch|while|until|for|poll|wait)\b"),
     "access-grant-guard.sh": re.compile(
-        r"\b(iam|policy|binding|workspace_user|workspace_group|grant|role|gam|gcloud|gh)\b"
+        r"(iam|policy|binding|workspace_user|workspace_group|uop_workspace|grant|role|gam|gcloud|gh)"
     ),
     "cron-mutation-provenance-guard.sh": re.compile(r"(cron|jobs\.json|crontab|launchctl|plist)"),
     "guide-publish-guard-hermes.sh": re.compile(r"(gsutil|gcloud|uropenn-docs|guide|storage)"),
     "ooo-window-gate-hermes.sh": re.compile(r"(ooo|out.of.office|vacation|auto.reply|vacation_settings)"),
-    "plane-html-guard-hermes.sh": re.compile(r"(plane|workitem)"),
-    "marker-corruption-guard.py": re.compile(r"(redacted|<<|write_file|patch)"),
-    "persona-save-guard.py": re.compile(r"(persona|soul\.md|memory\.md|user\.md|generate\.py)"),
+    "plane-html-guard-hermes.sh": re.compile(r"(plane|workitem|work-items|8087/mcp)"),
+    "marker-corruption-guard.py": re.compile(r"(redacted|<<|write_file|patch|execute_code|terminal|bash|edit|create_file|cat|python|tee)"),
+    "persona-save-guard.py": re.compile(r"(persona|soul\.md|memory\.md|user\.md|generate\.py|write_file|patch|edit|terminal|bash|execute_code)"),
 }
 
 
