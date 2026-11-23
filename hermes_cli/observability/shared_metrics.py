@@ -35,7 +35,7 @@ from .shared_metrics_drift import conform_counter_dimensions, counter_dimensions
 
 _PACKAGE_SCHEMA_VERSION = "hermes.shared_metrics.v4"
 _STORE_SCHEMA_VERSION = "2"
-_BUSY_TIMEOUT_MS = 250
+_BUSY_TIMEOUT_MS = 2500
 _SCHEMA_BUSY_TIMEOUT_MS = 5_000
 # Writes a busy store could not take within _BUSY_TIMEOUT_MS, kept in memory for the next write.
 _DEFERRED_WRITES_MAX = 1_024
