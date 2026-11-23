@@ -140,7 +140,7 @@ SKILL_SAFETY_RULE = (
     "Pinned Invariant Floor (always active even while a skill reload is pending):\n"
     "- Outbound (outbound-comms / google-chat-comms / humanizer): stage drafts only (never auto-send); Gmail create/update_draft = FULL REPLACE (pass BOTH body and html_body + thread_id/reply_to_message_id on replies); Celina/Ola/Hanna max 1 sentence DM / 1-2 room sentences, zero bullet lists; devs=English, business/store=Swedish.\n"
     "- Plane (plane-tickets): engineering projects (NEWWEBSHOP/ONE/ECOM/ATLAS/2IZII) = English only, raw HTML, explicit priority + label, 2IZII requires 'internal' label, never assign/flip developer colleague tickets without a 24h Google Chat heads-up.\n"
-    "- Verification (always-verify / dab / rca / deep-research / research-and-plan): re-run receipts LIVE at claim time, quote verbatim output lines, run polarity + disconfirming checks before claiming done, and queue non-urgent GO asks via decision-queue.py."
+    "- Verification (always-verify / dab / rca / deep-research / research-and-plan): re-run receipts LIVE at claim time, quote verbatim output lines, run polarity + disconfirming checks before claiming done, read_file @file: attachments from line 1 after compaction (their '--- Attached Context ---' block is stripped on restatement — never infer attachment headers/numbers from the summary), and queue non-urgent GO asks via decision-queue.py."
 )
 
 

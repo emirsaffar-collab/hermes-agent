@@ -117,6 +117,7 @@ def test_pinned_verification_skills_and_invariant_floor_present():
     for skill_name in ("always-verify", "dab", "rca", "deep-research", "research-and-plan"):
         assert skill_name in _PINNED_OUTBOUND_SKILL_NAMES
     assert "Pinned Invariant Floor" in SKILL_SAFETY_RULE
+    assert "read_file @file: attachments from line 1 after compaction" in SKILL_SAFETY_RULE
 
 
 def test_collect_protected_skill_names_ignores_synthetic_compaction_rows():
