@@ -23,7 +23,7 @@ from agent.agent_init_session import agent_interface
 from agent.prompt_builder import steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.route_verdicts import ROUTE_VERDICT_FIELDS, reset_route_verdicts, reset_route_verdicts_if_moved
-from agent.think_scrubber import CODE_FENCE_OR_SPAN, THINK_TAG_NAMES
+from agent.think_scrubber import CODE_FENCE_OR_SPAN, ORPHAN_STRIP_TAG_NAMES, THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
     STATUS_EXHAUSTED, _parse_absolute_timestamp, credential_pool_entry_serves_endpoint,
@@ -63,7 +63,7 @@ _UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
     rf'{CODE_FENCE_OR_SPAN}|(?:^|\n)[ \t]*<(?:{"|".join(THINK_TAG_NAMES)})\b[^>]*>.*$', re.DOTALL | re.IGNORECASE
 )
 _ORPHAN_REASONING_TAG_PATTERN = re.compile(
-    rf'{CODE_FENCE_OR_SPAN}|(?<!`)</?(?:{"|".join(THINK_TAG_NAMES)})>(?!`)\s*', re.IGNORECASE
+    rf'{CODE_FENCE_OR_SPAN}|(?<!`)</?(?:{"|".join(ORPHAN_STRIP_TAG_NAMES)})>(?!`)\s*', re.IGNORECASE
 )
 _STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
     rf'</(?:{_NS_PREFIX}(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function))>\s*', re.IGNORECASE
@@ -2243,6 +2243,10 @@ def fill_empty_non_final_wire_payload(msg: dict[str, Any], *, is_final: bool) ->
     Pass the per-call copy only; durable history must not be mutated."""
     if is_final or not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
         return False
+    if msg.get("role") == "assistant":
+        content = msg.get("content")
+        if isinstance(content, str) and "<" in content and not strip_think_blocks(None, content).strip():
+            msg["content"] = ""
     if _msg_has_payload(msg):
         return False
     msg["content"] = _INTERRUPTED_PLACEHOLDER

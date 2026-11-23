@@ -548,3 +548,28 @@ class TestCodeFenceAndVertexGoogleThoughtGuards:
         s_chars = StreamingThinkScrubber()
         assert _drive(s_chars, list(raw)).strip() == expected_visible
 
+    def test_leaked_multimodal_boundary_tokens_stripped_outside_backticks(self):
+        from types import SimpleNamespace
+        from agent.agent_runtime_helpers import (
+            _INTERRUPTED_PLACEHOLDER,
+            fill_empty_non_final_wire_payload,
+            strip_think_blocks,
+        )
+        from hermes_cli.cli_render import _strip_reasoning_tags
+
+        stub = SimpleNamespace(_think_scrubber=None)
+        assert strip_think_blocks(stub, "<end_of_image><end_of_image>") == ""
+        assert _strip_reasoning_tags("<end_of_image><end_of_image>") == ""
+        assert strip_think_blocks(stub, "<end_of_image>Visible answer<end_of_image>").strip() == "Visible answer"
+        assert strip_think_blocks(stub, "Token `<end_of_image>` stays").strip() == "Token `<end_of_image>` stays"
+
+        s = StreamingThinkScrubber()
+        assert _drive(s, ["<end_of_", "image><end_of_image>"]) == ""
+        s.reset()
+        assert _drive(s, ["Keep `<end_of_", "image>` here"]) == "Keep `<end_of_image>` here"
+
+        wire_msg = {"role": "assistant", "content": "<end_of_image><end_of_image>"}
+        assert fill_empty_non_final_wire_payload(wire_msg, is_final=False) is True
+        assert wire_msg["content"] == _INTERRUPTED_PLACEHOLDER
+
+

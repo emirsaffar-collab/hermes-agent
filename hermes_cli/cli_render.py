@@ -74,8 +74,16 @@ def _strip_reasoning_tags(text: str) -> str:
         r'(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*<function\b[^>]*\bname\s*=[^>]*>(?:(?:(?!</function>).)*)</function>\s*',
         '', cleaned, flags=re.DOTALL | re.IGNORECASE,
     )
-    # Stray closers and cut tool-call fragments share storage's compiled patterns (#101899, #102303).
-    from agent.agent_runtime_helpers import _STRAY_TOOL_CALL_CLOSER_PATTERN, _UNTERMINATED_TOOL_CALL_PATTERN
+    # Stray closers, orphan reasoning/multimodal tags, and cut tool-call fragments share storage's compiled patterns (#101899, #102303).
+    from agent.agent_runtime_helpers import (
+        _ORPHAN_REASONING_TAG_PATTERN,
+        _STRAY_TOOL_CALL_CLOSER_PATTERN,
+        _UNTERMINATED_TOOL_CALL_PATTERN,
+    )
+    cleaned = _ORPHAN_REASONING_TAG_PATTERN.sub(
+        lambda m: m.group(1) if m.lastindex and m.group(1) is not None else '',
+        cleaned,
+    )
     cleaned = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub('', cleaned)
     cleaned = _UNTERMINATED_TOOL_CALL_PATTERN.sub('', cleaned)
     return cleaned.strip()

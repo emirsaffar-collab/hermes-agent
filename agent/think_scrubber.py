@@ -15,6 +15,8 @@ from typing import Tuple
 
 __all__ = [
     "CODE_FENCE_OR_SPAN",
+    "LEAKED_MULTIMODAL_TAG_NAMES",
+    "ORPHAN_STRIP_TAG_NAMES",
     "THINK_CLOSE_TAGS",
     "THINK_OPEN_TAGS",
     "THINK_TAG_NAMES",
@@ -36,6 +38,12 @@ THINK_TAG_NAMES: tuple[str, ...] = (
     "think", "thinking", "reasoning", "thought", "REASONING_SCRATCHPAD",
     "思考", "反思", "推理", "推敲", "mm:think",
 )
+# Standalone multimodal boundary tokens occasionally leaked by Vertex Gemini 4 Argon (`<end_of_image>`)
+# after reasoning blocks; stripped as orphan tokens without treating `<end_of_image>` as a block opener.
+LEAKED_MULTIMODAL_TAG_NAMES: tuple[str, ...] = (
+    "end_of_image", "start_of_image", "end_of_audio", "start_of_audio", "image_soft_token",
+)
+ORPHAN_STRIP_TAG_NAMES: tuple[str, ...] = THINK_TAG_NAMES + LEAKED_MULTIMODAL_TAG_NAMES
 THINK_OPEN_TAGS: tuple[str, ...] = tuple(f"<{name.lower()}>" for name in THINK_TAG_NAMES)
 THINK_CLOSE_TAGS: tuple[str, ...] = tuple(f"</{name.lower()}>" for name in THINK_TAG_NAMES)
 
@@ -51,11 +59,16 @@ class StreamingThinkScrubber:
     # Literal tags so the hot path does string ops, not regex per feed().
     _OPEN_TAGS: tuple[str, ...] = THINK_OPEN_TAGS
     _CLOSE_TAGS: tuple[str, ...] = THINK_CLOSE_TAGS
-    _ALL_TAGS: tuple[str, ...] = _OPEN_TAGS + _CLOSE_TAGS
+    _ORPHAN_TAGS: tuple[str, ...] = (
+        THINK_CLOSE_TAGS
+        + tuple(f"<{name}>" for name in LEAKED_MULTIMODAL_TAG_NAMES)
+        + tuple(f"</{name}>" for name in LEAKED_MULTIMODAL_TAG_NAMES)
+    )
+    _ALL_TAGS: tuple[str, ...] = _OPEN_TAGS + _ORPHAN_TAGS
     _MAX_TAG_LEN: int = max(len(tag) for tag in _ALL_TAGS)
-    # Orphan close tag plus trailing whitespace (matches _strip_think_blocks case 3).
+    # Orphan close tag / leaked multimodal boundary token plus trailing whitespace (matches _strip_think_blocks case 3).
     _ORPHAN_CLOSE_RE = re.compile(
-        rf"{CODE_FENCE_OR_SPAN}|(?<!`)(?:" + "|".join(re.escape(t) for t in _CLOSE_TAGS) + r")(?!`)[ \t\n\r]*",
+        rf"{CODE_FENCE_OR_SPAN}|(?<!`)(?:" + "|".join(re.escape(t) for t in _ORPHAN_TAGS) + r")(?!`)[ \t\n\r]*",
         re.IGNORECASE,
     )
 
@@ -285,8 +298,8 @@ class StreamingThinkScrubber:
     def _strip_orphan_close_tags(
         cls, text: str, prior_ended_backtick: bool = False, emitted_prefix: str = ""
     ) -> str:
-        """Remove close tags with no matching open (always noise) plus trailing whitespace."""
-        if "</" not in text:
+        """Remove close tags with no matching open (and leaked multimodal tokens) plus trailing whitespace."""
+        if "<" not in text:
             return text
         probe = f"`{text}" if prior_ended_backtick else text
         offset = 1 if prior_ended_backtick else 0
