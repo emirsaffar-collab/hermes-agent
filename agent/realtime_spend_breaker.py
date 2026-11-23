@@ -705,6 +705,29 @@ def record_realtime_llm_call(
     return row_info
 
 
+def _sum_tier2_non_tier0_spend(cur: sqlite3.Cursor, day_cet: str, t_15m: float) -> tuple[float, float]:
+    cur.execute(
+        """
+        SELECT source, job_name, session_id, day_cet, ts, COALESCE(net_eur, 0.0)
+        FROM llm_call_ledger
+        WHERE (day_cet = ? OR ts >= ?)
+          AND (source = 'cron' OR (source = 'background_review' AND (session_id LIKE 'local-%' OR session_id LIKE 'cron%')))
+        """,
+        (day_cet, t_15m),
+    )
+    eur_today = 0.0
+    eur_15m = 0.0
+    for r_src, r_job, r_sid, r_day, r_ts, r_eur in cur.fetchall():
+        if r_src == "cron" and is_tier0_critical_cron(r_job, r_sid):
+            continue
+        val = float(r_eur or 0.0)
+        if str(r_day or "") == day_cet:
+            eur_today += val
+        if float(r_ts or 0.0) >= t_15m:
+            eur_15m += val
+    return eur_today, eur_15m
+
+
 def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
     ts_now = float(now if now is not None else time.time())
     day_cet = _day_cet(ts_now)
@@ -779,6 +802,7 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
                 (ts_now,),
             )
             q_count = cur.fetchone()[0]
+            tier2_today_f, tier2_15m_f = _sum_tier2_non_tier0_spend(cur, day_cet, t_15m)
         finally:
             con.close()
     except Exception as exc:
@@ -800,6 +824,7 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
             "net_eur_today_all": 0.0,
             "cache_hit_pct_today_all": 100.0,
             "net_eur_today_non_interactive": 0.0,
+            "net_eur_today_tier2_pool": 0.0,
             "cache_hit_pct_today": 100.0,
             "cache_resets_today": 0,
             "active_quarantined_sessions": 0,
@@ -814,7 +839,6 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
     eurday_f = float(eurday or 0.0)
     eur15_f = float(eur15 or 0.0)
     eurday_cron_bg_f = float(eurday_cron_bg or 0.0)
-    eur15_cron_bg_f = float(eur15_cron_bg or 0.0)
     q_int = int(q_count or 0)
     active_cap = get_active_budget_cap(ts_now)
     eff_tier3_hard_eur = (
@@ -836,7 +860,7 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
         breaker_state = "MANUAL_EMERGENCY_BRAKE"
     elif eurday_cron_bg_f >= eff_tier3_hard_eur:
         breaker_state = "TIER3_DAILY_HARD_CAP"
-    elif eurday_cron_bg_f >= eff_tier2_soft_eur or eur15_cron_bg_f >= eff_tier2_burst_15m_eur:
+    elif tier2_today_f >= eff_tier2_soft_eur or tier2_15m_f >= eff_tier2_burst_15m_eur:
         breaker_state = "TIER2_DAILY_SOFT_CAP"
     elif q_int > 0:
         breaker_state = "TIER1_SESSION_QUARANTINED"
@@ -863,6 +887,7 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
         "net_eur_today_all": round(float(eurday_all or 0.0), 4),
         "cache_hit_pct_today_all": hitday_all,
         "net_eur_today_non_interactive": round(float(eurday_non_int or 0.0), 4),
+        "net_eur_today_tier2_pool": round(tier2_today_f, 4),
         "cache_hit_pct_today": hitday,
         "cache_resets_today": int(crday or 0),
         "active_quarantined_sessions": q_int,
@@ -1090,6 +1115,7 @@ def evaluate_realtime_spend_breaker(
                 (day_cet,),
             )
             non_interactive_today = float(cur.fetchone()[0] or 0.0)
+            tier2_non_tier0_today, tier2_non_tier0_15m = _sum_tier2_non_tier0_spend(cur, day_cet, ts_now - 900.0)
         finally:
             con.close()
     except Exception as exc:
@@ -1289,17 +1315,20 @@ def evaluate_realtime_spend_breaker(
             "non_interactive_net_eur_today": non_interactive_today,
         }
 
-    # Tier 2: Daily Soft Cap (€150/day net default) or 15m Burst (€8/15m default on non-interactive pool) suppresses background_review and non-Tier-0 crons
+    # Tier 2: Daily Soft Cap (€150/day net default) or 15m Burst (€8/15m default on non-Tier-0 pool) suppresses background_review and non-Tier-0 crons
+    tier2_pool_today = non_interactive_today if src == "background_review" else tier2_non_tier0_today
+    tier2_pool_15m = non_interactive_15m if src == "background_review" else tier2_non_tier0_15m
     if src in ("background_review", "cron") and (
-        non_interactive_today >= eff_tier2_soft_eur or non_interactive_15m >= eff_tier2_burst_15m_eur
+        tier2_pool_today >= eff_tier2_soft_eur or tier2_pool_15m >= eff_tier2_burst_15m_eur
     ):
         return {
             "allowed": False,
             "reason": (
-                f"tier2_daily_soft_cap (non-interactive today €{non_interactive_today:.2f} / 15m €{non_interactive_15m:.2f})"
+                f"tier2_daily_soft_cap (non-interactive today €{tier2_pool_today:.2f} / 15m €{tier2_pool_15m:.2f})"
             ),
             "estate_net_eur_today": estate_today,
             "non_interactive_net_eur_today": non_interactive_today,
+            "tier2_pool_net_eur_today": tier2_pool_today,
         }
 
     return {
