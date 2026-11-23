@@ -625,3 +625,28 @@ def test_config_from_env_brief_settings(monkeypatch):
     assert cfg.brief_max_seconds == 420.0
 
 
+def test_rtc_merge_fragment_immediately_updates_last_audio_activity_above_dtx_floor(tmp_path):
+    from plugins.google_meet.meet_bot import _BotConfig, _BotState, _RtcTranscriber, _PARTICIPANT_COUNT_JS
+
+    cfg = _BotConfig(out_dir=tmp_path, whisper_model="small")
+    state = _BotState(tmp_path, "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
+    rtc = _RtcTranscriber(cfg, state, {"stop": False})
+
+    # DTX silence chunk (< 2000 bytes) does not mark speech activity
+    dtx_frag = tmp_path / "frag_dtx.webm"
+    dtx_frag.write_bytes(rtc._EBML_MAGIC + b"\x00" * 400)
+    rtc._merge_fragment_immediately(1, dtx_frag)
+    assert state.audio_fragments == 1
+    assert state.last_audio_activity_at is None
+
+    # Active speech WebRTC chunk (>= 2000 bytes) updates last_audio_activity_at immediately
+    # even before the downstream GPU transcription worker finishes
+    speech_frag = tmp_path / "frag_speech.webm"
+    speech_frag.write_bytes(rtc._EBML_MAGIC + b"\x01" * 4096)
+    rtc._merge_fragment_immediately(2, speech_frag)
+    assert state.audio_fragments == 2
+    assert state.last_audio_activity_at is not None
+    assert "vid.videoWidth > 0" in _PARTICIPANT_COUNT_JS
+
+
+

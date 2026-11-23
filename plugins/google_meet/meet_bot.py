@@ -148,6 +148,9 @@ def _classify_voice_control(text: str) -> Optional[str]:
 class _BotState:
     """Single-process mutable state, flushed to ``status.json`` on each change."""
 
+    audio_fragments: int = 0
+    last_audio_activity_at: Optional[float] = None
+
     def __init__(self, out_dir: Path, meeting_id: str, url: str):
         self.__dict__.update({attr: default for _, attr, default in _STATUS_FIELDS if attr})
         self.__dict__.update(out_dir=out_dir, meeting_id=meeting_id, url=url, _seen=set(),  # seen "speaker|text"
@@ -818,11 +821,89 @@ class _RtcTranscriber:
         allowed_langs: Optional[set[str]] = None,
         speeches: Optional[list[dict]] = None,
     ):
-        """Run Simul-Whisper style variable-length dynamic encoder on Apple Silicon Metal GPU."""
+        """Run Simul-Whisper style variable-length dynamic encoder via `voice_gpu_worker.py` (127.0.0.1:8817)
+        on the GUI main thread, avoiding background-thread Metal (`IOGPUCommandQueueSubmitCommandBuffers`) `UNs` deadlocks
+        and duplicate 2.7 GB per-bot Metal memory allocations.
+        """
+        import base64
         import gc
         import importlib
+        import io
+        import urllib.request
+        import wave
         import numpy as np
         from types import SimpleNamespace
+
+        if speeches:
+            speech_pcm = np.concatenate([tail[sp["start"]:sp["end"]] for sp in speeches])
+            seg_start_s = float(speeches[0]["start"]) / 16000.0
+            seg_end_s = float(speeches[-1]["end"]) / 16000.0
+        else:
+            speech_pcm = tail
+            seg_start_s = 0.0
+            seg_end_s = max(1.0, float(len(tail)) / 16000.0)
+
+        window_samples = 25 * 16000
+        total_samples = len(speech_pcm)
+        chunk_ranges = (
+            [(off, min(total_samples, off + window_samples)) for off in range(0, total_samples, window_samples)]
+            if total_samples > 30 * 16000
+            else [(0, total_samples)]
+        )
+
+        if os.environ.get("HERMES_MEET_INPROC_MLX", "0").strip() != "1":
+            worker_url = os.environ.get("HERMES_MEET_GPU_WORKER_URL", "http://127.0.0.1:8817/transcribe").strip()
+            segs = []
+            det_lang = lang_env if (lang_env and lang_env != "auto") else "sv"
+            for c_start, c_end in chunk_ranges:
+                c_pcm = np.asarray(speech_pcm[c_start:c_end], dtype=np.float32)
+                if len(c_pcm) < 3200:
+                    continue
+                peak = float(np.max(np.abs(c_pcm))) if len(c_pcm) else 0.0
+                if peak < 0.005:
+                    continue
+                norm_pcm = np.clip((c_pcm / peak) * 0.9, -1.0, 1.0)
+                pcm_i16 = (norm_pcm * 32767.0).astype(np.int16).tobytes()
+                wav_buf = io.BytesIO()
+                with wave.open(wav_buf, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(pcm_i16)
+                payload = json.dumps({
+                    "audio_b64": base64.b64encode(wav_buf.getvalue()).decode("ascii"),
+                    "ext": "wav",
+                    "fast": True,
+                    "voice_gate": "off",
+                }).encode("utf-8")
+                try:
+                    req = urllib.request.Request(
+                        worker_url,
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=18.0) as resp:
+                        out = json.loads(resp.read().decode("utf-8"))
+                    txt = str(out.get("transcript") or "").strip()
+                    langs = out.get("detected_languages") or []
+                    if langs and isinstance(langs, list) and langs[0]:
+                        det_lang = str(langs[0]).lower()
+                    if txt and not re.search(r"\b(\w+)(?:[\s,]+\1){3,}", txt, re.IGNORECASE):
+                        c_s = seg_start_s + (float(c_start) / 16000.0)
+                        c_e = min(seg_end_s, seg_start_s + (float(c_end) / 16000.0))
+                        segs.append(SimpleNamespace(text=txt, start=c_s, end=c_e))
+                except Exception as exc:
+                    sys.stderr.write(f"meet rtc: voice_gpu_worker chunk {c_start}..{c_end} deferred ({exc})\n")
+                    break
+            info = SimpleNamespace(
+                language=det_lang or "sv",
+                language_probability=0.98,
+                no_speech_prob=0.0 if segs else 0.5,
+                compression_ratio=1.0,
+            )
+            return segs, info
+
         asr_site = "/Users/emirsaffar/.hermes/tools/asr-sv/.venv/lib/python3.11/site-packages"
         if Path(asr_site).is_dir() and asr_site not in sys.path:
             sys.path.insert(0, asr_site)
@@ -834,15 +915,6 @@ class _RtcTranscriber:
         pad_or_trim = mlx_audio.pad_or_trim
         DecodingOptions = importlib.import_module("mlx_whisper.decoding").DecodingOptions
         get_tokenizer = importlib.import_module("mlx_whisper.tokenizer").get_tokenizer
-
-        if speeches:
-            speech_pcm = np.concatenate([tail[sp["start"]:sp["end"]] for sp in speeches])
-            seg_start_s = float(speeches[0]["start"]) / 16000.0
-            seg_end_s = float(speeches[-1]["end"]) / 16000.0
-        else:
-            speech_pcm = tail
-            seg_start_s = 0.0
-            seg_end_s = max(1.0, float(len(tail)) / 16000.0)
 
         mlx_repo = os.environ.get(
             "HERMES_MEET_MLX_MODEL",
@@ -1039,9 +1111,14 @@ class _RtcTranscriber:
                     data = data[cluster:]
             with merged.open("ab") as f:
                 f.write(data)
+            active_ts = (
+                now_ts
+                if len(data) >= 2000
+                else self.state.last_audio_activity_at
+            )
             self.state.set(
                 audio_fragments=self.state.audio_fragments + 1,
-                last_audio_activity_at=self.state.last_audio_activity_at,
+                last_audio_activity_at=active_ts,
             )
             _quiet(path.unlink)
             return len(data)
@@ -1498,7 +1575,13 @@ _PARTICIPANT_COUNT_JS = r"""
           const rawTxt = (t.innerText || t.textContent || '').trim();
           const aria = (t.getAttribute('aria-label') || '').trim();
           const combined = `${selfName} ${rawTxt} ${aria}`.trim();
-          if (!combined) continue;
+          if (!combined) {
+            const vid = t.querySelector('video');
+            if (vid && vid.readyState >= 2 && vid.videoWidth > 0 && !vid.paused) {
+              humanOtherCount += 1;
+            }
+            continue;
+          }
           if (botRe.test(combined)) continue;
           const lines = rawTxt.split(/\n+/).map(s => s.trim()).filter(Boolean);
           if (lines.length > 0 && lines.every(l => selfRe.test(l) || botRe.test(l))) continue;
@@ -1711,6 +1794,8 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 60.0) -> Non
         for dismiss_sel in (
             'div[role="dialog"][aria-label*="Byt samtal" i] button',
             'div[role="dialog"][aria-label*="Switch" i] button',
+            'button:has-text("Fortsätt utan mikrofon och kamera")',
+            'button:has-text("Continue without microphone and camera")',
             'button:has-text("Got it")',
             'button:has-text("Uppfattat")',
             'button:has-text("Jag förstår")',
@@ -2138,6 +2223,16 @@ def run_bot() -> int:
         os.environ["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
     context_args = dict(_CONTEXT_ARGS)
     if cfg.auth_state and Path(cfg.auth_state).is_file():
+        try:
+            raw_auth = Path(cfg.auth_state).read_text(encoding="utf-8").lstrip()
+            obj_auth, end_idx = json.JSONDecoder().raw_decode(raw_auth)
+            if end_idx < len(raw_auth.rstrip()):
+                tmp_heal = f"{cfg.auth_state}.heal.{os.getpid()}"
+                Path(tmp_heal).write_text(json.dumps(obj_auth, ensure_ascii=False), encoding="utf-8")
+                os.chmod(tmp_heal, 0o600)
+                os.replace(tmp_heal, cfg.auth_state)
+        except Exception:
+            pass
         context_args["storage_state"] = cfg.auth_state
     # RTC capture plumbing: init script must precede any page load, the binding before
     # the first MediaRecorder chunk (~10 s after join). Fragments land in audio/ and are
@@ -2209,7 +2304,13 @@ def run_bot() -> int:
                 _quiet(page.wait_for_timeout, 1500)
             _quiet(page.evaluate, _LEAVE_CALL_JS)
             if cfg.auth_state:
-                _quiet(context.storage_state, path=cfg.auth_state)
+                tmp_auth = f"{cfg.auth_state}.tmp.{os.getpid()}"
+                if _quiet(context.storage_state, path=tmp_auth) is not None or Path(tmp_auth).is_file():
+                    try:
+                        os.chmod(tmp_auth, 0o600)
+                        os.replace(tmp_auth, cfg.auth_state)
+                    except OSError:
+                        pass
             _quiet(context.close)
             _quiet(browser.close)
             if cfg.rtc_audio:
