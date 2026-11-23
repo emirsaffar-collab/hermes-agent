@@ -1650,35 +1650,36 @@ def test_tier0_critical_cron_spend_does_not_starve_tier2_builder_owner_crons(tmp
     monkeypatch.setenv("HERMES_AI_BUDGET_CAP_PATH", str(cap_file))
 
     now = time.time()
-    # Record ~€34.50 on Tier-0 critical cron chat247-owner
+    # Record ~€43.73 on Tier-0 critical cron chat247-owner
     rsb.record_realtime_llm_call(
         session_id="local-tier0-chat247",
         source="cron",
         job_name="chat247-owner",
         provider="vertex",
         model="google/gemini-4-argon",
-        prompt_tokens=8_000_000,
-        uncached_input_tokens=8_000_000,
+        prompt_tokens=12_000_000,
+        uncached_input_tokens=12_000_000,
         cache_read_tokens=0,
-        output_tokens=2_000_000,
-        request_id="rid_tier0_35",
+        output_tokens=3_000_000,
+        request_id="rid_tier0_44",
     )
-    # Record ~€128.25 on non-Tier-0 newintra-builder-owner (total non-interactive ~€162.75: >= €150 soft cap, < €195 hard cap)
+    # Record ~€120.97 on non-Tier-0 newintra-builder-owner (total non-interactive ~€164.70: >= €150 soft cap, < €195 hard cap)
     rsb.record_realtime_llm_call(
         session_id="local-tier2-newintra",
         source="cron",
         job_name="newintra-builder-owner",
         provider="vertex",
         model="google/gemini-4-argon",
-        prompt_tokens=30_000_000,
-        uncached_input_tokens=30_000_000,
+        prompt_tokens=35_000_000,
+        uncached_input_tokens=35_000_000,
         cache_read_tokens=0,
-        output_tokens=7_000_000,
-        request_id="rid_tier2_128",
+        output_tokens=8_000_000,
+        request_id="rid_tier2_121",
     )
-    eval_now = now + 7200.0
+    eval_now = now + 1000.0
     summary = rsb.get_realtime_spend_summary(now=eval_now)
     assert summary["breaker_state"] == "ARMED_OK"
+    assert summary["net_eur_today_non_interactive"] >= 150.0
     assert summary["net_eur_today_tier2_pool"] < 150.0
 
     v_ok = rsb.evaluate_realtime_spend_breaker(
@@ -1692,18 +1693,18 @@ def test_tier0_critical_cron_spend_does_not_starve_tier2_builder_owner_crons(tmp
     assert v_ok["allowed"] is True
     assert v_ok["reason"] == "ok"
 
-    # Negative polarity: non-Tier-0 cron spend crosses €150 soft cap (~€155) while total (~€183.50) stays < €195 hard cap
+    # Negative polarity: non-Tier-0 cron spend crosses €150 soft cap (~€150.12) while total (~€193.85) stays < €195 hard cap
     rsb.record_realtime_llm_call(
         session_id="local-tier2-lager",
         source="cron",
         job_name="lager-builder-owner",
         provider="vertex",
         model="google/gemini-4-argon",
-        prompt_tokens=15_000_000,
-        uncached_input_tokens=15_000_000,
+        prompt_tokens=8_000_000,
+        uncached_input_tokens=8_000_000,
         cache_read_tokens=0,
-        output_tokens=4_000_000,
-        request_id="rid_tier2_50_more",
+        output_tokens=2_000_000,
+        request_id="rid_tier2_29_more",
     )
     summary_tripped = rsb.get_realtime_spend_summary(now=eval_now)
     assert summary_tripped["breaker_state"] == "TIER2_DAILY_SOFT_CAP"
