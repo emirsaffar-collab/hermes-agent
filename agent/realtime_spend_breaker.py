@@ -717,7 +717,7 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
             cur.execute(
                 """
                 SELECT COUNT(*), COALESCE(SUM(net_eur), 0.0),
-                       COALESCE(SUM(CASE WHEN source IN ('cron', 'background_review') THEN net_eur ELSE 0.0 END), 0.0),
+                       COALESCE(SUM(CASE WHEN source = 'cron' OR (source = 'background_review' AND (session_id LIKE 'local-%' OR session_id LIKE 'cron%')) THEN net_eur ELSE 0.0 END), 0.0),
                        COALESCE(SUM(uncached_in), 0), COALESCE(SUM(cached_in), 0),
                        COALESCE(SUM(cache_reset), 0)
                 FROM llm_call_ledger WHERE ts >= ? AND source != 'log_tail'
@@ -755,7 +755,7 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
                 """
                 SELECT COUNT(*), COALESCE(SUM(net_eur), 0.0),
                        COALESCE(SUM(CASE WHEN source NOT IN ('desktop', 'mobile', 'tui', 'tui_gateway', 'gui', 'web', 'cli', 'interactive', 'log_tail') THEN net_eur ELSE 0.0 END), 0.0),
-                       COALESCE(SUM(CASE WHEN source IN ('cron', 'background_review') THEN net_eur ELSE 0.0 END), 0.0),
+                       COALESCE(SUM(CASE WHEN source = 'cron' OR (source = 'background_review' AND (session_id LIKE 'local-%' OR session_id LIKE 'cron%')) THEN net_eur ELSE 0.0 END), 0.0),
                        COALESCE(SUM(uncached_in), 0), COALESCE(SUM(cached_in), 0),
                        COALESCE(SUM(cache_reset), 0)
                 FROM llm_call_ledger WHERE day_cet = ? AND source != 'log_tail'
@@ -1074,14 +1074,19 @@ def evaluate_realtime_spend_breaker(
             )
             estate_today = float(cur.fetchone()[0] or 0.0)
 
+            _ni_clause = (
+                "source IN ('cron', 'background_review')"
+                if src == "background_review"
+                else "(source = 'cron' OR (source = 'background_review' AND (session_id LIKE 'local-%' OR session_id LIKE 'cron%')))"
+            )
             cur.execute(
-                "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE ts >= ? AND source IN ('cron', 'background_review')",
+                f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE ts >= ? AND {_ni_clause}",
                 (ts_now - 900.0,),
             )
             non_interactive_15m = float(cur.fetchone()[0] or 0.0)
 
             cur.execute(
-                "SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE day_cet = ? AND source IN ('cron', 'background_review')",
+                f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE day_cet = ? AND {_ni_clause}",
                 (day_cet,),
             )
             non_interactive_today = float(cur.fetchone()[0] or 0.0)

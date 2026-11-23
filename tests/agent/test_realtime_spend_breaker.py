@@ -1571,6 +1571,71 @@ def test_cron_job_name_aggregates_across_fresh_local_session_ids_and_caps_budget
     assert float(aux_row[5]) > 0.0
 
 
+def test_desktop_background_review_does_not_starve_cron_tier2_daily_soft_cap(tmp_path, monkeypatch):
+    import time
+
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    cap_file = tmp_path / "ai-budget-cap.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+    monkeypatch.setenv("HERMES_AI_BUDGET_CAP_PATH", str(cap_file))
+
+    now = time.time()
+    # 1) Cron spend earlier today is ~€105 (< €150 TIER2_DAILY_SOFT_CAP_EUR)
+    rsb.record_realtime_llm_call(
+        session_id="local-87eb84d3cd09784835b92c88a9eb541fc13ce6fed0016072046e4fe4c4058b0e",
+        source="cron",
+        job_name="newintra-builder-owner",
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=30_000_000,
+        uncached_input_tokens=30_000_000,
+        cache_read_tokens=0,
+        output_tokens=8_000_000,
+        request_id="rid_cron_105",
+    )
+    # 2) Interactive Desktop background_review spend today is ~€50 (making cron + desktop bg_review > €150)
+    rsb.record_realtime_llm_call(
+        session_id="20261123_152435_14c822",
+        source="background_review",
+        job_name="",
+        provider="vertex",
+        model="google/gemini-4-argon",
+        prompt_tokens=15_000_000,
+        uncached_input_tokens=15_000_000,
+        cache_read_tokens=0,
+        output_tokens=4_000_000,
+        request_id="rid_desk_bg_50",
+    )
+    eval_now = now + 7200.0
+    summary = rsb.get_realtime_spend_summary(now=eval_now)
+    assert summary["breaker_state"] == "ARMED_OK"
+
+    v_cron = rsb.evaluate_realtime_spend_breaker(
+        session_id="local-87eb84d3-next",
+        source="cron",
+        job_name="newintra-builder-owner",
+        model="google/gemini-4-argon",
+        provider="vertex",
+        now=eval_now,
+    )
+    assert v_cron["allowed"] is True
+    assert v_cron["reason"] == "ok"
+
+    # Negative polarity: background_review itself still sees combined cron + background_review (> €150) and is throttled
+    v_bg = rsb.evaluate_realtime_spend_breaker(
+        session_id="20261123_152435_14c822",
+        source="background_review",
+        model="google/gemini-4-argon",
+        provider="vertex",
+        now=eval_now,
+    )
+    assert v_bg["allowed"] is False
+    assert "tier2_daily_soft_cap" in v_bg["reason"]
+
+
+
 
 
 
