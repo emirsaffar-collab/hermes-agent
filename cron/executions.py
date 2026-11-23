@@ -440,10 +440,14 @@ def _recoverable_row(conn, execution_id, job_id):
 
 
 def _row_owner_live(row) -> bool:
+    if row['status'] == 'unknown':
+        # Only a given-up attempt (give_up_execution) or dead-owner sweep reaches 'unknown';
+        # no firer is actively finishing it, even if an external firer PID is still alive.
+        return False
     if row['process_id'] == _PROCESS_ID:
         # The in-gateway ticker fires on pool threads: a claimed/running row of THIS process is
-        # still in flight here. Only an unknown row was given up by its own firer.
-        return row['status'] != 'unknown'
+        # still in flight here.
+        return True
     return _owner_is_live(int(row['pid']), row['process_started_at'])
 
 
