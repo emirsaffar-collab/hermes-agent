@@ -33,6 +33,7 @@ import { HERMES_CLOUD_MANAGED, isHermesCloudUrl } from '../../shared/src/hermes-
 import {
   hostLabelFromBaseUrl,
   modeIsRemoteLike,
+  normalizeProfileLauncher,
   normalizeRemoteBaseUrl,
   normalizeRemoteHeaders,
   normalizeSshConfig,
@@ -1525,7 +1526,9 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
  *
  * Per-profile override entries become registry connections too (deduped by
  * URL/host against the global block), so a user who had `research` pinned to
- * a second gateway sees both sources registered on first launch.
+ * a second gateway sees both sources registered on first launch. An entry a
+ * desktop plugin's launcher serves is a per-profile route only, never a
+ * gateway the user registered.
  */
 export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
   const config = v1 && typeof v1 === 'object' ? (v1 as Record<string, any>) : {}
@@ -1648,7 +1651,7 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
   // Per-profile overrides → additional registered sources (deduped).
   const profiles = config.profiles && typeof config.profiles === 'object' ? config.profiles : {}
 
-  for (const block of Object.values(profiles) as Record<string, any>[]) {
+  for (const block of (Object.values(profiles) as Record<string, any>[]).filter(entry => !isLauncherEntry(entry))) {
     if (!block || typeof block !== 'object') {
       continue
     }
@@ -1663,6 +1666,10 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
   }
 
   return { version: REGISTRY_VERSION, primary, launchMode: 'primary', lastUsed: primary, connections }
+}
+
+function isLauncherEntry(entry: Record<string, any>): boolean {
+  return entry?.mode === 'remote' && Boolean(normalizeProfileLauncher(entry.launcher))
 }
 
 /** Insert or replace by id. Input must already be normalized/validated. */
