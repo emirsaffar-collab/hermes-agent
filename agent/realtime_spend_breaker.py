@@ -747,7 +747,7 @@ def get_realtime_spend_summary(now: float | None = None) -> dict[str, Any]:
                 """,
                 (t_15m,),
             )
-            c15, eur15, eur15_cron_bg, u15, ca15, cr15_total = cur.fetchone()
+            c15, eur15, _eur15_cron_bg, u15, ca15, cr15_total = cur.fetchone()
 
             cur.execute(
                 """

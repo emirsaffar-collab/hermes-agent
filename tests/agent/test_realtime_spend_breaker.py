@@ -1692,18 +1692,18 @@ def test_tier0_critical_cron_spend_does_not_starve_tier2_builder_owner_crons(tmp
     assert v_ok["allowed"] is True
     assert v_ok["reason"] == "ok"
 
-    # Negative polarity: non-Tier-0 cron spend crosses €150 soft cap (~€154.13) while total (~€188.63) stays < €195 hard cap
+    # Negative polarity: non-Tier-0 cron spend crosses €150 soft cap (~€155) while total (~€183.50) stays < €195 hard cap
     rsb.record_realtime_llm_call(
         session_id="local-tier2-lager",
         source="cron",
         job_name="lager-builder-owner",
         provider="vertex",
         model="google/gemini-4-argon",
-        prompt_tokens=6_000_000,
-        uncached_input_tokens=6_000_000,
+        prompt_tokens=15_000_000,
+        uncached_input_tokens=15_000_000,
         cache_read_tokens=0,
-        output_tokens=1_500_000,
-        request_id="rid_tier2_26_more",
+        output_tokens=4_000_000,
+        request_id="rid_tier2_50_more",
     )
     summary_tripped = rsb.get_realtime_spend_summary(now=eval_now)
     assert summary_tripped["breaker_state"] == "TIER2_DAILY_SOFT_CAP"
