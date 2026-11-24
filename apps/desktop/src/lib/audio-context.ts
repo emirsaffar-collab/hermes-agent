@@ -5,6 +5,22 @@
 // its own. Nothing closes it — it lives for the window.
 
 let ctx: AudioContext | null = null
+let idleSuspendTimer: ReturnType<typeof setTimeout> | null = null
+const IDLE_SUSPEND_DELAY_MS = 3_000
+
+function scheduleIdleSuspend(ac: AudioContext) {
+  if (idleSuspendTimer !== null) {
+    clearTimeout(idleSuspendTimer)
+  }
+
+  idleSuspendTimer = setTimeout(() => {
+    idleSuspendTimer = null
+
+    if (ac.state === 'running' && typeof ac.suspend === 'function') {
+      void ac.suspend().catch(() => undefined)
+    }
+  }, IDLE_SUSPEND_DELAY_MS)
+}
 
 /** The shared AudioContext, or null where WebAudio is unavailable. */
 export function getAudioContext(): AudioContext | null {
@@ -29,6 +45,8 @@ export function getAudioContext(): AudioContext | null {
     if (ctx.state === 'suspended') {
       void ctx.resume().catch(() => undefined)
     }
+
+    scheduleIdleSuspend(ctx)
 
     return ctx
   } catch {

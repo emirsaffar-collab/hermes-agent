@@ -25,6 +25,7 @@ class FakeGain {
 }
 
 const started: FakeOscillator[] = []
+const suspended = vi.fn(() => Promise.resolve())
 
 class FakeAudioContext {
   currentTime = 0
@@ -44,7 +45,15 @@ class FakeAudioContext {
   }
 
   resume() {
+    this.state = 'running'
+
     return Promise.resolve()
+  }
+
+  suspend() {
+    this.state = 'suspended'
+
+    return suspended()
   }
 }
 
@@ -52,6 +61,7 @@ describe('thinking-sound', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     started.length = 0
+    suspended.mockClear()
     $thinkingSoundEnabled.set(true)
     vi.mocked($hapticsMuted.get).mockReturnValue(false)
     vi.stubGlobal('AudioContext', FakeAudioContext)
@@ -105,6 +115,19 @@ describe('thinking-sound', () => {
 
     // One loop: at most ~2 blips in 1.3s (first at 400ms, next ≥800ms later).
     expect(started.length).toBeLessThanOrEqual(2)
+  })
+
+  it('suspends the shared AudioContext after 3s of silence to release OS sleep assertions', () => {
+    startThinkingSound()
+    vi.advanceTimersByTime(1_500)
+    expect(suspended).not.toHaveBeenCalled()
+
+    stopThinkingSound()
+    vi.advanceTimersByTime(1_500)
+    expect(suspended).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(1_600)
+    expect(suspended).toHaveBeenCalledTimes(1)
   })
 
   it('never throws when WebAudio is unavailable', () => {
