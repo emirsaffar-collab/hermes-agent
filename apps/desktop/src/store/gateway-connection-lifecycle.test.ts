@@ -802,6 +802,11 @@ describe('secondary stalled-dial budget', () => {
 
       expect(getConnectionFor.mock.calls.length, permanent).toBe(2)
 
+      // Subsequent focus/wake nudges must NOT un-park a permanent local ensure failure.
+      reconnectSecondaryGateways()
+      await vi.advanceTimersByTimeAsync(20_000)
+      expect(getConnectionFor.mock.calls.length, permanent).toBe(2)
+
       getConnectionFor.mockResolvedValue(descriptorFor('homelab', 'bot-a'))
       await ensureGatewayForAgent('homelab', 'bot-a')
       expect(getConnectionFor.mock.calls.length, permanent).toBe(3)

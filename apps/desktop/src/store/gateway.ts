@@ -1833,7 +1833,7 @@ export async function ensureActiveGatewayOpen({
 
   const entry = g.secondaries.get(g.activeKey)
 
-  if (!entry || (!explicit && g.reauthFailures.has(entry.scope))) {
+  if (!entry || (!explicit && (g.reauthFailures.has(entry.scope) || g.dialFailures.get(entry.scope)?.permanent))) {
     return null
   }
 
@@ -1965,10 +1965,11 @@ function probeSecondaryLiveness(entry: Secondary): void {
 // signals can force sockets that still report open to retire before redialing.
 export function reconnectSecondaryGateways({ forceOpenSockets = false }: { forceOpenSockets?: boolean } = {}): void {
   for (const entry of g.secondaries.values()) {
-    // A backend main retired for a foreground open stays parked: redialing it
-    // from a focus/wake nudge would queue a background spawn for the slot the
-    // retirement just freed. Its tile still shows; the next click re-arms it.
-    if (g.reauthFailures.has(entry.scope)) {
+    // A backend main retired for a foreground open or parked on a permanent
+    // local-gateway ensure refusal stays parked: redialing it from a focus/wake
+    // nudge would re-spawn `hermes gateway ensure` on every window focus. Its
+    // tile still shows; the next explicit open/click re-arms it.
+    if (g.reauthFailures.has(entry.scope) || g.dialFailures.get(entry.scope)?.permanent) {
       continue
     }
 
