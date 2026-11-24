@@ -773,3 +773,27 @@ def test_real_fork_never_reaches_a_delegate_worker(monkeypatch):
     denied = [m for m in run.requests[3]["messages"] if m.get("role") == "tool" and m.get("tool_call_id") == "call_d"]
     assert denied and "delegate_task was denied" in str(denied[0]["content"])
     assert run.handle.outcome == "ok" and run.handle.actions == ()
+
+
+def test_current_turn_origin_handles_none_and_prefix():
+    """Guard against version-skew or legacy ContextVar defaults holding None."""
+    from agent import plugin_session_fork
+
+    tok = plugin_session_fork._TURN_ORIGIN.set(None)  # type: ignore[arg-type]
+    try:
+        assert plugin_session_fork.current_turn_origin() is None
+    finally:
+        plugin_session_fork._TURN_ORIGIN.reset(tok)
+
+    tok_ok = plugin_session_fork._TURN_ORIGIN.set("plugin_fork:wisdom")
+    try:
+        assert plugin_session_fork.current_turn_origin() == "plugin_fork:wisdom"
+    finally:
+        plugin_session_fork._TURN_ORIGIN.reset(tok_ok)
+
+    tok_other = plugin_session_fork._TURN_ORIGIN.set("background_review")
+    try:
+        assert plugin_session_fork.current_turn_origin() is None
+    finally:
+        plugin_session_fork._TURN_ORIGIN.reset(tok_other)
+

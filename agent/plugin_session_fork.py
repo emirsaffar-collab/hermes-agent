@@ -66,7 +66,7 @@ def fork_tool_allowlist(own_tools: Iterable[Any], *agents: Any) -> frozenset[str
 def current_turn_origin() -> Optional[str]:
     """``"plugin_fork:<plugin id>"`` while a plugin session fork runs on this context, else None."""
     origin = _TURN_ORIGIN.get()
-    return origin if origin.startswith(f"{PLUGIN_FORK_TASK}:") else None
+    return origin if isinstance(origin, str) and origin.startswith(f"{PLUGIN_FORK_TASK}:") else None
 
 
 class PluginForkHandle:
