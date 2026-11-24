@@ -1845,13 +1845,25 @@ export function reconcileRegistryDrift(
     }
 
     const target = normalizedSshTarget(ssh)
+    const normalizedHost = String(ssh.host || '').trim().toLowerCase()
+    const normalizedPort = ssh.port ?? 22
 
-    const registered = registry.connections.find(
+    const exactMatch = registry.connections.find(
       connection =>
         connection.kind === 'ssh' &&
         normalizedSshTarget(connection) === target &&
-        (connection.port ?? 22) === (ssh.port ?? 22)
+        (connection.port ?? 22) === normalizedPort
     )
+    const userlessCandidates = exactMatch
+      ? []
+      : registry.connections.filter(
+          connection =>
+            connection.kind === 'ssh' &&
+            String(connection.host || '').trim().toLowerCase() === normalizedHost &&
+            (connection.port ?? 22) === normalizedPort &&
+            (!String(connection.user || '').trim() || !String(ssh.user || '').trim())
+        )
+    const registered = exactMatch ?? (userlessCandidates.length === 1 ? userlessCandidates[0] : undefined)
 
     const { mode: _mode, ...sshFields } = ssh
 
@@ -1871,8 +1883,9 @@ export function reconcileRegistryDrift(
         return unchanged
       }
 
-      const { host: _host, user: _user, port: _port, ...identityFields } = sshFields
+      const { host: _host, port: _port, ...identityFields } = sshFields
       const aligned: RegistryConnection = { ...registered }
+      delete aligned.user
       delete aligned.keyPath
       delete aligned.remoteHermesPath
       delete aligned.remoteProfile

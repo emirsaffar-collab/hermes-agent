@@ -17,7 +17,7 @@ export const RENDERER_ANIMATIONS_PAUSED_ATTRIBUTE = 'data-renderer-animations-pa
 
 export function createRendererLoopPauseController(
   onChange: () => void,
-  { pauseOnBattery = false, pauseWhenUnfocused = false } = {}
+  { pauseOnBattery = true, pauseWhenUnfocused = false } = {}
 ) {
   let windowPaused = false
   let windowFocused = document.hasFocus()

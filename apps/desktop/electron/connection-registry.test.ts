@@ -1968,6 +1968,26 @@ test('drift heal aligns a registered SSH route whose identity fields drifted fro
   assert.equal(cleared.registry.connections.find(connection => connection.kind === 'ssh')?.keyPath, undefined)
 })
 
+test('drift heal aligns a userless SSH entry when v1 carries an explicit user on the same host', () => {
+  const first = reconcileRegistryDrift(emptyRegistry(), {
+    mode: 'ssh',
+    remote: { host: 'mini', port: 22 }
+  })
+
+  assert.equal(first.changed, true)
+
+  const drifted = reconcileRegistryDrift(first.registry, {
+    mode: 'ssh',
+    remote: { host: 'mini', port: 22, user: 'emirsaffar' }
+  })
+
+  assert.equal(drifted.changed, true)
+  const sshEntries = drifted.registry.connections.filter(connection => connection.kind === 'ssh')
+  assert.equal(sshEntries.length, 1)
+  assert.equal(sshEntries[0].id, 'mini')
+  assert.equal(sshEntries[0].user, 'emirsaffar')
+})
+
 test('drift heal respects a deliberate primary pick on a registered SSH route', () => {
   let registry = reconcileRegistryDrift(emptyRegistry(), {
     mode: 'ssh',

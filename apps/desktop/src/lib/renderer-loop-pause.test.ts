@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { installRendererAnimationPauseState, RENDERER_ANIMATIONS_PAUSED_ATTRIBUTE } from './renderer-loop-pause'
+import {
+  createRendererLoopPauseController,
+  installRendererAnimationPauseState,
+  RENDERER_ANIMATIONS_PAUSED_ATTRIBUTE
+} from './renderer-loop-pause'
 
 describe('installRendererAnimationPauseState', () => {
   afterEach(() => {
@@ -87,6 +91,36 @@ describe('installRendererAnimationPauseState', () => {
 
       dispose()
       expect(document.documentElement.hasAttribute(RENDERER_ANIMATIONS_PAUSED_ATTRIBUTE)).toBe(false)
+    } finally {
+      window.hermesDesktop = prevDesktop
+    }
+  })
+
+  it('defaults createRendererLoopPauseController to pauseOnBattery=true while honoring explicit pauseOnBattery=false', async () => {
+    const prevDesktop = window.hermesDesktop
+    window.hermesDesktop = {
+      ...(prevDesktop ?? {}),
+      getOnBattery: vi.fn(async () => true),
+      onBatteryChanged: vi.fn(() => () => undefined)
+    } as unknown as typeof window.hermesDesktop
+
+    try {
+      const defaultChanges = vi.fn()
+      const explicitOptOutChanges = vi.fn()
+      const defaultController = createRendererLoopPauseController(defaultChanges)
+      const explicitOptOutController = createRendererLoopPauseController(explicitOptOutChanges, {
+        pauseOnBattery: false
+      })
+
+      await Promise.resolve()
+
+      expect(defaultController.isPaused()).toBe(true)
+      expect(defaultChanges).toHaveBeenCalledTimes(1)
+      expect(explicitOptOutController.isPaused()).toBe(false)
+      expect(explicitOptOutChanges).not.toHaveBeenCalled()
+
+      defaultController.dispose()
+      explicitOptOutController.dispose()
     } finally {
       window.hermesDesktop = prevDesktop
     }
