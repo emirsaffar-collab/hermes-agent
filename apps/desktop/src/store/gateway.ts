@@ -676,6 +676,9 @@ async function openSecondary(entry: Secondary): Promise<void> {
 
     // Parked here, where every dial lands, so not even the first scheduled redial runs.
     if (error instanceof UnservedProfileError || isPermanentLocalGatewayEnsureError(error)) {
+      if (isPermanentLocalGatewayEnsureError(error)) {
+        recordDialFailure(entry, error)
+      }
       entry.wantOpen = false
       entry.stalledDials = 0
       clearTimer(entry)
@@ -1293,7 +1296,7 @@ export function retainGatewayForRelay(connectionId: null | string, profile: stri
 
   entry.relayRetainCount += 1
 
-  if (!g.reauthFailures.has(entry.scope)) {
+  if (!g.reauthFailures.has(entry.scope) && !g.dialFailures.get(entry.scope)?.permanent) {
     rearmSecondary(entry)
   }
 
@@ -1408,7 +1411,7 @@ export async function retainGatewayForAgent(
 
   try {
     if (!isOpen(entry.gateway)) {
-      await openSecondary(entry)
+      await openSecondaryForRequest(entry, spawnPriority)
     }
   } catch (error) {
     release()
