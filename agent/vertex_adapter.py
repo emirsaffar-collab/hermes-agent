@@ -165,6 +165,9 @@ def is_vertex_global_only_model(model: Optional[str]) -> bool:
         cleaned.startswith("gemini-3.8-flash")
         or cleaned.startswith("gemini-3-")
         or cleaned.startswith("gemini-3.")
+        or cleaned.startswith("gemini-4-neon")
+        or cleaned.startswith("gemini-4-hydrogen")
+        or cleaned.startswith("gemini-4-carbon")
     )
 
 

@@ -1304,7 +1304,7 @@ def evaluate_realtime_spend_breaker(
     )
     tier3_pool_today = (
         non_interactive_today
-        if src in ("cron", "background_review")
+        if src in ("cron", "background_review", "subagent")
         else max(non_interactive_today, estate_today)
     )
     if tier3_pool_today >= eff_tier3_hard_eur:
