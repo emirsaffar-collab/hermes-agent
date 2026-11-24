@@ -339,3 +339,31 @@ def test_spend_breaker_persists_region_service_tier_and_decodes_vflex_cluster(tm
     assert rows[0][0] == "sess_eu_persist" and rows[0][1] == "eu" and rows[0][2] == ""
     assert rows[1][0] == "sess_flex_persist" and rows[1][1] == "global" and rows[1][2] == "flex"
     assert rows[1][3] == rsb.extract_vertex_cluster_id("pg4Ga7XaI_u4stMPqIaIuAQ")
+
+
+def test_usage_pricing_google_dec1_and_jan1_cliffs(monkeypatch):
+    from datetime import UTC, datetime
+    from decimal import Decimal
+    from agent import usage_pricing as up
+
+    monkeypatch.setattr(up, "_UTC_NOW", lambda: datetime(2026, 11, 24, 12, tzinfo=UTC))
+    argon_pre = up.get_pricing_entry(model_name="gemini-4-argon", provider="google")
+    flash_pre = up.get_pricing_entry(model_name="gemini-3.8-flash", provider="google")
+    assert argon_pre is not None and argon_pre.input_cost_per_million == Decimal("2.00")
+    assert flash_pre is not None and flash_pre.input_cost_per_million == Decimal("0.75")
+
+    monkeypatch.setattr(up, "_UTC_NOW", lambda: datetime(2026, 12, 1, 0, tzinfo=UTC))
+    argon_post = up.get_pricing_entry(model_name="gemini-4-argon", provider="google")
+    flash_still_promo = up.get_pricing_entry(model_name="gemini-3.8-flash", provider="google")
+    neon_steady = up.get_pricing_entry(model_name="gemini-4-neon", provider="google")
+    assert argon_post is not None and argon_post.input_cost_per_million == Decimal("4.00")
+    assert argon_post.output_cost_per_million == Decimal("20.00")
+    assert argon_post.cache_read_cost_per_million == Decimal("0.20")
+    assert flash_still_promo is not None and flash_still_promo.input_cost_per_million == Decimal("0.75")
+    assert neon_steady is not None and neon_steady.input_cost_per_million == Decimal("3.00")
+
+    monkeypatch.setattr(up, "_UTC_NOW", lambda: datetime(2027, 1, 1, 0, tzinfo=UTC))
+    flash_post = up.get_pricing_entry(model_name="gemini-3.8-flash", provider="google")
+    assert flash_post is not None and flash_post.input_cost_per_million == Decimal("1.50")
+    assert flash_post.output_cost_per_million == Decimal("7.50")
+    assert flash_post.cache_read_cost_per_million == Decimal("0.15")

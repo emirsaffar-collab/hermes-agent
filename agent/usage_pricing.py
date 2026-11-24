@@ -520,14 +520,36 @@ def _normalize_anthropic_model_name(model: str) -> str:
 _MODEL_NORMALIZERS = {"anthropic": _normalize_anthropic_model_name, "bedrock": _normalize_bedrock_model_name}
 
 
+def _apply_google_promo_cliff(model: str, entry: PricingEntry) -> PricingEntry:
+    """Apply documented Gemini 4 Argon/Carbon (2026-12-01 UTC) and Flash 3.8 (2027-01-01 UTC) 2x rate cliffs."""
+    now = _UTC_NOW()
+    suffix = None
+    if model in ("gemini-4-argon", "gemini-4-carbon") and now >= datetime(2026, 12, 1, 0, tzinfo=UTC):
+        suffix = "post-dec1-2x"
+    elif model in ("gemini-3.8-flash", "gemini-3.7-flash") and now >= datetime(2027, 1, 1, 0, tzinfo=UTC):
+        suffix = "post-jan1-2x"
+    if not suffix:
+        return entry
+    rates = {
+        field.name: value * 2
+        for field in fields(PricingEntry)
+        if "cost_per_million" in field.name and (value := getattr(entry, field.name)) is not None
+    }
+    return replace(entry, **rates, pricing_version=f"{entry.pricing_version}-{suffix}")
+
+
 def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
     model = route.model.lower()
     entry = _OFFICIAL_DOCS_PRICING.get((route.provider, model))
-    if entry:
-        return entry
-    normalize = _MODEL_NORMALIZERS.get(route.provider)
-    normalized = normalize(model) if normalize else model
-    return _OFFICIAL_DOCS_PRICING.get((route.provider, normalized)) if normalized != model else None
+    if not entry:
+        normalize = _MODEL_NORMALIZERS.get(route.provider)
+        normalized = normalize(model) if normalize else model
+        entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized)) if normalized != model else None
+        if entry:
+            model = normalized
+    if entry and route.provider == "google":
+        return _apply_google_promo_cliff(model, entry)
+    return entry
 
 
 def with_served_service_tier(usage: CanonicalUsage, response: Any) -> CanonicalUsage:
