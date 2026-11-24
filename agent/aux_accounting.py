@@ -162,6 +162,13 @@ def record_aux_usage(
         try:
             from agent.realtime_spend_breaker import record_realtime_llm_call
             _aux_rid = getattr(response, "id", None)
+            _aux_tier = getattr(usage, "service_tier", None) or getattr(response, "service_tier", None)
+            _aux_region = None
+            if base_url and str(provider or "").lower() == "vertex":
+                from agent.vertex_adapter import parse_vertex_base_url as _parse_vbu
+                _parsed_vbu = _parse_vbu(str(base_url))
+                if _parsed_vbu:
+                    _aux_region = _parsed_vbu[1]
             record_realtime_llm_call(
                 session_id=str(session_id or f"aux:{task}"),
                 source=f"aux:{task}",
@@ -174,6 +181,8 @@ def record_aux_usage(
                 request_id=_aux_rid if isinstance(_aux_rid, str) else None,
                 job_name=str(task or ""),
                 estimated_cost_usd=estimated_cost,
+                region=_aux_region,
+                service_tier=str(_aux_tier) if _aux_tier else None,
             )
         except Exception:
             pass

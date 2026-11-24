@@ -563,6 +563,8 @@ class ClientLifecycleMixin:
                         "europe-west2-aiplatform.googleapis.com",
                         "asia-southeast1-aiplatform.googleapis.com",
                         "us-central1-aiplatform.googleapis.com",
+                        "aiplatform.eu.rep.googleapis.com",
+                        "aiplatform.us.rep.googleapis.com",
                     )
                 ):
                     target_slot = _OPENAI_GLOBAL_FALLBACK_SLOT

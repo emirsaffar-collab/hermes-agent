@@ -24,7 +24,10 @@ _LOGGED_MINIMAX_UNEXPECTED_KEYS: set = set()
 
 def _resolve_vertex_arm(req: _ResolveRequest) -> _ResolveResult:
     from agent.auxiliary_client import _build_vertex_client, _route_client
-    client, final_model = _build_vertex_client(req.provider, req.model)
+    try:
+        client, final_model = _build_vertex_client(req.provider, req.model, task=req.task)
+    except TypeError:
+        client, final_model = _build_vertex_client(req.provider, req.model)
     return _route_client(req, client, final_model) if client is not None else (None, None)
 
 

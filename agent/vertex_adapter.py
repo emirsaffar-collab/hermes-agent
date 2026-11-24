@@ -56,6 +56,12 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REGION = "global"
 GLOBAL_VERTEX_REGION = "global"
+EU_MULTI_REGION_VERTEX_REGION = "eu"
+US_MULTI_REGION_VERTEX_REGION = "us"
+MULTI_REGION_VERTEX_REGIONS = (
+    EU_MULTI_REGION_VERTEX_REGION,
+    US_MULTI_REGION_VERTEX_REGION,
+)
 EUROPE_WEST2_VERTEX_REGION = "europe-west2"
 ASIA_SOUTHEAST1_VERTEX_REGION = "asia-southeast1"
 US_CENTRAL1_VERTEX_REGION = "us-central1"
@@ -105,6 +111,12 @@ _asia_southeast1_cooldown_until: float = float(
 _us_central1_cooldown_until: float = float(
     getattr(_prev_vertex_mod, "_us_central1_cooldown_until", 0.0) or 0.0
 )
+_eu_multi_region_cooldown_until: float = float(
+    getattr(_prev_vertex_mod, "_eu_multi_region_cooldown_until", 0.0) or 0.0
+)
+_us_multi_region_cooldown_until: float = float(
+    getattr(_prev_vertex_mod, "_us_multi_region_cooldown_until", 0.0) or 0.0
+)
 _prev_cold_in_flight = getattr(_prev_vertex_mod, "_cold_prefill_in_flight", None)
 _cold_prefill_in_flight: dict[str, int] = (
     _prev_cold_in_flight if isinstance(_prev_cold_in_flight, dict) else {}
@@ -118,7 +130,7 @@ _session_region_last_seen: dict[str, float] = (
     _prev_last_seen if isinstance(_prev_last_seen, dict) else {}
 )
 for _stale_sid, _stale_reg in list(_session_region_affinity.items()):
-    if _stale_reg not in (GLOBAL_VERTEX_REGION, *REGIONAL_VERTEX_REGIONS):
+    if _stale_reg not in (GLOBAL_VERTEX_REGION, *REGIONAL_VERTEX_REGIONS, *MULTI_REGION_VERTEX_REGIONS):
         _session_region_affinity.pop(_stale_sid, None)
         _session_region_last_seen.pop(_stale_sid, None)
 _prev_strikes = getattr(_prev_vertex_mod, "_session_regional_429_strikes", None)
@@ -131,7 +143,8 @@ _non_interactive_session_ids: set[str] = (
 )
 _SESSION_AFFINITY_CAP = 512
 _VERTEX_BASE_URL_RE = re.compile(
-    r"^https://(?:[a-z0-9-]+-)?aiplatform\.googleapis\.com/v1(?:beta1)?/projects/([^/]+)/locations/([^/]+)/endpoints/openapi/?$"
+    r"^https://(?:(?:[a-z0-9-]+-)?aiplatform\.googleapis\.com|aiplatform\.(?:eu|us)\.rep\.googleapis\.com)"
+    r"/v1(?:beta1)?/projects/([^/]+)/locations/([^/]+)/endpoints/openapi/?$"
 )
 _CLOUD_PLATFORM_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
@@ -152,6 +165,20 @@ def is_vertex_argon_model(model: Optional[str]) -> bool:
     if "@" in cleaned:
         cleaned = cleaned.split("@", 1)[0]
     return cleaned == "gemini-4-argon" or cleaned.startswith("gemini-4-argon-")
+
+
+def is_vertex_multi_region_supported_model(model: Optional[str]) -> bool:
+    """Models that 404 on single regions (europe-west2) but support multi-region ``eu``/``us`` REP endpoints."""
+    cleaned = str(model or "").strip().lower()
+    if "/" in cleaned:
+        cleaned = cleaned.rsplit("/", 1)[-1]
+    if "@" in cleaned:
+        cleaned = cleaned.split("@", 1)[0]
+    return (
+        cleaned.startswith("gemini-4-neon")
+        or cleaned.startswith("gemini-4-hydrogen")
+        or cleaned.startswith("gemini-4-carbon")
+    )
 
 
 def is_vertex_global_only_model(model: Optional[str]) -> bool:
@@ -258,6 +285,7 @@ def record_vertex_regional_429(
 ) -> float:
     """Trip the regional 429 cooldown so subsequent calls route to locations/global."""
     global _europe_west2_cooldown_until, _asia_southeast1_cooldown_until, _us_central1_cooldown_until
+    global _eu_multi_region_cooldown_until, _us_multi_region_cooldown_until
     now = time.monotonic()
     raw_sid = str(session_id or "").strip()
     canon_sid = _canonical_affinity_session_id(raw_sid) if raw_sid else None
@@ -267,6 +295,8 @@ def record_vertex_regional_429(
         pinned_before = _session_region_affinity.get(canon_sid) if canon_sid else None
         is_ase1_session = pinned_before == ASIA_SOUTHEAST1_VERTEX_REGION
         is_usc1_session = pinned_before == US_CENTRAL1_VERTEX_REGION
+        is_eu_rep_session = pinned_before == EU_MULTI_REGION_VERTEX_REGION
+        is_us_rep_session = pinned_before == US_MULTI_REGION_VERTEX_REGION
         is_non_ew2_session = bool(
             pinned_before != EUROPE_WEST2_VERTEX_REGION
             and (
@@ -276,6 +306,8 @@ def record_vertex_regional_429(
                     GLOBAL_VERTEX_REGION,
                     ASIA_SOUTHEAST1_VERTEX_REGION,
                     US_CENTRAL1_VERTEX_REGION,
+                    EU_MULTI_REGION_VERTEX_REGION,
+                    US_MULTI_REGION_VERTEX_REGION,
                 )
             )
         )
@@ -291,6 +323,12 @@ def record_vertex_regional_429(
         elif is_usc1_session:
             _us_central1_cooldown_until = max(_us_central1_cooldown_until, target)
             tripped_region = US_CENTRAL1_VERTEX_REGION
+        elif is_eu_rep_session:
+            _eu_multi_region_cooldown_until = max(_eu_multi_region_cooldown_until, target)
+            tripped_region = EU_MULTI_REGION_VERTEX_REGION
+        elif is_us_rep_session:
+            _us_multi_region_cooldown_until = max(_us_multi_region_cooldown_until, target)
+            tripped_region = US_MULTI_REGION_VERTEX_REGION
         elif not is_non_ew2_session:
             _europe_west2_cooldown_until = max(_europe_west2_cooldown_until, target)
             tripped_region = EUROPE_WEST2_VERTEX_REGION
@@ -346,14 +384,31 @@ def vertex_us_central1_cooldown_remaining() -> float:
     return max(local_rem, _peer_cooldown_remaining(US_CENTRAL1_VERTEX_REGION))
 
 
+def vertex_eu_multi_region_cooldown_remaining() -> float:
+    """Seconds remaining on the eu multi-region 429/404 cooldown (0.0 when ready)."""
+    with _EUROPE_WEST2_STATE_LOCK:
+        local_rem = max(0.0, _eu_multi_region_cooldown_until - time.monotonic())
+    return max(local_rem, _peer_cooldown_remaining(EU_MULTI_REGION_VERTEX_REGION))
+
+
+def vertex_us_multi_region_cooldown_remaining() -> float:
+    """Seconds remaining on the us multi-region 429/404 cooldown (0.0 when ready)."""
+    with _EUROPE_WEST2_STATE_LOCK:
+        local_rem = max(0.0, _us_multi_region_cooldown_until - time.monotonic())
+    return max(local_rem, _peer_cooldown_remaining(US_MULTI_REGION_VERTEX_REGION))
+
+
 def reset_vertex_hybrid_router_state() -> None:
     """Reset cooldown, session affinity, and semaphore state (used by unit tests)."""
     global _europe_west2_cooldown_until, _asia_southeast1_cooldown_until, _us_central1_cooldown_until
+    global _eu_multi_region_cooldown_until, _us_multi_region_cooldown_until
     global _EUROPE_WEST2_ARGON_SEMAPHORE, _ASIA_SOUTHEAST1_ARGON_SEMAPHORE, _US_CENTRAL1_ARGON_SEMAPHORE
     with _EUROPE_WEST2_STATE_LOCK:
         _europe_west2_cooldown_until = 0.0
         _asia_southeast1_cooldown_until = 0.0
         _us_central1_cooldown_until = 0.0
+        _eu_multi_region_cooldown_until = 0.0
+        _us_multi_region_cooldown_until = 0.0
         _EUROPE_WEST2_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
         _ASIA_SOUTHEAST1_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
         _US_CENTRAL1_ARGON_SEMAPHORE = threading.BoundedSemaphore(EUROPE_WEST2_ARGON_MAX_CONCURRENCY)
@@ -404,7 +459,7 @@ def migrate_vertex_sticky_region(old_session_id: Optional[str], new_session_id: 
     with _EUROPE_WEST2_STATE_LOCK:
         prev = _session_region_affinity.pop(old_sid, None)
         _session_region_last_seen.pop(old_sid, None)
-        if new_sid and prev in REGIONAL_VERTEX_REGIONS:
+        if new_sid and prev in (*REGIONAL_VERTEX_REGIONS, *MULTI_REGION_VERTEX_REGIONS):
             _session_region_affinity[new_sid] = prev
             _session_region_last_seen[new_sid] = now_mono
 
@@ -416,7 +471,11 @@ def get_session_vertex_region_affinity(session_id: Optional[str]) -> Optional[st
         return None
     with _EUROPE_WEST2_STATE_LOCK:
         reg = _session_region_affinity.get(sid)
-        if reg is not None and reg not in (GLOBAL_VERTEX_REGION, *REGIONAL_VERTEX_REGIONS):
+        if reg is not None and reg not in (
+            GLOBAL_VERTEX_REGION,
+            *REGIONAL_VERTEX_REGIONS,
+            *MULTI_REGION_VERTEX_REGIONS,
+        ):
             _session_region_affinity.pop(sid, None)
             _session_region_last_seen.pop(sid, None)
             return None
@@ -466,6 +525,10 @@ def _region_cooldown_remaining(region: str) -> float:
         return vertex_asia_southeast1_cooldown_remaining()
     if region == US_CENTRAL1_VERTEX_REGION:
         return vertex_us_central1_cooldown_remaining()
+    if region == EU_MULTI_REGION_VERTEX_REGION:
+        return vertex_eu_multi_region_cooldown_remaining()
+    if region == US_MULTI_REGION_VERTEX_REGION:
+        return vertex_us_multi_region_cooldown_remaining()
     return 0.0
 
 
@@ -540,6 +603,32 @@ def acquire_vertex_hybrid_region(
     - All other models/regions -> ``(configured_region or "global", False)``.
     """
     reg = (configured_region or DEFAULT_REGION).strip() or DEFAULT_REGION
+    if is_vertex_multi_region_supported_model(model):
+        target_mr: Optional[str] = None
+        if reg in MULTI_REGION_VERTEX_REGIONS:
+            target_mr = reg
+        else:
+            mode = _resolve_multi_region_policy()
+            if mode in MULTI_REGION_VERTEX_REGIONS:
+                target_mr = mode
+            elif mode == "canary_50":
+                canon = _canonical_affinity_session_id(str(session_id or ""))
+                pinned_mr = get_session_vertex_region_affinity(session_id)
+                if pinned_mr in (GLOBAL_VERTEX_REGION, *MULTI_REGION_VERTEX_REGIONS):
+                    target_mr = pinned_mr
+                elif canon:
+                    bucket = hashlib.sha256(canon.encode("utf-8")).digest()[0] % 2
+                    target_mr = EU_MULTI_REGION_VERTEX_REGION if bucket == 0 else GLOBAL_VERTEX_REGION
+                    _record_session_vertex_region_affinity(session_id, target_mr)
+        if target_mr in MULTI_REGION_VERTEX_REGIONS:
+            if _region_cooldown_remaining(target_mr) > 0.0:
+                if session_id:
+                    _record_session_vertex_region_affinity(session_id, GLOBAL_VERTEX_REGION)
+                return (GLOBAL_VERTEX_REGION, False)
+            if session_id:
+                _record_session_vertex_region_affinity(session_id, target_mr)
+            return (target_mr, False)
+        return (GLOBAL_VERTEX_REGION, False)
     if is_vertex_global_only_model(model):
         return (GLOBAL_VERTEX_REGION, False)
     prompt_tok = int(last_prompt_tokens or 0)
@@ -878,9 +967,33 @@ def get_vertex_credentials(
         return None, None
 
 
+def _resolve_multi_region_policy() -> str:
+    """Policy for Gemini 4 multi-region models (Neon/Hydrogen/Carbon):
+    ``global`` (default), ``eu``, ``us``, or ``canary_50`` (deterministic 50/50 sticky split).
+    Precedence: HERMES_VERTEX_NEON_REGION env > config.yaml vertex.neon_region > 'global'.
+    """
+    raw = (
+        os.environ.get("HERMES_VERTEX_NEON_REGION")
+        or str(_vertex_config().get("neon_region") or "")
+    ).strip().lower()
+    if raw in ("eu", "us", "canary_50", "global"):
+        return raw
+    return GLOBAL_VERTEX_REGION
+
+
 def build_vertex_base_url(project_id: str, region: str = DEFAULT_REGION) -> str:
-    """OpenAI-compatible Vertex base URL; ``global`` uses the bare host (Gemini 3.x preview is global-only)."""
-    host = "aiplatform.googleapis.com" if region == "global" else f"{region}-aiplatform.googleapis.com"
+    """OpenAI-compatible Vertex base URL.
+
+    - ``global`` -> ``aiplatform.googleapis.com``
+    - ``eu`` / ``us`` multi-region -> ``aiplatform.{region}.rep.googleapis.com``
+    - single region (e.g. ``europe-west2``) -> ``{region}-aiplatform.googleapis.com``
+    """
+    if region == GLOBAL_VERTEX_REGION:
+        host = "aiplatform.googleapis.com"
+    elif region in MULTI_REGION_VERTEX_REGIONS:
+        host = f"aiplatform.{region}.rep.googleapis.com"
+    else:
+        host = f"{region}-aiplatform.googleapis.com"
     return f"https://{host}/v1beta1/projects/{project_id}/locations/{region}/endpoints/openapi"
 
 
@@ -939,3 +1052,151 @@ def has_explicit_vertex_config() -> bool:
         return True
     sa_path = _get_secret("VERTEX_CREDENTIALS_PATH")
     return bool(sa_path and os.path.isfile(sa_path) and os.access(sa_path, os.R_OK))
+
+
+def _flatten_openai_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(p for p in parts if p)
+    return str(content or "")
+
+
+def call_vertex_native_flex(
+    *,
+    messages: list[dict[str, Any]],
+    model: str,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    stop: Optional[list[str]] = None,
+    timeout: float = 90.0,
+) -> Any:
+    """Call Vertex native ``:generateContent`` with Sync Flex (0.50x list price).
+
+    Only supported on eligible models (verified live on ``gemini-3.8-flash``; Gemini 4
+    models reject Flex with HTTP 400). Returns an OpenAI-chat-completions-compatible
+    ``SimpleNamespace`` carrying ``service_tier='flex'`` when Vertex confirms
+    ``usageMetadata.trafficType == 'ON_DEMAND_FLEX'``.
+    """
+    from types import SimpleNamespace
+    import urllib.request
+
+    token, project_id = get_vertex_credentials()
+    if not token or not project_id:
+        raise RuntimeError("Vertex credentials unavailable for Sync Flex request")
+
+    bare_model = str(model or "").strip()
+    if "/" in bare_model:
+        bare_model = bare_model.rsplit("/", 1)[-1]
+    if "@" in bare_model:
+        bare_model = bare_model.split("@", 1)[0]
+
+    system_chunks: list[str] = []
+    contents: list[dict[str, Any]] = []
+    for msg in messages or []:
+        role = str(msg.get("role") or "user").strip().lower()
+        text = _flatten_openai_message_content(msg.get("content"))
+        if not text:
+            continue
+        if role == "system":
+            system_chunks.append(text)
+            continue
+        vertex_role = "model" if role == "assistant" else "user"
+        if contents and contents[-1]["role"] == vertex_role:
+            contents[-1]["parts"].append({"text": text})
+        else:
+            contents.append({"role": vertex_role, "parts": [{"text": text}]})
+    if not contents:
+        contents.append({"role": "user", "parts": [{"text": ""}]})
+
+    # Thinking tokens share maxOutputTokens on gemini-3.8-flash; enforce >= 4096 floor
+    # so reasoning never starves the handoff summary.
+    gen_cfg: dict[str, Any] = {
+        "maxOutputTokens": max(4096, int(max_tokens)) if max_tokens else 8192,
+    }
+    if temperature is not None:
+        gen_cfg["temperature"] = float(temperature)
+    if top_p is not None:
+        gen_cfg["topP"] = float(top_p)
+    if stop:
+        gen_cfg["stopSequences"] = list(stop)
+
+    payload: dict[str, Any] = {
+        "contents": contents,
+        "generationConfig": gen_cfg,
+    }
+    if system_chunks:
+        payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_chunks)}]}
+
+    url = (
+        f"https://aiplatform.googleapis.com/v1beta1/projects/{project_id}"
+        f"/locations/global/publishers/google/models/{bare_model}:generateContent"
+    )
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "X-Vertex-AI-LLM-Shared-Request-Type": "flex",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Vertex Sync Flex returned no candidates: {str(data)[:240]}")
+    cand0 = candidates[0]
+    parts = ((cand0.get("content") or {}).get("parts") or [])
+    text_out = "".join(
+        str(p.get("text") or "")
+        for p in parts
+        if isinstance(p, dict) and not p.get("thought")
+    )
+    raw_finish = str(cand0.get("finishReason") or "STOP").upper()
+    finish_map = {
+        "STOP": "stop",
+        "MAX_TOKENS": "length",
+        "SAFETY": "content_filter",
+        "RECITATION": "content_filter",
+    }
+    finish_reason = finish_map.get(raw_finish, raw_finish.lower())
+
+    um = data.get("usageMetadata") or {}
+    prompt_tok = int(um.get("promptTokenCount") or 0)
+    cached_tok = int(um.get("cachedContentTokenCount") or 0)
+    cand_tok = int(um.get("candidatesTokenCount") or 0)
+    thought_tok = int(um.get("thoughtsTokenCount") or 0)
+    total_tok = int(um.get("totalTokenCount") or (prompt_tok + cand_tok + thought_tok))
+    traffic_type = str(um.get("trafficType") or "").upper()
+    service_tier = "flex" if traffic_type == "ON_DEMAND_FLEX" else "default"
+    resp_id = str(data.get("responseId") or f"flex_{int(time.time() * 1000)}")
+
+    return SimpleNamespace(
+        id=f"vflex-{resp_id}",
+        model=model,
+        service_tier=service_tier,
+        choices=[
+            SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(role="assistant", content=text_out),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tok,
+            completion_tokens=cand_tok + thought_tok,
+            total_tokens=total_tok,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tok),
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=thought_tok),
+        ),
+    )

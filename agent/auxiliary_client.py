@@ -1851,6 +1851,74 @@ class AsyncBedrockAuxiliaryClient(_AsyncAuxiliaryClientBase):
     pass
 
 
+class _VertexFlexCompletionsAdapter:
+    """Calls Vertex native ``:generateContent`` with Sync Flex (0.50x) for ``aux:compression``
+    on eligible models (``gemini-3.8-flash``), falling back transparently to the standard
+    OpenAI-compatible Vertex client on any transport/API/empty-content error."""
+
+    def __init__(self, fallback_client: Any, model: str):
+        self._fallback_client = fallback_client
+        self._model = model
+
+    def create(self, **kwargs) -> Any:
+        from agent.vertex_adapter import call_vertex_native_flex
+
+        model = kwargs.get("model", self._model)
+        # Tool-calling requests are not handled by the lightweight native flex shim.
+        if kwargs.get("tools") or kwargs.get("tool_choice") is not None:
+            resp = self._fallback_client.chat.completions.create(**kwargs)
+            _notify_aux_provider_response()
+            return resp
+        max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
+        stop = kwargs.get("stop")
+        if isinstance(stop, str):
+            stop = [stop]
+        timeout_val = kwargs.get("timeout")
+        try:
+            resp = call_vertex_native_flex(
+                messages=kwargs.get("messages", []),
+                model=model,
+                max_tokens=int(max_tokens) if max_tokens else None,
+                temperature=kwargs.get("temperature"),
+                top_p=kwargs.get("top_p"),
+                stop=stop,
+                timeout=float(timeout_val) if timeout_val else 90.0,
+            )
+            content = getattr(resp.choices[0].message, "content", "") if getattr(resp, "choices", None) else ""
+            if isinstance(content, str) and content.strip():
+                _notify_aux_provider_response()
+                return resp
+            logger.warning("VertexFlexCompressionAuxiliaryClient: empty flex response; falling back to standard Vertex")
+        except Exception as exc:
+            logger.warning("VertexFlexCompressionAuxiliaryClient: flex failed (%s); falling back to standard Vertex", exc)
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs.pop("stream", None)
+        resp = self._fallback_client.chat.completions.create(**fallback_kwargs)
+        _notify_aux_provider_response()
+        return resp
+
+
+class VertexFlexCompressionAuxiliaryClient:
+    """OpenAI-client-compatible wrapper routing ``aux:compression`` on ``gemini-3.8-flash``
+    via Vertex native Sync Flex (0.50x) with automatic standard-endpoint fallback."""
+
+    def __init__(self, fallback_client: Any, model: str):
+        self._fallback_client = fallback_client
+        self._model = model
+        self.chat = _ChatShim(_VertexFlexCompletionsAdapter(fallback_client, model))
+        self.api_key = getattr(fallback_client, "api_key", "")
+        self.base_url = getattr(fallback_client, "base_url", "")
+
+    def close(self):
+        close_fn = getattr(self._fallback_client, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+
+class AsyncVertexFlexCompressionAuxiliaryClient(_AsyncAuxiliaryClientBase):
+    pass
+
+
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
     """True if ``base_url`` speaks Anthropic Messages, not OpenAI chat.completions.
 
@@ -1880,7 +1948,15 @@ def _maybe_wrap_anthropic(
     # a class-attribute declaration rather than isinstance so this hot path never imports them.
     if (
         isinstance(client_obj, _AuxProbeClientStub)
-        or _safe_isinstance(client_obj, (AnthropicAuxiliaryClient, BedrockAuxiliaryClient, CodexAuxiliaryClient))
+        or _safe_isinstance(
+            client_obj,
+            (
+                AnthropicAuxiliaryClient,
+                BedrockAuxiliaryClient,
+                CodexAuxiliaryClient,
+                VertexFlexCompressionAuxiliaryClient,
+            ),
+        )
         or _client_declares(client_obj, "HERMES_SKIP_TRANSPORT_WRAP")
     ):
         return client_obj
@@ -4524,6 +4600,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
     if isinstance(sync_client, BedrockAuxiliaryClient):
         return AsyncBedrockAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, VertexFlexCompressionAuxiliaryClient):
+        return AsyncVertexFlexCompressionAuxiliaryClient(sync_client), model
     with contextlib.suppress(ImportError):
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
         if isinstance(sync_client, GeminiNativeClient):
@@ -4651,7 +4729,12 @@ def _build_bedrock_client(provider: str, model: Optional[str], *, raw_codex: boo
     return client, final_model
 
 
-def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[Any], Optional[str]]:
+def _build_vertex_client(
+    provider: str,
+    model: Optional[str],
+    *,
+    task: Optional[str] = None,
+) -> tuple[Optional[Any], Optional[str]]:
     """Google Vertex AI: Gemini via the OpenAI-compatible endpoint with an OAuth2 bearer (standard OpenAI client)."""
     try:
         from agent.vertex_adapter import (
@@ -4675,10 +4758,20 @@ def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[
     try:
         # Aliased import: a bare `from openai import OpenAI` would shadow the module-level lazy proxy.
         from openai import OpenAI as _VertexOpenAI
-        client = _VertexOpenAI(api_key=vertex_access_token, base_url=base_url)
+        client: Any = _VertexOpenAI(api_key=vertex_access_token, base_url=base_url)
     except Exception as exc:
         logger.warning("resolve_provider_client: cannot create Vertex client: %s", exc)
         return None, None
+    _flex_flag = os.environ.get("HERMES_VERTEX_COMPRESSION_FLEX", "1").strip().lower()
+    if (
+        task == "compression"
+        and isinstance(final_model, str)
+        and "gemini-3.8-flash" in final_model.lower()
+        and _flex_flag not in ("0", "false", "off", "no")
+    ):
+        client = VertexFlexCompressionAuxiliaryClient(client, final_model)
+        logger.debug("resolve_provider_client: vertex Sync Flex compression wrapper (%s)", final_model)
+        return client, final_model
     logger.debug("resolve_provider_client: vertex (%s)", final_model)
     return client, final_model
 
@@ -6827,8 +6920,16 @@ def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
 
 def _client_streams_internally(client: Any) -> bool:
     """Adapters that stream inside .create() tick the hook themselves (Codex, Anthropic) or
-    cannot stream (Bedrock); none accept ``stream=True`` from us."""
-    return isinstance(client, (CodexAuxiliaryClient, AnthropicAuxiliaryClient, BedrockAuxiliaryClient))
+    cannot stream (Bedrock, VertexFlexCompression); none accept ``stream=True`` from us."""
+    return isinstance(
+        client,
+        (
+            CodexAuxiliaryClient,
+            AnthropicAuxiliaryClient,
+            BedrockAuxiliaryClient,
+            VertexFlexCompressionAuxiliaryClient,
+        ),
+    )
 
 
 def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
@@ -7171,7 +7272,15 @@ async def _acreate_with_stream(client: Any, kwargs: dict[str, Any], task: Option
 
 def _async_client_streams_internally(client: Any) -> bool:
     """Async twin of :func:`_client_streams_internally` (the async adapters are separate classes)."""
-    return isinstance(client, (AsyncCodexAuxiliaryClient, AsyncAnthropicAuxiliaryClient, AsyncBedrockAuxiliaryClient))
+    return isinstance(
+        client,
+        (
+            AsyncCodexAuxiliaryClient,
+            AsyncAnthropicAuxiliaryClient,
+            AsyncBedrockAuxiliaryClient,
+            AsyncVertexFlexCompressionAuxiliaryClient,
+        ),
+    )
 
 
 async def _acreate_with_progress(

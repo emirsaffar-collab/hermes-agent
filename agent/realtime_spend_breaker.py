@@ -46,17 +46,35 @@ VERTEX_ARGON_LIST_CACHED_IN_EUR_PER_M = 0.179620
 VERTEX_ARGON_LIST_OUT_EUR_PER_M = 17.962000
 ARGON_PROMO_EXPIRY_EPOCH_UTC = 1796112000.0  # 2026-12-01T08:00:00Z (2026-11-30 23:59:59 PT)
 
-# Regional europe-west2 & asia-southeast1 SKUs (A891-E7A5-FDA5, F61C-57E6-DBE0, EA0E-13A1-6B07) carry 1.10x multiplier
-# Verified via bipartite KV-cache sharing graph + BigQuery SKU correlation on llm_call_ledger
+# Regional europe-west2, asia-southeast1 & eu multi-region SKUs carry 1.10x multiplier
+# Verified via bipartite KV-cache sharing graph + BigQuery SKU correlation + live EU rep probe
 VERTEX_EU_WEST2_REGIONAL_MULTIPLIER = 1.10
+VERTEX_FLEX_DISCOUNT_MULTIPLIER = 0.50
 _EU_WEST2_MACRO_CLUSTERS: frozenset[str] = frozenset(
     {
         # europe-west2 regional macro clusters
         "0L8P", "9_oP", "6-wP", "6_gP", "08QP", "4ATb", "l-oP", "9wMP",
         # asia-southeast1 regional macro clusters (enabled 2026-11-18 00:00 CET)
         "k7QP", "z7sP", "i9sP", "7PkP", "3LUP", "4vEP", "4t4P", "tOkP",
+        # eu multi-region (aiplatform.eu.rep.googleapis.com) macro clusters (verified 2026-11-24)
+        "2s4P", "ndYP", "wdYP",
     }
 )
+
+# Gemini 4 non-Argon flat EUR rates per 1M tokens (NO -50% promo; USD list * 0.8981 EUR/USD)
+# Verified against Vertex Model Garden rate card 2026-11-24:
+#   gemini-4-neon:     $3.00 in / $0.15 cached / $15.00 out (95% cache read discount)
+#   gemini-4-hydrogen: $1.50 in / $0.075 cached / $7.50 out (95% cache read discount)
+#   gemini-4-carbon:   $2.00 in / $0.10 cached / $10.00 out (95% cache read discount)
+VERTEX_NEON_UNCACHED_IN_EUR_PER_M = 2.694300
+VERTEX_NEON_CACHED_IN_EUR_PER_M = 0.134715
+VERTEX_NEON_OUT_EUR_PER_M = 13.471500
+VERTEX_HYDROGEN_UNCACHED_IN_EUR_PER_M = 1.347150
+VERTEX_HYDROGEN_CACHED_IN_EUR_PER_M = 0.067358
+VERTEX_HYDROGEN_OUT_EUR_PER_M = 6.735750
+VERTEX_CARBON_UNCACHED_IN_EUR_PER_M = 1.796200
+VERTEX_CARBON_CACHED_IN_EUR_PER_M = 0.089810
+VERTEX_CARBON_OUT_EUR_PER_M = 8.981000
 
 # Global Flash SKUs: 2A35-AC68-14D6 (in), 8658-6939-8BEC (cache), 90FD-DC5F-DC55 (out)
 VERTEX_FLASH_UNCACHED_IN_EUR_PER_M = 0.673573
@@ -66,6 +84,11 @@ VERTEX_FLASH_LIST_UNCACHED_IN_EUR_PER_M = 1.347146
 VERTEX_FLASH_LIST_CACHED_IN_EUR_PER_M = 0.134714
 VERTEX_FLASH_LIST_OUT_EUR_PER_M = 6.735688
 FLASH_PROMO_EXPIRY_EPOCH_UTC = 1798790400.0  # 2027-01-01T08:00:00Z (2026-12-31 23:59:59 PT)
+
+
+def _is_gemini4_vertex_model(model: str) -> bool:
+    mod = (model or "").lower()
+    return any(k in mod for k in ("argon", "neon", "hydrogen", "carbon"))
 
 
 def resolve_vertex_rates(model: str, ts: float | None = None) -> tuple[float, float, float]:
@@ -83,6 +106,24 @@ def resolve_vertex_rates(model: str, ts: float | None = None) -> tuple[float, fl
             VERTEX_ARGON_CACHED_IN_EUR_PER_M,
             VERTEX_ARGON_OUT_EUR_PER_M,
         )
+    if "neon" in mod:
+        return (
+            VERTEX_NEON_UNCACHED_IN_EUR_PER_M,
+            VERTEX_NEON_CACHED_IN_EUR_PER_M,
+            VERTEX_NEON_OUT_EUR_PER_M,
+        )
+    if "hydrogen" in mod:
+        return (
+            VERTEX_HYDROGEN_UNCACHED_IN_EUR_PER_M,
+            VERTEX_HYDROGEN_CACHED_IN_EUR_PER_M,
+            VERTEX_HYDROGEN_OUT_EUR_PER_M,
+        )
+    if "carbon" in mod:
+        return (
+            VERTEX_CARBON_UNCACHED_IN_EUR_PER_M,
+            VERTEX_CARBON_CACHED_IN_EUR_PER_M,
+            VERTEX_CARBON_OUT_EUR_PER_M,
+        )
     if now_ts >= FLASH_PROMO_EXPIRY_EPOCH_UTC:
         return (
             VERTEX_FLASH_LIST_UNCACHED_IN_EUR_PER_M,
@@ -95,7 +136,7 @@ def resolve_vertex_rates(model: str, ts: float | None = None) -> tuple[float, fl
         VERTEX_FLASH_OUT_EUR_PER_M,
     )
 
-USD_TO_EUR = 0.92
+USD_TO_EUR = 0.8981
 
 # Budget & breaker thresholds (EUR net) aligned with May 2027 Sparplan (€6,000/mo = €200/day)
 MAY_2027_DAILY_TARGET_EUR = 200.0
@@ -423,6 +464,8 @@ def compute_call_net_eur(
     output_tokens: int,
     estimated_cost_usd: float | None = None,
     cluster_id: str | None = None,
+    region: str | None = None,
+    service_tier: str | None = None,
     ts: float | None = None,
 ) -> float:
     prov = (provider or "").lower()
@@ -432,9 +475,21 @@ def compute_call_net_eur(
     out = max(0, int(output_tokens or 0))
     cid = str(cluster_id or "")
     macro = cid[2:6] if len(cid) >= 6 else ""
-    reg_mult = VERTEX_EU_WEST2_REGIONAL_MULTIPLIER if macro in _EU_WEST2_MACRO_CLUSTERS else 1.0
+    reg_norm = str(region or "").strip().lower()
+    is_non_global_region = bool(reg_norm and reg_norm != "global")
+    reg_mult = (
+        VERTEX_EU_WEST2_REGIONAL_MULTIPLIER
+        if (is_non_global_region or macro in _EU_WEST2_MACRO_CLUSTERS)
+        else 1.0
+    )
+    tier_norm = str(service_tier or "").strip().lower()
+    flex_mult = (
+        VERTEX_FLEX_DISCOUNT_MULTIPLIER
+        if tier_norm in ("flex", "on_demand_flex")
+        else 1.0
+    )
 
-    if "argon" in mod and (prov in ("vertex", "", "google") or estimated_cost_usd is None):
+    if _is_gemini4_vertex_model(mod) and (prov in ("vertex", "", "google") or estimated_cost_usd is None):
         in_r, cache_r, out_r = resolve_vertex_rates(mod, ts=ts)
         return round(
             reg_mult
@@ -445,7 +500,9 @@ def compute_call_net_eur(
     if "flash" in mod and ("gemini" in mod or prov in ("vertex", "google")):
         in_r, cache_r, out_r = resolve_vertex_rates(mod, ts=ts)
         return round(
-            (uncached * in_r + cached * cache_r + out * out_r)
+            reg_mult
+            * flex_mult
+            * (uncached * in_r + cached * cache_r + out * out_r)
             / 1_000_000.0,
             6,
         )
@@ -560,6 +617,8 @@ def record_realtime_llm_call(
     request_id: str | None = None,
     job_name: str = "",
     estimated_cost_usd: float | None = None,
+    region: str | None = None,
+    service_tier: str | None = None,
     ts: float | None = None,
 ) -> dict[str, Any]:
     now = float(ts if ts is not None else time.time())
@@ -569,6 +628,7 @@ def record_realtime_llm_call(
     out = max(0, int(output_tokens or 0))
     prompt = int(prompt_tokens or (uncached + cached))
     cluster_id = extract_vertex_cluster_id(request_id)
+    effective_tier = service_tier or ("flex" if isinstance(request_id, str) and request_id.startswith("vflex-") else None)
     is_live_call = (
         str(source) != "log_tail"
         and not str(source).startswith("aux:")
@@ -578,7 +638,7 @@ def record_realtime_llm_call(
     is_argon_live = (
         is_live_call
         and prompt > 55_000
-        and "argon" in (model or "").lower()
+        and _is_gemini4_vertex_model(model)
     )
     cache_reset = (
         1
@@ -594,6 +654,8 @@ def record_realtime_llm_call(
         output_tokens=out,
         estimated_cost_usd=estimated_cost_usd,
         cluster_id=cluster_id,
+        region=region,
+        service_tier=effective_tier,
         ts=now,
     )
     req_key = request_id or f"{session_id}:{now:.6f}:{prompt}:{out}"

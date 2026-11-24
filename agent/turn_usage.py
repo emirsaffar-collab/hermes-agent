@@ -483,6 +483,13 @@ def record_response_usage(
             or getattr(agent, "_turn_route_task", "")
             or ""
         )
+        _rt_region = None
+        _rt_base = getattr(agent, "_last_routed_base_url", None) or getattr(agent, "base_url", None)
+        if _rt_base and str(_agg_cost_provider or agent.provider or "").lower() == "vertex":
+            from agent.vertex_adapter import parse_vertex_base_url as _parse_vbu
+            _parsed_vbu = _parse_vbu(str(_rt_base))
+            if _parsed_vbu:
+                _rt_region = _parsed_vbu[1]
         record_realtime_llm_call(
             session_id=str(getattr(agent, "session_id", "") or "unknown"),
             source=_rt_source,
@@ -495,6 +502,8 @@ def record_response_usage(
             request_id=_rid if isinstance(_rid, str) else None,
             job_name=_rt_job,
             estimated_cost_usd=_cost_delta,
+            region=_rt_region,
+            service_tier=getattr(canonical_usage, "service_tier", None),
         )
 
     if agent.verbose_logging:
