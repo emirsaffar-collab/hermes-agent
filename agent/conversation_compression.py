@@ -1617,6 +1617,10 @@ def _adopt_live_compression_child(
     if parent_session_id:
         _rot_hist.add(parent_session_id)
     with contextlib.suppress(Exception):
+        from agent.realtime_spend_breaker import record_session_parent
+        if parent_session_id and child_session_id:
+            record_session_parent(child_session_id, parent_session_id)
+    with contextlib.suppress(Exception):
         from agent.vertex_adapter import migrate_vertex_sticky_region
         migrate_vertex_sticky_region(parent_session_id, child_session_id)
     with contextlib.suppress(Exception):
@@ -3444,6 +3448,10 @@ def _publish_rotated_compaction(
     if _cc_rot is not None and int(getattr(_cc_rot, "_force_rotate_restore_threshold", 0) or 0) > 0:
         _cc_rot.threshold_tokens = int(_cc_rot._force_rotate_restore_threshold)
         _cc_rot._force_rotate_restore_threshold = 0
+    with contextlib.suppress(Exception):
+        from agent.realtime_spend_breaker import record_session_parent
+        if old_session_id and new_session_id:
+            record_session_parent(new_session_id, old_session_id)
     with contextlib.suppress(Exception):
         from agent.vertex_adapter import migrate_vertex_sticky_region
         migrate_vertex_sticky_region(old_session_id, new_session_id)

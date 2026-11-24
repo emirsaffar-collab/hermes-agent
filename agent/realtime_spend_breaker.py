@@ -154,30 +154,93 @@ TIER1_STALLED_DESKTOP_MIN_CALLS = 35
 TIER1_STALLED_DESKTOP_15M_CAP_EUR = 6.00
 TIER1_RUNAWAY_DESKTOP_TURN_MAX_CALLS = 90
 TIER1_RUNAWAY_DESKTOP_15M_CAP_EUR = 10.00
+TIER1_RUNAWAY_DESKTOP_1H_CAP_EUR = 20.00
 
 _SESSION_PARENT_MAP: dict[str, str] = {}
 
 
-def record_session_parent(child_session_id: str, parent_session_id: str) -> None:
-    if child_session_id and parent_session_id and child_session_id != parent_session_id:
-        _SESSION_PARENT_MAP[child_session_id] = parent_session_id
+def record_session_parent(child_session_id: str, parent_session_id: str, now: float | None = None) -> None:
+    if not (child_session_id and parent_session_id and child_session_id != parent_session_id):
+        return
+    _SESSION_PARENT_MAP[child_session_id] = parent_session_id
+    ts_now = float(now if now is not None else time.time())
+    try:
+        con = _connect()
+        try:
+            with con:
+                con.execute(
+                    """
+                    INSERT OR REPLACE INTO session_parent_lineage (
+                        child_session_id, parent_session_id, updated_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (child_session_id, parent_session_id, ts_now),
+                )
+        finally:
+            con.close()
+    except Exception:
+        pass
+
+
+def _lookup_persisted_parent_session_id(child_session_id: str) -> str:
+    if not child_session_id:
+        return ""
+    cached = _SESSION_PARENT_MAP.get(child_session_id, "")
+    if cached:
+        return cached
+    try:
+        con = _connect()
+        try:
+            row = con.execute(
+                "SELECT parent_session_id FROM session_parent_lineage WHERE child_session_id = ? LIMIT 1",
+                (child_session_id,),
+            ).fetchone()
+            if row and row[0]:
+                parent_sid = str(row[0]).strip()
+                if parent_sid and parent_sid != child_session_id:
+                    _SESSION_PARENT_MAP[child_session_id] = parent_sid
+                    return parent_sid
+        finally:
+            con.close()
+    except Exception:
+        pass
+    if not os.environ.get("HERMES_AI_SPEND_DB_PATH"):
+        state_db = Path.home() / ".hermes" / "state.db"
+        if state_db.is_file():
+            try:
+                scon = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=1.0)
+                try:
+                    srow = scon.execute(
+                        "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1",
+                        (child_session_id,),
+                    ).fetchone()
+                    if srow and srow[0]:
+                        parent_sid = str(srow[0]).strip()
+                        if parent_sid and parent_sid != child_session_id:
+                            record_session_parent(child_session_id, parent_sid)
+                            return parent_sid
+                finally:
+                    scon.close()
+            except Exception:
+                pass
+    return ""
 
 
 def _resolve_lineage_session_ids(
     session_id: str,
     parent_session_id: str = "",
     lineage_session_ids: tuple[str, ...] | list[str] | set[str] = (),
-    max_depth: int = 16,
+    max_depth: int = 128,
 ) -> tuple[str, ...]:
     if parent_session_id and session_id and session_id != parent_session_id:
-        _SESSION_PARENT_MAP[session_id] = parent_session_id
+        record_session_parent(session_id, parent_session_id)
     sids: list[str] = [session_id] if session_id else []
     seen = set(sids)
-    cur_sid = parent_session_id or _SESSION_PARENT_MAP.get(session_id, "")
+    cur_sid = parent_session_id or _lookup_persisted_parent_session_id(session_id)
     while cur_sid and cur_sid not in seen and len(sids) < max_depth:
         sids.append(cur_sid)
         seen.add(cur_sid)
-        cur_sid = _SESSION_PARENT_MAP.get(cur_sid, "")
+        cur_sid = _lookup_persisted_parent_session_id(cur_sid)
     for extra in lineage_session_ids or ():
         es = str(extra or "").strip()
         if es and es not in seen and len(sids) < max_depth:
@@ -435,6 +498,15 @@ def _connect() -> sqlite3.Connection:
             expires_at REAL NOT NULL,
             reason TEXT NOT NULL,
             net_eur_window REAL NOT NULL
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_parent_lineage (
+            child_session_id TEXT PRIMARY KEY,
+            parent_session_id TEXT NOT NULL,
+            updated_at REAL NOT NULL
         )
         """
     )
@@ -1111,7 +1183,7 @@ def evaluate_realtime_spend_breaker(
             if is_bg_review:
                 cur.execute(
                     f"""
-                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
+                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0), COUNT(*)
                     FROM llm_call_ledger
                     WHERE session_id IN ({s_placeholders}) AND source = 'background_review' AND ts >= ?
                     """,
@@ -1121,7 +1193,8 @@ def evaluate_realtime_spend_breaker(
                 cur.execute(
                     f"""
                     SELECT COALESCE(SUM(net_eur), 0.0),
-                           COALESCE(SUM(CASE WHEN session_id IN ({s_placeholders}) THEN cache_reset ELSE 0 END), 0)
+                           COALESCE(SUM(CASE WHEN session_id IN ({s_placeholders}) THEN cache_reset ELSE 0 END), 0),
+                           COUNT(*)
                     FROM llm_call_ledger
                     WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND source != 'background_review' AND ts >= ?
                     """,
@@ -1135,31 +1208,34 @@ def evaluate_realtime_spend_breaker(
             else:
                 cur.execute(
                     f"""
-                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0)
+                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0), COUNT(*)
                     FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source != 'background_review' AND ts >= ?
                     """,
                     (*spend_sids, ts_now - 900.0),
                 )
-            s_eur_15m, s_resets_15m = cur.fetchone()
+            s_eur_15m, s_resets_15m, s_calls_15m = cur.fetchone()
             s_eur_15m = float(s_eur_15m or 0.0)
             s_resets_15m = int(s_resets_15m or 0)
+            s_calls_15m = int(s_calls_15m or 0)
 
             if is_bg_review:
                 cur.execute(
-                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source = 'background_review' AND ts >= ?",
+                    f"SELECT COALESCE(SUM(net_eur), 0.0), COUNT(*) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source = 'background_review' AND ts >= ?",
                     (*spend_sids, ts_now - 3600.0),
                 )
             elif family_job_tag:
                 cur.execute(
-                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND source != 'background_review' AND ts >= ?",
+                    f"SELECT COALESCE(SUM(net_eur), 0.0), COUNT(*) FROM llm_call_ledger WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND source != 'background_review' AND ts >= ?",
                     (*spend_sids, family_job_tag, ts_now - 3600.0),
                 )
             else:
                 cur.execute(
-                    f"SELECT COALESCE(SUM(net_eur), 0.0) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source != 'background_review' AND ts >= ?",
+                    f"SELECT COALESCE(SUM(net_eur), 0.0), COUNT(*) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source != 'background_review' AND ts >= ?",
                     (*spend_sids, ts_now - 3600.0),
                 )
-            s_eur_1h = float(cur.fetchone()[0] or 0.0)
+            r_1h_row = cur.fetchone()
+            s_eur_1h = float(r_1h_row[0] or 0.0)
+            s_calls_1h = int(r_1h_row[1] or 0)
 
             # 3) Estate 15m and Today spend (plus non-interactive pool so interactive spikes do not starve crons)
             cur.execute(
@@ -1217,6 +1293,9 @@ def evaluate_realtime_spend_breaker(
         elif not is_interactive or (
             not making_productive_progress
             and int(consecutive_calls_since_user or 0) > 2
+        ) or (
+            q_reason.startswith("tier1_runaway_autonomous_turn")
+            and int(consecutive_calls_since_user or 0) >= 6
         ):
             return {
                 "allowed": False,
@@ -1293,29 +1372,50 @@ def evaluate_realtime_spend_breaker(
                 quarantine_session(p_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
 
-    # Tier 1B: Progress-aware Desktop stalled loop breaker + hard single-turn runaway ceiling
+    # Tier 1B: Progress-aware Desktop stalled loop breaker + hard single-turn / compaction-chain runaway ceiling
     if is_interactive:
+        compaction_hops = max(0, len(all_lineage_sids) - 1)
+        effective_runaway_calls = (
+            max(int(consecutive_calls_since_user or 0), s_calls_15m)
+            if (int(consecutive_calls_since_user or 0) >= 6 and compaction_hops >= 1)
+            else int(consecutive_calls_since_user or 0)
+        )
         if (
             not making_productive_progress
-            and consecutive_calls_since_user >= TIER1_STALLED_DESKTOP_MIN_CALLS
+            and effective_runaway_calls >= TIER1_STALLED_DESKTOP_MIN_CALLS
             and s_eur_15m >= TIER1_STALLED_DESKTOP_15M_CAP_EUR
         ):
             reason = (
-                f"tier1_stalled_desktop_loop (calls={consecutive_calls_since_user}, "
+                f"tier1_stalled_desktop_loop (calls={effective_runaway_calls}, "
                 f"€{s_eur_15m:.2f} in 15m with no productive progress)"
             )
-            quarantine_session(session_id, reason, s_eur_15m, ttl_s=900.0, now=ts_now)
+            for l_sid in all_lineage_sids:
+                quarantine_session(l_sid, reason, s_eur_15m, ttl_s=900.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
         if (
-            consecutive_calls_since_user >= TIER1_RUNAWAY_DESKTOP_TURN_MAX_CALLS
+            effective_runaway_calls >= TIER1_RUNAWAY_DESKTOP_TURN_MAX_CALLS
             and s_eur_15m >= TIER1_RUNAWAY_DESKTOP_15M_CAP_EUR
         ):
             reason = (
-                f"tier1_runaway_autonomous_turn (calls={consecutive_calls_since_user} without user input, "
-                f"€{s_eur_15m:.2f} in 15m)"
+                f"tier1_runaway_autonomous_turn (calls={effective_runaway_calls} without user input, "
+                f"€{s_eur_15m:.2f} in 15m across {len(all_lineage_sids)} lineage session(s))"
             )
-            quarantine_session(session_id, reason, s_eur_15m, ttl_s=900.0, now=ts_now)
+            for l_sid in all_lineage_sids:
+                quarantine_session(l_sid, reason, s_eur_15m, ttl_s=900.0, now=ts_now)
             return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
+        if (
+            compaction_hops >= 2
+            and int(consecutive_calls_since_user or 0) >= 6
+            and s_calls_1h >= TIER1_RUNAWAY_DESKTOP_TURN_MAX_CALLS
+            and s_eur_1h >= TIER1_RUNAWAY_DESKTOP_1H_CAP_EUR
+        ):
+            reason = (
+                f"tier1_runaway_autonomous_turn (calls_1h={s_calls_1h} across {len(all_lineage_sids)} compacted sessions, "
+                f"€{s_eur_1h:.2f} in 1h >= €{TIER1_RUNAWAY_DESKTOP_1H_CAP_EUR:.2f})"
+            )
+            for l_sid in all_lineage_sids:
+                quarantine_session(l_sid, reason, s_eur_1h, ttl_s=900.0, now=ts_now)
+            return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m, "session_net_eur_1h": s_eur_1h}
         # Interactive Desktop sessions with productive progress are NEVER blocked by Tier 2 or Tier 3
         return {
             "allowed": True,
@@ -1379,7 +1479,7 @@ def evaluate_realtime_spend_breaker(
     )
     tier3_pool_today = (
         non_interactive_today
-        if src in ("cron", "background_review", "subagent")
+        if src in ("cron", "background_review")
         else max(non_interactive_today, estate_today)
     )
     if tier3_pool_today >= eff_tier3_hard_eur:

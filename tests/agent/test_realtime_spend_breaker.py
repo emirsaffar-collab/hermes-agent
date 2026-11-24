@@ -1713,13 +1713,76 @@ def test_tier0_critical_cron_spend_does_not_starve_tier2_builder_owner_crons(tmp
     v_blocked = rsb.evaluate_realtime_spend_breaker(
         session_id="local-tier2-newintra-next2",
         source="cron",
-        job_name="newintra-builder-owner",
+        job_name="lager-builder-owner",
         model="google/gemini-4-argon",
         provider="vertex",
         now=eval_now,
     )
     assert v_blocked["allowed"] is False
     assert "tier2_daily_soft_cap" in v_blocked["reason"]
+
+
+def test_persisted_deep_compaction_lineage_catches_split_desktop_runaway(tmp_path, monkeypatch):
+    """Persisted parent-child lineage in SQLite resolves deep (>16 hops) desktop
+    compaction chains across process restarts and catches 90+ call / €10+ split
+    compaction runaways even when consecutive_calls_since_user resets per segment."""
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+    now = 1_763_650_000.0
+    # Build a 20-segment desktop compaction chain (exceeding old max_depth=16):
+    # 5 calls per segment * 20 segments = 100 calls in 15m, ~€0.12/call = €12.00 total.
+    for seg_idx in range(20):
+        sid = f"desk_chain_{seg_idx}"
+        if seg_idx > 0:
+            rsb.record_session_parent(sid, f"desk_chain_{seg_idx - 1}", now=now - 600 + seg_idx * 20)
+        for call_idx in range(5):
+            rsb.record_realtime_llm_call(
+                session_id=sid,
+                source="desktop",
+                provider="vertex",
+                model="google/gemini-4-argon",
+                prompt_tokens=160_000,
+                uncached_input_tokens=40_000,
+                cache_read_tokens=120_000,
+                output_tokens=4_000,
+                request_id=f"req_chain_{seg_idx}_{call_idx}",
+                ts=now - 600 + seg_idx * 20 + call_idx,
+            )
+
+    # Clear in-memory map to simulate a fresh process / synthetic turn restart on desk_chain_19
+    rsb._SESSION_PARENT_MAP.clear()
+    resolved = rsb._resolve_lineage_session_ids("desk_chain_19")
+    assert len(resolved) == 20
+    assert resolved[0] == "desk_chain_19"
+    assert resolved[-1] == "desk_chain_0"
+
+    # Immediate human message entry (consecutive_calls_since_user=1) is NEVER blocked
+    v_human = rsb.evaluate_realtime_spend_breaker(
+        session_id="desk_chain_19",
+        source="desktop",
+        model="google/gemini-4-argon",
+        provider="vertex",
+        making_productive_progress=True,
+        consecutive_calls_since_user=1,
+        now=now,
+    )
+    assert v_human["allowed"] is True
+
+    # Autonomous continuation turn past grace window (consecutive_calls_since_user=12,
+    # while lineage has 100 calls and >€10 in 15m) trips tier1_runaway_autonomous_turn
+    v_runaway = rsb.evaluate_realtime_spend_breaker(
+        session_id="desk_chain_19",
+        source="desktop",
+        model="google/gemini-4-argon",
+        provider="vertex",
+        making_productive_progress=True,
+        consecutive_calls_since_user=12,
+        now=now,
+    )
+    assert v_runaway["allowed"] is False
+    assert "tier1_runaway_autonomous_turn" in v_runaway["reason"]
 
 
 
