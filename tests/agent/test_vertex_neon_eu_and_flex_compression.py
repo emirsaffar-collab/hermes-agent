@@ -227,3 +227,115 @@ def test_vertex_flex_compression_wrapper_and_fallback(monkeypatch):
     resp_fb = c_comp.chat.completions.create(model="google/gemini-3.8-flash", messages=[{"role": "user", "content": "hi"}])
     assert fb_called.get("called") is True
     assert resp_fb.id == "std-999"
+
+
+def test_vertex_client_cache_key_isolates_compression_from_interactive_tasks(monkeypatch):
+    """V1a + V1b regression: compression and title/web_extract must NEVER share a _client_cache slot on Vertex,
+    and get_text_auxiliary_client('compression') must forward task='compression'."""
+    from agent.auxiliary_client import (
+        VertexFlexCompressionAuxiliaryClient,
+        _client_cache,
+        _client_cache_key,
+        _get_cached_client,
+        get_text_auxiliary_client,
+    )
+
+    k_title = _client_cache_key("vertex", async_mode=False, task="title", model="google/gemini-3.8-flash")
+    k_comp = _client_cache_key("vertex", async_mode=False, task="compression", model="google/gemini-3.8-flash")
+    assert k_title != k_comp, "Vertex compression and title collided on _client_cache_key!"
+
+    _client_cache.clear()
+    monkeypatch.delenv("HERMES_VERTEX_COMPRESSION_FLEX", raising=False)
+    monkeypatch.setattr(va, "has_vertex_credentials", lambda: True)
+    monkeypatch.setattr(
+        va,
+        "get_vertex_config",
+        lambda region=None, **kw: ("ya29.tok", va.build_vertex_base_url("uop-atlas", region or "global")),
+    )
+
+    # Order 1: title warms cache FIRST, then compression MUST still get Flex wrapper
+    c_title_1, _ = _get_cached_client("vertex", "google/gemini-3.8-flash", task="title")
+    c_comp_1, _ = _get_cached_client("vertex", "google/gemini-3.8-flash", task="compression")
+    assert not isinstance(c_title_1, VertexFlexCompressionAuxiliaryClient)
+    assert isinstance(c_comp_1, VertexFlexCompressionAuxiliaryClient)
+
+    # Order 2: compression warms cache FIRST, then title MUST NOT get hijacked onto Flex
+    _client_cache.clear()
+    c_comp_2, _ = _get_cached_client("vertex", "google/gemini-3.8-flash", task="compression")
+    c_title_2, _ = _get_cached_client("vertex", "google/gemini-3.8-flash", task="title")
+    assert isinstance(c_comp_2, VertexFlexCompressionAuxiliaryClient)
+    assert not isinstance(c_title_2, VertexFlexCompressionAuxiliaryClient)
+
+    # Public consumer entry point get_text_auxiliary_client('compression') forwards task
+    monkeypatch.setattr(
+        "agent.auxiliary_client._resolve_task_provider_model",
+        lambda task=None, *a, **kw: ("vertex", "google/gemini-3.8-flash", None, None, None),
+    )
+    c_pub, _ = get_text_auxiliary_client("compression")
+    assert isinstance(c_pub, VertexFlexCompressionAuxiliaryClient)
+    c_pub_title, _ = get_text_auxiliary_client("title")
+    assert not isinstance(c_pub_title, VertexFlexCompressionAuxiliaryClient)
+    _client_cache.clear()
+
+
+def test_spend_breaker_persists_region_service_tier_and_decodes_vflex_cluster(tmp_path, monkeypatch):
+    """V2 + V3 regressions: llm_call_ledger persists region/service_tier via ALTER TABLE migration and decodes vflex- cluster."""
+    import sqlite3
+    from agent import realtime_spend_breaker as rsb
+
+    db = tmp_path / "spend.db"
+    con = sqlite3.connect(str(db))
+    con.execute(
+        """
+        CREATE TABLE llm_call_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL, day_cet TEXT NOT NULL, session_id TEXT NOT NULL,
+            source TEXT NOT NULL, job_name TEXT DEFAULT '', provider TEXT NOT NULL,
+            model TEXT NOT NULL, prompt_tokens INTEGER NOT NULL,
+            uncached_in INTEGER NOT NULL, cached_in INTEGER NOT NULL,
+            out_tokens INTEGER NOT NULL, net_eur REAL NOT NULL,
+            cluster_id TEXT DEFAULT '', cache_reset INTEGER DEFAULT 0,
+            request_id TEXT UNIQUE
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(tmp_path / "status.json"))
+
+    assert rsb.extract_vertex_cluster_id("vflex-pg4Ga7XaI_u4stMPqIaIuAQ") == rsb.extract_vertex_cluster_id("pg4Ga7XaI_u4stMPqIaIuAQ")
+
+    rsb.record_realtime_llm_call(
+        session_id="sess_eu_persist",
+        source="desktop",
+        provider="vertex",
+        model="google/gemini-4-neon",
+        prompt_tokens=100_000,
+        uncached_input_tokens=10_000,
+        cache_read_tokens=90_000,
+        output_tokens=1_000,
+        request_id="2w4Ga9qDKNeBwdYPpqipmQY",
+        region="eu",
+    )
+    rsb.record_realtime_llm_call(
+        session_id="sess_flex_persist",
+        source="aux:compression",
+        provider="vertex",
+        model="google/gemini-3.8-flash",
+        prompt_tokens=60_000,
+        uncached_input_tokens=60_000,
+        cache_read_tokens=0,
+        output_tokens=1_500,
+        request_id="vflex-pg4Ga7XaI_u4stMPqIaIuAQ",
+        region="global",
+        service_tier="flex",
+    )
+
+    con = sqlite3.connect(str(db))
+    rows = con.execute("SELECT session_id, region, service_tier, cluster_id FROM llm_call_ledger ORDER BY id").fetchall()
+    con.close()
+    assert rows[0][0] == "sess_eu_persist" and rows[0][1] == "eu" and rows[0][2] == ""
+    assert rows[1][0] == "sess_flex_persist" and rows[1][1] == "global" and rows[1][2] == "flex"
+    assert rows[1][3] == rsb.extract_vertex_cluster_id("pg4Ga7XaI_u4stMPqIaIuAQ")

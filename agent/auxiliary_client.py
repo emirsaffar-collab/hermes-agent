@@ -5415,7 +5415,7 @@ def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[dict[str
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
-        api_mode=api_mode, main_runtime=main_runtime,
+        api_mode=api_mode, main_runtime=main_runtime, task=task,
     )
 
 
@@ -5689,8 +5689,12 @@ def _client_cache_key(
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
+    # Vertex `compression` wraps Flash 3.8 in VertexFlexCompressionAuxiliaryClient (Sync Flex 0.50x),
+    # so it must not share a cache slot with latency-sensitive interactive aux tasks (title, web_extract, ...).
     runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
-    task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
+    _norm_provider = _normalize_aux_provider(provider)
+    _is_vertex_compression = _norm_provider == "vertex" and str(task or "").strip().lower() == "compression"
+    task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ("compression" if _is_vertex_compression else "")
     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
     # share an entry, and the second builder's _store_cached_client would close the first's client.

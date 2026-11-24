@@ -413,10 +413,17 @@ def _connect() -> sqlite3.Connection:
             net_eur REAL NOT NULL,
             cluster_id TEXT DEFAULT '',
             cache_reset INTEGER DEFAULT 0,
-            request_id TEXT UNIQUE
+            request_id TEXT UNIQUE,
+            region TEXT DEFAULT '',
+            service_tier TEXT DEFAULT ''
         )
         """
     )
+    existing_cols = {row[1] for row in con.execute("PRAGMA table_info(llm_call_ledger)").fetchall()}
+    if "region" not in existing_cols:
+        con.execute("ALTER TABLE llm_call_ledger ADD COLUMN region TEXT DEFAULT ''")
+    if "service_tier" not in existing_cols:
+        con.execute("ALTER TABLE llm_call_ledger ADD COLUMN service_tier TEXT DEFAULT ''")
     con.execute("CREATE INDEX IF NOT EXISTS idx_ledger_ts ON llm_call_ledger(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_ledger_day ON llm_call_ledger(day_cet)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_ledger_sess_ts ON llm_call_ledger(session_id, ts)")
@@ -437,7 +444,7 @@ def _connect() -> sqlite3.Connection:
 def extract_vertex_cluster_id(request_id: str | None) -> str:
     if not request_id or not isinstance(request_id, str):
         return ""
-    rid = request_id.strip().removeprefix("chatcmpl-")
+    rid = request_id.strip().removeprefix("chatcmpl-").removeprefix("vflex-")
     if len(rid) in (20, 22) and not rid.startswith("*"):
         try:
             pad = "=" * ((4 - len(rid) % 4) % 4)
@@ -676,6 +683,8 @@ def record_realtime_llm_call(
         "cluster_id": cluster_id,
         "cache_reset": cache_reset,
         "request_id": req_key,
+        "region": str(region or "").strip().lower(),
+        "service_tier": str(effective_tier or "").strip().lower(),
     }
     if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("HERMES_AI_SPEND_DB_PATH"):
         return row_info
@@ -729,14 +738,16 @@ def record_realtime_llm_call(
                     INSERT INTO llm_call_ledger (
                         ts, day_cet, session_id, source, job_name, provider, model,
                         prompt_tokens, uncached_in, cached_in, out_tokens, net_eur,
-                        cluster_id, cache_reset, request_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        cluster_id, cache_reset, request_id, region, service_tier
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(request_id) DO UPDATE SET
                         session_id = CASE WHEN llm_call_ledger.source = 'log_tail' AND excluded.source != 'log_tail' THEN excluded.session_id ELSE llm_call_ledger.session_id END,
                         source = CASE WHEN llm_call_ledger.source = 'log_tail' AND excluded.source != 'log_tail' THEN excluded.source ELSE llm_call_ledger.source END,
                         job_name = CASE WHEN llm_call_ledger.job_name = '' AND excluded.job_name != '' THEN excluded.job_name ELSE llm_call_ledger.job_name END,
                         out_tokens = MAX(llm_call_ledger.out_tokens, excluded.out_tokens),
-                        net_eur = MAX(llm_call_ledger.net_eur, excluded.net_eur)
+                        net_eur = MAX(llm_call_ledger.net_eur, excluded.net_eur),
+                        region = CASE WHEN llm_call_ledger.region = '' AND excluded.region != '' THEN excluded.region ELSE llm_call_ledger.region END,
+                        service_tier = CASE WHEN llm_call_ledger.service_tier = '' AND excluded.service_tier != '' THEN excluded.service_tier ELSE llm_call_ledger.service_tier END
                     """,
                     (
                         now,
@@ -754,6 +765,8 @@ def record_realtime_llm_call(
                         cluster_id,
                         cache_reset,
                         req_key,
+                        row_info["region"],
+                        row_info["service_tier"],
                     ),
                 )
         finally:
