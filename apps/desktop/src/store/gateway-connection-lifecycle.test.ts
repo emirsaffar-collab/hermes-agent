@@ -782,6 +782,7 @@ describe('secondary stalled-dial budget', () => {
     // as they cross the IPC boundary. Each re-dial spawns another `hermes gateway ensure`.
     for (const permanent of [
       "Error invoking remote method 'hermes:connection:get-for': Error: Gateway incompatible (runtime_protocol). Use hermes gateway status for recovery.",
+      "Error invoking remote method 'hermes:connection:get-for': Error: Gateway inaccessible (service_start_failed). Use hermes gateway status for recovery.",
       'hermes gateway ensure produced no result (exit 2): invalid choice. Update Hermes or check the profile, then retry.',
       'Invalid local gateway endpoint'
     ]) {

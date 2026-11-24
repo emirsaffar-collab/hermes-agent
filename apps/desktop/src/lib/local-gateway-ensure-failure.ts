@@ -6,6 +6,9 @@
 const PERMANENT_ENSURE_FAILURES = [
   // ensureLocalGateway: protocol verdict `incompatible` (runtime_protocol, session authority missing).
   'Gateway incompatible (',
+  // ensureLocalGateway: supervisor / service definition refusal (`service_start_failed`, `service_disabled`,
+  // `service_identity_unverified`, `service_account_mismatch`, `service_manager_unavailable`).
+  'Gateway inaccessible (service_',
   // parseGatewayEnsureOutput: the installed `hermes` has no ensure protocol, or the profile is missing.
   'hermes gateway ensure produced no result',
   // assertLocalGatewayEndpoint: a ready verdict that is not a loopback session-authority endpoint.

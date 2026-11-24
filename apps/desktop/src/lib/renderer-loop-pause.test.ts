@@ -59,4 +59,36 @@ describe('installRendererAnimationPauseState', () => {
       nav.getBattery = origGetBattery
     }
   })
+
+  it('pauses continuous decorative animations via Electron hermesDesktop battery IPC on file:// protocol', async () => {
+    let batteryListener: ((onBattery: boolean) => void) | null = null
+    const prevDesktop = window.hermesDesktop
+    window.hermesDesktop = {
+      ...(prevDesktop ?? {}),
+      getOnBattery: vi.fn(async () => true),
+      onBatteryChanged: vi.fn((cb: (onBattery: boolean) => void) => {
+        batteryListener = cb
+        return () => {
+          batteryListener = null
+        }
+      })
+    } as unknown as typeof window.hermesDesktop
+
+    try {
+      const dispose = installRendererAnimationPauseState()
+      await Promise.resolve()
+      expect(document.documentElement.hasAttribute(RENDERER_ANIMATIONS_PAUSED_ATTRIBUTE)).toBe(true)
+
+      batteryListener?.(false)
+      expect(document.documentElement.hasAttribute(RENDERER_ANIMATIONS_PAUSED_ATTRIBUTE)).toBe(false)
+
+      batteryListener?.(true)
+      expect(document.documentElement.hasAttribute(RENDERER_ANIMATIONS_PAUSED_ATTRIBUTE)).toBe(true)
+
+      dispose()
+      expect(document.documentElement.hasAttribute(RENDERER_ANIMATIONS_PAUSED_ATTRIBUTE)).toBe(false)
+    } finally {
+      window.hermesDesktop = prevDesktop
+    }
+  })
 })

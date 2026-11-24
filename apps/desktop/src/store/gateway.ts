@@ -675,8 +675,9 @@ async function openSecondary(entry: Secondary): Promise<void> {
     }
 
     // Parked here, where every dial lands, so not even the first scheduled redial runs.
-    if (error instanceof UnservedProfileError) {
+    if (error instanceof UnservedProfileError || isPermanentLocalGatewayEnsureError(error)) {
       entry.wantOpen = false
+      entry.stalledDials = 0
       clearTimer(entry)
     }
 
@@ -713,6 +714,8 @@ function rearmSecondary(entry: Secondary, priority: SpawnPriority = 'foreground'
   // its scope before dialing, so clearing it here would lift the throttle on each poll.
   if (priority === 'foreground') {
     g.dialFailures.delete(entry.scope)
+  } else if (g.dialFailures.get(entry.scope)?.permanent) {
+    return
   }
 
   entry.wantOpen = true
@@ -726,10 +729,12 @@ function recordDialFailure(entry: Pick<Secondary, 'connectionId' | 'scope'>, err
   }
 
   const previous = g.dialFailures.get(entry.scope)
+  const permanent = Boolean(previous?.permanent || (error !== undefined && isPermanentLocalGatewayEnsureError(error)))
 
   g.dialFailures.set(entry.scope, {
     at: Date.now(),
     ownerProbe,
+    permanent,
     streak: (previous?.streak ?? 0) + 1,
     connectionId: entry.connectionId ?? null
   })
@@ -743,7 +748,15 @@ function recordDialFailure(entry: Pick<Secondary, 'connectionId' | 'scope'>, err
 function backgroundDialCoolingDown(scope: string, now = Date.now()): boolean {
   const failure = g.dialFailures.get(scope)
 
-  return failure !== undefined && now - failure.at < reconnectBackoffDelayMs(failure.streak - 1, { jitter: false })
+  if (!failure) {
+    return false
+  }
+
+  if (failure.permanent) {
+    return true
+  }
+
+  return now - failure.at < reconnectBackoffDelayMs(failure.streak - 1, { jitter: false })
 }
 
 /** Dial a request's secondary if it is down. Both request paths (a plain profile via
@@ -1633,7 +1646,7 @@ export async function openGatewayForAgent(
   }
 
   try {
-    await openSecondary(entry)
+    await openSecondaryForRequest(entry, spawnPriority)
   } catch (error) {
     if (activationLease) {
       entry.activationLeaseUntil = 0

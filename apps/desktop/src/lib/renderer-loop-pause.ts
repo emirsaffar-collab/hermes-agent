@@ -24,6 +24,16 @@ export function createRendererLoopPauseController(
   let onBattery = false
   let disposed = false
   let batteryRef: BatteryManagerLike | null = null
+  let offDesktopBattery: (() => void) | undefined
+
+  const setBatteryState = (next: boolean) => {
+    if (disposed || onBattery === next) {
+      return
+    }
+
+    onBattery = next
+    onChange()
+  }
 
   const onVisibilityChange = () => onChange()
 
@@ -46,12 +56,7 @@ export function createRendererLoopPauseController(
       return
     }
 
-    const next = batteryRef.charging === false
-
-    if (onBattery !== next) {
-      onBattery = next
-      onChange()
-    }
+    setBatteryState(batteryRef.charging === false)
   }
 
   const offWindowState = window.hermesDesktop?.onWindowStateChanged?.((payload: WindowStatePayload) => {
@@ -72,22 +77,36 @@ export function createRendererLoopPauseController(
     window.addEventListener('focus', onFocus)
   }
 
-  if (pauseOnBattery && typeof navigator !== 'undefined') {
-    const nav = navigator as BatteryNavigator
+  if (pauseOnBattery) {
+    offDesktopBattery = window.hermesDesktop?.onBatteryChanged?.((next: boolean) => {
+      setBatteryState(Boolean(next))
+    })
 
-    if (typeof nav.getBattery === 'function') {
-      void nav
-        .getBattery()
-        .then(battery => {
-          if (disposed || !battery) {
-            return
-          }
-
-          batteryRef = battery
-          onBatteryChange()
-          battery.addEventListener?.('chargingchange', onBatteryChange)
+    if (typeof window.hermesDesktop?.getOnBattery === 'function') {
+      void Promise.resolve(window.hermesDesktop.getOnBattery())
+        .then(next => {
+          setBatteryState(Boolean(next))
         })
         .catch(() => undefined)
+    }
+
+    if (typeof navigator !== 'undefined') {
+      const nav = navigator as BatteryNavigator
+
+      if (typeof nav.getBattery === 'function') {
+        void nav
+          .getBattery()
+          .then(battery => {
+            if (disposed || !battery) {
+              return
+            }
+
+            batteryRef = battery
+            onBatteryChange()
+            battery.addEventListener?.('chargingchange', onBatteryChange)
+          })
+          .catch(() => undefined)
+      }
     }
   }
 
@@ -99,6 +118,7 @@ export function createRendererLoopPauseController(
       window.removeEventListener('focus', onFocus)
       batteryRef?.removeEventListener?.('chargingchange', onBatteryChange)
       batteryRef = null
+      offDesktopBattery?.()
       offWindowState?.()
     },
     isPaused: () =>
