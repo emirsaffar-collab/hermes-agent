@@ -2970,6 +2970,18 @@ class _StreamingCall(StreamingWaitMonitor):
             return base, cfg, min(base, 60.0)
         read = env_float("HERMES_STREAM_READ_TIMEOUT", 120.0)
         stale = self._stream_stale_timeout
+        if (
+            getattr(self.agent, "provider", None) == "vertex"
+            and (
+                getattr(self.agent, "run_budget_seconds", None)
+                or should_use_direct_api_call(self.agent)
+            )
+        ):
+            # Inline cron/subagent and budget-capped Vertex streams cap both TTFB and
+            # post-chunk staleness at 150s and cannot abandon a wedged inline socket.
+            # Keep httpx's read timeout aligned (150s + 15s = 165s) so a pre-header
+            # wedge unwinds via ReadTimeout instead of hanging 615s+ until wall-clock kill.
+            stale = self._effective_stale_timeout()
         if read == 120.0 and waits_like_local(self.agent.base_url, self.agent.provider):
             read = base  # local providers prefill for minutes
             logger.debug("Local provider detected (%s) — stream read timeout raised to %.0fs", self.agent.base_url, read)

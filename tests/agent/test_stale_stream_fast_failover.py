@@ -218,3 +218,47 @@ def test_subagent_and_cron_never_acquire_regional_slot_via_bg_review_branch():
     va.record_vertex_regional_429(cooldown_seconds=15.0, session_id=ts_subagent_sid)
     assert va.vertex_regional_cooldown_remaining() == 0.0
 
+
+def test_vertex_inline_stream_read_timeout_honors_150s_cap_while_desktop_keeps_615s():
+    """Inline Vertex streams (cron, subagent) and run_budget_seconds-bounded runs
+    must align httpx read timeout to _effective_stale_timeout() + 15s (165s) so a
+    pre-header socket wedge unwinds via ReadTimeout instead of hanging 615s+ past
+    3 stale kills. Unbounded interactive desktop turns keep read=615s for Phase-2
+    deep thinking pauses.
+    """
+    from typing import Any
+    from types import SimpleNamespace
+
+    def _make_call(platform: str, run_budget_seconds: float | None = None) -> Any:
+        call: Any = _StreamingCall.__new__(_StreamingCall)
+        call.agent = SimpleNamespace(
+            provider="vertex",
+            model="google/gemini-4-argon",
+            api_mode="chat_completions",
+            platform=platform,
+            run_budget_seconds=run_budget_seconds,
+            base_url="https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi",
+            _last_routed_base_url="https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi",
+            _stream_stale_timeout=None,
+            _stream_inter_event_timeout=None,
+        )
+        call.api_kwargs = {"model": "google/gemini-4-argon", "messages": [{"role": "user", "content": "hi"}]}
+        call.clients = SimpleNamespace(diag={"first_chunk_at": None})
+        call._resolve_stale_timeout()
+        return call
+
+    cron_call = _make_call("cron")
+    assert cron_call._stream_timeouts()[1] == 165.0
+
+    sub_call = _make_call("subagent")
+    assert sub_call._stream_timeouts()[1] == 165.0
+    sub_call.clients.diag["first_chunk_at"] = 1001.0
+    assert sub_call._effective_stale_timeout() == 150.0
+
+    budget_call = _make_call("desktop", run_budget_seconds=600.0)
+    assert budget_call._stream_timeouts()[1] == 165.0
+
+    desktop_call = _make_call("desktop")
+    assert desktop_call._stream_timeouts()[1] == 615.0
+
+

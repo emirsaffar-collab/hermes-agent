@@ -54,7 +54,10 @@ class StreamingWaitMonitor:
             eff = min(stale, post_chunk) if (post_chunk is not None and post_chunk > 0) else stale
             if (
                 getattr(agent, "provider", None) == "vertex"
-                and (getattr(agent, "run_budget_seconds", None) or getattr(agent, "platform", None) == "cron")
+                and (
+                    getattr(agent, "run_budget_seconds", None)
+                    or getattr(agent, "platform", None) in ("cron", "subagent")
+                )
             ):
                 return min(eff, VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS)
             return eff
