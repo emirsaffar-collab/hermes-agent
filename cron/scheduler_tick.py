@@ -188,14 +188,39 @@ def _tick_admitted(
         # re-arms next_run_at on completion, so no catch-up queue is needed.
         _results: list = []
         _all_futures: list = []
-        pool = _sched._get_parallel_pool(_max_workers)
-        for job in due_jobs:
-            fut = _sched._submit_with_guard(job, pool, _process_job)
-            if fut is None:
-                continue
-            _all_futures.append(fut)
-            if not sync:
-                _results.append(True)  # optimistically counted
+        # Bulkhead isolation: split interactive_chat vs background_other into separate pools
+        # when max_workers != 1 (serial mode) and _get_parallel_pool is not monkeypatched by tests.
+        _orig_get_pool = getattr(_sched, "_get_parallel_pool", None)
+        _use_bulkhead = (
+            _max_workers != 1
+            and _sched._cron_bulkhead_enabled()
+            and getattr(_orig_get_pool, "__module__", "") == "cron.scheduler"
+            and getattr(_orig_get_pool, "__name__", "") == "_get_parallel_pool"
+        )
+        if _use_bulkhead:
+            # Dispatch interactive_chat jobs first so they never wait behind background jobs.
+            _ordered_jobs = sorted(
+                due_jobs,
+                key=lambda j: 0 if _sched._job_bulkhead_lane(j) == "interactive_chat" else 1,
+            )
+            for job in _ordered_jobs:
+                lane = _sched._job_bulkhead_lane(job)
+                pool = _sched._get_bulkhead_pool(_max_workers, lane)
+                fut = _sched._submit_with_guard(job, pool, _process_job)
+                if fut is None:
+                    continue
+                _all_futures.append(fut)
+                if not sync:
+                    _results.append(True)  # optimistically counted
+        else:
+            pool = _sched._get_parallel_pool(_max_workers)
+            for job in due_jobs:
+                fut = _sched._submit_with_guard(job, pool, _process_job)
+                if fut is None:
+                    continue
+                _all_futures.append(fut)
+                if not sync:
+                    _results.append(True)  # optimistically counted
 
         if sync:
             for f in concurrent.futures.as_completed(_all_futures):

@@ -602,8 +602,8 @@ _FAST_ACCEPT_ABSENT_RE: dict[str, re.Pattern[str]] = {
     "guide-publish-guard-hermes.sh": re.compile(r"(gsutil|gcloud|uropenn-docs|guide|storage)"),
     "ooo-window-gate-hermes.sh": re.compile(r"(ooo|out.of.office|vacation|auto.reply|vacation_settings)"),
     "plane-html-guard-hermes.sh": re.compile(r"(plane|workitem|work-items|8087/mcp)"),
-    "marker-corruption-guard.py": re.compile(r"(redacted|<<|write_file|patch|execute_code|terminal|bash|edit|create_file|cat|python|tee)"),
-    "persona-save-guard.py": re.compile(r"(persona|soul\.md|memory\.md|user\.md|generate\.py|write_file|patch|edit|terminal|bash|execute_code)"),
+    "marker-corruption-guard.py": re.compile(r"(hermes-context-compression|omitted|must never be reproduced)"),
+    "persona-save-guard.py": re.compile(r"(master-persona|persona|changelog|_version|v3\.\d|soul\.md|memory\.md|user\.md|generate\.py)"),
 }
 
 

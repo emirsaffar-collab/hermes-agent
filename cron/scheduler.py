@@ -616,6 +616,55 @@ def _is_cron_silence_response(text: str) -> bool:
 # and then imposes that limit on all the others.
 _parallel_pools: dict[str, concurrent.futures.ThreadPoolExecutor] = {}
 _parallel_pool_max_workers: dict[str, Optional[int]] = {}
+_bulkhead_pools: dict[tuple[str, str], concurrent.futures.ThreadPoolExecutor] = {}
+_bulkhead_pool_max_workers: dict[tuple[str, str], Optional[int]] = {}
+
+_DEFAULT_INTERACTIVE_CHAT_PREFIXES: tuple[str, ...] = (
+    "chat247",
+    "chat-",
+    "evelina-",
+    "celina-",
+    "wh-room",
+    "lager-builder",
+    "newintra-builder",
+)
+
+
+def _cron_bulkhead_enabled() -> bool:
+    """Two-pool scheduler bulkhead isolation (interactive_chat vs background_other).
+    Disable via HERMES_CRON_BULKHEAD=0 to revert to a single shared pool."""
+    raw = cron_env_setting("HERMES_CRON_BULKHEAD").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def _job_bulkhead_lane(job: dict) -> str:
+    """Classify a cron job into 'interactive_chat' or 'background_other' bulkhead lane."""
+    explicit = str(job.get("lane") or "").strip().lower()
+    if explicit in ("interactive_chat", "chat", "fast", "fast_lane"):
+        return "interactive_chat"
+    if explicit in ("background", "background_other", "batch"):
+        return "background_other"
+    raw_pat = cron_env_setting("HERMES_CRON_BULKHEAD_CHAT_PATTERNS").strip()
+    prefixes = tuple(
+        p.strip().lower() for p in raw_pat.split(",") if p.strip()
+    ) if raw_pat else _DEFAULT_INTERACTIVE_CHAT_PREFIXES
+    name = str(job.get("name") or "").strip().lower()
+    jid = str(job.get("id") or "").strip().lower()
+    for pfx in prefixes:
+        if name.startswith(pfx) or jid.startswith(pfx) or (pfx in name):
+            return "interactive_chat"
+    return "background_other"
+
+
+def _bulkhead_lane_workers(max_workers: Optional[int], lane: str) -> Optional[int]:
+    """Partition total max_workers across the two isolated bulkhead pools."""
+    if max_workers is None:
+        return None
+    if max_workers <= 1:
+        return 1
+    chat_workers = max(1, max_workers // 2)
+    bg_workers = max(1, max_workers - chat_workers)
+    return chat_workers if lane == "interactive_chat" else bg_workers
 
 
 def _inflight_key(job_id: str, home: Optional[Path | str] = None) -> tuple:
@@ -1256,6 +1305,26 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     return pool
 
 
+def _get_bulkhead_pool(max_workers: Optional[int], lane: str) -> concurrent.futures.ThreadPoolExecutor:
+    """Return (or create) an isolated ThreadPoolExecutor for ``(profile_home, lane)``.
+
+    Keeps interactive 24/7 chat jobs strictly isolated from slow background builders/audits
+    so a background backlog can never starve interactive chat slots.
+    """
+    home = hermes_home_key(_remember_inflight_home(_get_hermes_home()))
+    lane_workers = _bulkhead_lane_workers(max_workers, lane)
+    key = (home, lane)
+    pool = _bulkhead_pools.get(key)
+    if pool is None or _bulkhead_pool_max_workers.get(key) != lane_workers:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=False)
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=lane_workers, thread_name_prefix=f"cron-{lane}")
+        _bulkhead_pools[key] = pool
+        _bulkhead_pool_max_workers[key] = lane_workers
+    return pool
+
+
 def discard_parallel_pools(home_keys) -> None:
     """Drop the parallel pools of homes this process no longer ticks.
 
@@ -1269,6 +1338,11 @@ def discard_parallel_pools(home_keys) -> None:
         _parallel_pool_max_workers.pop(key, None)
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=False)
+        for bkey in [k for k in list(_bulkhead_pools) if k[0] == key]:
+            bpool = _bulkhead_pools.pop(bkey, None)
+            _bulkhead_pool_max_workers.pop(bkey, None)
+            if bpool is not None:
+                bpool.shutdown(wait=False, cancel_futures=False)
 
 
 def _shutdown_parallel_pool() -> None:
@@ -1277,6 +1351,10 @@ def _shutdown_parallel_pool() -> None:
         pool.shutdown(wait=True, cancel_futures=False)
     _parallel_pools.clear()
     _parallel_pool_max_workers.clear()
+    for bpool in list(_bulkhead_pools.values()):
+        bpool.shutdown(wait=True, cancel_futures=False)
+    _bulkhead_pools.clear()
+    _bulkhead_pool_max_workers.clear()
 
 
 atexit.register(_shutdown_parallel_pool)

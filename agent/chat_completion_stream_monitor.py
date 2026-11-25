@@ -7,6 +7,7 @@ for a wedged inline call) and the shared "no visible text was delivered" check
 
 import contextlib
 import logging
+import os
 import time
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -20,9 +21,14 @@ logger = logging.getLogger(__name__)
 
 # Kills of one dispatched attempt whose worker never unwinds before the monitor gives up on it.
 _STALE_ABANDON_KILLS = 3
-# Phase-1 (pre-first-chunk TTFB) stale cap on regional Vertex endpoints (europe-west2 /
-# asia-southeast1): wedged regional TPU slots fail over to locations/global in 150s instead of 600s.
-VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS = 150.0
+# Phase-1 (pre-first-chunk TTFB) stale cap on regional Vertex endpoints (eu / europe-west2 /
+# asia-southeast1): wedged regional TPU slots fail over to locations/global in 75s instead of 150s/600s.
+try:
+    VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS = max(
+        15.0, float(os.environ.get("HERMES_VERTEX_TTFB_STALE_CAP_SECONDS", "75.0"))
+    )
+except (TypeError, ValueError):
+    VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS = 75.0
 
 
 class StreamingWaitMonitor:

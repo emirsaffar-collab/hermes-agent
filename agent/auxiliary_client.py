@@ -4864,7 +4864,7 @@ def _build_vertex_client(
     except Exception as exc:
         logger.warning("resolve_provider_client: cannot create Vertex client: %s", exc)
         return None, None
-    _flex_flag = os.environ.get("HERMES_VERTEX_COMPRESSION_FLEX", "1").strip().lower()
+    _flex_flag = os.environ.get("HERMES_VERTEX_COMPRESSION_FLEX", "0").strip().lower()
     if (
         task == "compression"
         and isinstance(final_model, str)

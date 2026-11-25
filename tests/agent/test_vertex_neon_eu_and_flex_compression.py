@@ -184,7 +184,13 @@ def test_vertex_flex_compression_wrapper_and_fallback(monkeypatch):
         lambda region=None, **kw: ("ya29.tok", va.build_vertex_base_url("uop-atlas", region or "global")),
     )
 
-    # compression + gemini-3.8-flash -> wrapped in VertexFlexCompressionAuxiliaryClient
+    # Default (HERMES_VERTEX_COMPRESSION_FLEX unset / 0): standard synchronous client (no Sync Flex)
+    monkeypatch.delenv("HERMES_VERTEX_COMPRESSION_FLEX", raising=False)
+    c_default, _ = _build_vertex_client("vertex", "google/gemini-3.8-flash", task="compression")
+    assert not isinstance(c_default, VertexFlexCompressionAuxiliaryClient)
+
+    # Opt-in HERMES_VERTEX_COMPRESSION_FLEX=1 -> wrapped in VertexFlexCompressionAuxiliaryClient
+    monkeypatch.setenv("HERMES_VERTEX_COMPRESSION_FLEX", "1")
     c_comp, m_comp = _build_vertex_client("vertex", "google/gemini-3.8-flash", task="compression")
     assert isinstance(c_comp, VertexFlexCompressionAuxiliaryClient)
     assert m_comp == "google/gemini-3.8-flash"
@@ -245,7 +251,7 @@ def test_vertex_client_cache_key_isolates_compression_from_interactive_tasks(mon
     assert k_title != k_comp, "Vertex compression and title collided on _client_cache_key!"
 
     _client_cache.clear()
-    monkeypatch.delenv("HERMES_VERTEX_COMPRESSION_FLEX", raising=False)
+    monkeypatch.setenv("HERMES_VERTEX_COMPRESSION_FLEX", "1")
     monkeypatch.setattr(va, "has_vertex_credentials", lambda: True)
     monkeypatch.setattr(
         va,

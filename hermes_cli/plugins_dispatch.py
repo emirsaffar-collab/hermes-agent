@@ -11,6 +11,7 @@ import contextvars
 import copy
 import inspect
 import logging
+import os
 import queue
 import re
 import threading
@@ -307,42 +308,96 @@ class PluginDispatchMixin:
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         return self._run_hook_callbacks(hook_name, self._hooks.get(hook_name, []), kwargs)
 
+    @staticmethod
+    def _pre_tool_result_precedence(item: Any) -> int:
+        """Claude-Code-compatible fail-closed merge precedence: block/deny (0) > ask (1) > other (2)."""
+        if isinstance(item, dict):
+            action = str(item.get("action") or "").strip().lower()
+            if action in ("block", "deny"):
+                return 0
+            if action == "ask":
+                return 1
+        return 2
+
+    def _run_single_hook_callback(
+        self, hook_name: str, cb: Callable, kwargs: dict[str, Any], timeout: float, use_timeout: bool,
+    ) -> tuple[Any, bool]:
+        """Invoke one already-matched callback; returns ``(result_or_none, did_fail)``."""
+        fail_closed = _hook_fail_closed(hook_name, cb)
+        try:
+            if use_timeout:
+                ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
+                if ret is _HOOK_SKIPPED:
+                    if fail_closed:  # policy hook: fail closed with a block directive
+                        return {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}, True
+                    return None, True
+            else:
+                ret = self._invoke_hook_callback(cb, kwargs)
+            return ret, False
+        except (Exception, SystemExit) as exc:  # health: allow BLE001 -- moved from invoke_hook: plugin callbacks are untrusted; each failure is reported and isolated
+            self._report_hook_failure(hook_name, cb, kwargs, exc)
+            if fail_closed:  # a guard that raised made no decision: same veto as a timeout
+                return _policy_error_block_directive(hook_name, cb, exc), True
+            return None, True
+
     def _run_hook_callbacks(self, hook_name: str, callbacks: Any, kwargs: dict[str, Any],
                             failed: Optional[list] = None) -> list[Any]:
         """:meth:`invoke_hook`'s loop over ``callbacks``; each one that raised or timed out is
         appended to ``failed`` when given."""
         from hermes_cli.plugins import _resolve_hook_callback_timeout
-        results: list[Any] = []
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
+        matched: list[Callable] = []
         for cb in callbacks:
-            # Per-callback: the hook's own fail_closed declaration wins over the event default.
-            fail_closed = _hook_fail_closed(hook_name, cb)
-            try:
-                # Matcher gate BEFORE the single-flight window (upstream #105223): a shell-hook
-                # callback that doesn't match this tool must never acquire (nor be skipped for)
-                # the flight token of another session's in-flight run of the same callback.
-                matcher = getattr(cb, "_hermes_matches_tool", None)
-                if matcher is not None and not matcher(kwargs.get("tool_name")):
-                    continue
-                if use_timeout:
-                    ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
-                    if ret is _HOOK_SKIPPED:
-                        if failed is not None:
-                            failed.append(cb)
-                        if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
-                        continue
-                else:
-                    ret = self._invoke_hook_callback(cb, kwargs)
+            # Matcher gate BEFORE the single-flight window (upstream #105223): a shell-hook
+            # callback that doesn't match this tool must never acquire (nor be skipped for)
+            # the flight token of another session's in-flight run of the same callback.
+            matcher = getattr(cb, "_hermes_matches_tool", None)
+            if matcher is not None and not matcher(kwargs.get("tool_name")):
+                continue
+            matched.append(cb)
+
+        serial_override = os.environ.get("HERMES_HOOKS_SERIAL", "").strip().lower() in ("1", "true", "yes")
+        if hook_name in ("pre_tool_call", "post_tool_call") and len(matched) > 1 and not serial_override:
+            slots: list[tuple[Any, bool]] = [(None, False)] * len(matched)
+            sem = threading.Semaphore(12)
+            threads: list[threading.Thread] = []
+
+            def _worker(idx: int, callback: Callable, ctx: contextvars.Context) -> None:
+                with sem:
+                    slots[idx] = ctx.run(
+                        self._run_single_hook_callback, hook_name, callback, kwargs, timeout, use_timeout
+                    )
+
+            for idx, cb in enumerate(matched):
+                t = threading.Thread(
+                    target=_worker,
+                    args=(idx, cb, contextvars.copy_context()),
+                    name=f"hook-par-{hook_name}-{idx}",
+                    daemon=True,
+                )
+                threads.append(t)
+                t.start()
+            for t in threads:
+                t.join()
+
+            results: list[Any] = []
+            for idx, (ret, did_fail) in enumerate(slots):
+                if did_fail and failed is not None:
+                    failed.append(matched[idx])
                 if ret is not None:
                     results.append(ret)
-            except (Exception, SystemExit) as exc:  # health: allow BLE001 -- moved from invoke_hook: plugin callbacks are untrusted; each failure is reported and isolated
-                self._report_hook_failure(hook_name, cb, kwargs, exc)
-                if failed is not None:
-                    failed.append(cb)
-                if fail_closed:  # a guard that raised made no decision: same veto as a timeout
-                    results.append(_policy_error_block_directive(hook_name, cb, exc))
+            if hook_name == "pre_tool_call" and len(results) > 1:
+                results.sort(key=self._pre_tool_result_precedence)
+            return results
+
+        results = []
+        for cb in matched:
+            ret, did_fail = self._run_single_hook_callback(hook_name, cb, kwargs, timeout, use_timeout)
+            if did_fail and failed is not None:
+                failed.append(cb)
+            if ret is not None:
+                results.append(ret)
         return results
 
     def _report_hook_failure(
