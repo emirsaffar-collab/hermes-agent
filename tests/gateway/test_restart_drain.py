@@ -1127,3 +1127,27 @@ async def test_an_update_pause_adopts_a_waiting_restart_instead_of_reporting_it_
     await asyncio.wait_for(runner._restart_task, timeout=5.0)
     runner._launch_detached_restart_command.assert_not_awaited()
     assert seen == {"restart": True, "detached_restart": False, "service_restart": True}
+
+
+def test_inprocess_cron_can_dispatch_pauses_while_restart_requested():
+    """Positive & negative polarity: a pending graceful restart pauses new in-process cron
+    admissions so recurring jobs cannot starve await_idle(), and resumes if cleared."""
+    from gateway.run_bootstrap import _inprocess_cron_can_dispatch
+
+    runner, _adapter = make_restart_runner()
+    runner._draining = False
+    runner._external_drain_active = False
+    runner._restart_requested = False
+    assert _inprocess_cron_can_dispatch(runner) is True
+
+    runner._restart_requested = True
+    assert _inprocess_cron_can_dispatch(runner) is False
+
+    runner._restart_requested = False
+    assert _inprocess_cron_can_dispatch(runner) is True
+
+    runner._draining = True
+    assert _inprocess_cron_can_dispatch(runner) is False
+    runner._draining = False
+    runner._external_drain_active = True
+    assert _inprocess_cron_can_dispatch(runner) is False

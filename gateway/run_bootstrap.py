@@ -447,6 +447,21 @@ def _cron_registry_profile_count(ticked: list) -> int:
     return len({name for name, _home in [*ticked, *listed]})
 
 
+def _inprocess_cron_can_dispatch(runner) -> bool:
+    """Return True when the in-process cron ticker may admit new due jobs.
+
+    New scheduled cron dispatches pause while draining, under external drain, or while a
+    graceful restart is waiting for idle (``_restart_requested``): in-flight jobs finish
+    uninterrupted and held jobs catch up on the restarted gateway's first tick instead of
+    keeping ``await_idle()`` wedged indefinitely on busy 24/7 cron schedules.
+    """
+    return not (
+        runner._draining
+        or runner._external_drain_active
+        or getattr(runner, "_restart_requested", False)
+    )
+
+
 def _start_gateway_start_cron_and_housekeeping(runner):
     """Start the cron scheduler thread + gateway housekeeping thread; returns
     ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
@@ -489,10 +504,9 @@ def _start_gateway_start_cron_and_housekeeping(runner):
             "Cron scheduler will tick %d profile(s): %s", len(cron_profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in cron_profile_homes])
 
-    # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
+    # Only the in-process ticker polls local due jobs, so only it gets the drain/restart dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active)
+        cron_start_kwargs["can_dispatch"] = lambda: _inprocess_cron_can_dispatch(runner)
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(
