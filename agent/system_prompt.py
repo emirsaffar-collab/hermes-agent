@@ -313,9 +313,26 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
     return " ".join(g for g in tool_guidance if g) or None
 
 
+def _configured_compact_skill_categories() -> frozenset[str]:
+    """Read standalone ``skills.compact_categories`` from config.yaml without
+    requiring ``agent.coding_context: focus`` (so $HOME desktop and cron sessions
+    can demote tool-dense non-core skill descriptions to names-only without
+    stripping any toolsets)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        raw = (cfg.get("skills") or {}).get("compact_categories")
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            return frozenset(str(c).strip() for c in raw if str(c).strip())
+    except Exception:
+        pass
+    return frozenset()
+
+
 def _skills_prompt(agent: Any) -> str:
-    """Skills index (empty without skills tools).  Focus mode demotes non-coding
-    categories to names-only — never hidden, every name stays visible."""
+    """Skills index (empty without skills tools).  Focus mode and/or standalone
+    ``skills.compact_categories`` demotes listed categories to names-only —
+    never hidden, every name stays visible."""
     if not any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage']):
         return ""
     import model_tools
@@ -325,6 +342,9 @@ def _skills_prompt(agent: Any) -> str:
         _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
     except Exception:
         _compact_cats = frozenset()
+    _cfg_compact = _configured_compact_skill_categories()
+    if _cfg_compact:
+        _compact_cats = frozenset(_compact_cats) | _cfg_compact
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
                                          compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
 

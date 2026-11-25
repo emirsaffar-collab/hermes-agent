@@ -66,15 +66,26 @@ _EU_WEST2_MACRO_CLUSTERS: frozenset[str] = frozenset(
 #   gemini-4-neon:     $3.00 in / $0.15 cached / $15.00 out (95% cache read discount)
 #   gemini-4-hydrogen: $1.50 in / $0.075 cached / $7.50 out (95% cache read discount)
 #   gemini-4-carbon:   $2.00 in / $0.10 cached / $10.00 out (95% cache read discount)
+# Jan 12, 2027 00:00 PT (2027-01-12T08:00:00Z): 1.25x uncached input write surcharge on Neon/Hydrogen
+#   gemini-4-neon write cliff:     $3.75 in ($3.367875 EUR/M)
+#   gemini-4-hydrogen write cliff: $1.875 in ($1.683938 EUR/M)
 VERTEX_NEON_UNCACHED_IN_EUR_PER_M = 2.694300
+VERTEX_NEON_UNCACHED_IN_JAN12_EUR_PER_M = 3.367875
 VERTEX_NEON_CACHED_IN_EUR_PER_M = 0.134715
 VERTEX_NEON_OUT_EUR_PER_M = 13.471500
 VERTEX_HYDROGEN_UNCACHED_IN_EUR_PER_M = 1.347150
+VERTEX_HYDROGEN_UNCACHED_IN_JAN12_EUR_PER_M = 1.683938
 VERTEX_HYDROGEN_CACHED_IN_EUR_PER_M = 0.067358
 VERTEX_HYDROGEN_OUT_EUR_PER_M = 6.735750
 VERTEX_CARBON_UNCACHED_IN_EUR_PER_M = 1.796200
 VERTEX_CARBON_CACHED_IN_EUR_PER_M = 0.089810
 VERTEX_CARBON_OUT_EUR_PER_M = 8.981000
+GEMINI4_WRITE_SURCHARGE_EPOCH_UTC = 1799740800.0  # 2027-01-12T08:00:00Z (2027-01-12 00:00:00 PT)
+
+# Gemini 3.5 Flash-Lite flat EUR rates per 1M tokens ($0.30 in / $0.03 cached / $2.50 out * 0.8981)
+VERTEX_FLASH_LITE_UNCACHED_IN_EUR_PER_M = 0.269430
+VERTEX_FLASH_LITE_CACHED_IN_EUR_PER_M = 0.026943
+VERTEX_FLASH_LITE_OUT_EUR_PER_M = 2.245250
 
 # Global Flash SKUs: 2A35-AC68-14D6 (in), 8658-6939-8BEC (cache), 90FD-DC5F-DC55 (out)
 VERTEX_FLASH_UNCACHED_IN_EUR_PER_M = 0.673573
@@ -107,14 +118,24 @@ def resolve_vertex_rates(model: str, ts: float | None = None) -> tuple[float, fl
             VERTEX_ARGON_OUT_EUR_PER_M,
         )
     if "neon" in mod:
+        in_r = (
+            VERTEX_NEON_UNCACHED_IN_JAN12_EUR_PER_M
+            if now_ts >= GEMINI4_WRITE_SURCHARGE_EPOCH_UTC
+            else VERTEX_NEON_UNCACHED_IN_EUR_PER_M
+        )
         return (
-            VERTEX_NEON_UNCACHED_IN_EUR_PER_M,
+            in_r,
             VERTEX_NEON_CACHED_IN_EUR_PER_M,
             VERTEX_NEON_OUT_EUR_PER_M,
         )
     if "hydrogen" in mod:
+        in_r = (
+            VERTEX_HYDROGEN_UNCACHED_IN_JAN12_EUR_PER_M
+            if now_ts >= GEMINI4_WRITE_SURCHARGE_EPOCH_UTC
+            else VERTEX_HYDROGEN_UNCACHED_IN_EUR_PER_M
+        )
         return (
-            VERTEX_HYDROGEN_UNCACHED_IN_EUR_PER_M,
+            in_r,
             VERTEX_HYDROGEN_CACHED_IN_EUR_PER_M,
             VERTEX_HYDROGEN_OUT_EUR_PER_M,
         )
@@ -123,6 +144,12 @@ def resolve_vertex_rates(model: str, ts: float | None = None) -> tuple[float, fl
             VERTEX_CARBON_UNCACHED_IN_EUR_PER_M,
             VERTEX_CARBON_CACHED_IN_EUR_PER_M,
             VERTEX_CARBON_OUT_EUR_PER_M,
+        )
+    if "flash-lite" in mod or "flash_lite" in mod:
+        return (
+            VERTEX_FLASH_LITE_UNCACHED_IN_EUR_PER_M,
+            VERTEX_FLASH_LITE_CACHED_IN_EUR_PER_M,
+            VERTEX_FLASH_LITE_OUT_EUR_PER_M,
         )
     if now_ts >= FLASH_PROMO_EXPIRY_EPOCH_UTC:
         return (

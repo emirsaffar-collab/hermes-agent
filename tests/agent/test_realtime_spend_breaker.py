@@ -1785,6 +1785,60 @@ def test_persisted_deep_compaction_lineage_catches_split_desktop_runaway(tmp_pat
     assert "tier1_runaway_autonomous_turn" in v_runaway["reason"]
 
 
+def test_flash_lite_rates_and_jan12_gemini4_write_surcharge():
+    pre_jan12 = rsb.GEMINI4_WRITE_SURCHARGE_EPOCH_UTC - 60.0
+    post_jan12 = rsb.GEMINI4_WRITE_SURCHARGE_EPOCH_UTC + 60.0
+
+    # Neon & Hydrogen uncached input write steps up 1.25x on Jan 12, 2027 (cache read & out unchanged)
+    neon_pre = rsb.resolve_vertex_rates("google/gemini-4-neon", ts=pre_jan12)
+    neon_post = rsb.resolve_vertex_rates("google/gemini-4-neon", ts=post_jan12)
+    assert neon_pre == (
+        rsb.VERTEX_NEON_UNCACHED_IN_EUR_PER_M,
+        rsb.VERTEX_NEON_CACHED_IN_EUR_PER_M,
+        rsb.VERTEX_NEON_OUT_EUR_PER_M,
+    )
+    assert neon_post == (
+        rsb.VERTEX_NEON_UNCACHED_IN_JAN12_EUR_PER_M,
+        rsb.VERTEX_NEON_CACHED_IN_EUR_PER_M,
+        rsb.VERTEX_NEON_OUT_EUR_PER_M,
+    )
+    assert abs((neon_post[0] / neon_pre[0]) - 1.25) < 1e-6
+
+    hyd_pre = rsb.resolve_vertex_rates("google/gemini-4-hydrogen", ts=pre_jan12)
+    hyd_post = rsb.resolve_vertex_rates("google/gemini-4-hydrogen", ts=post_jan12)
+    assert abs((hyd_post[0] / hyd_pre[0]) - 1.25) < 1e-6
+    assert hyd_pre[1:] == hyd_post[1:]
+
+    # gemini-3.5-flash-lite must NOT fall through to post-Jan-1 Flash ($1.50/$0.15/$7.50)
+    fl_post_jan1 = rsb.resolve_vertex_rates("google/gemini-3.5-flash-lite", ts=post_jan12)
+    assert fl_post_jan1 == (
+        rsb.VERTEX_FLASH_LITE_UNCACHED_IN_EUR_PER_M,
+        rsb.VERTEX_FLASH_LITE_CACHED_IN_EUR_PER_M,
+        rsb.VERTEX_FLASH_LITE_OUT_EUR_PER_M,
+    )
+    eur_std = rsb.compute_call_net_eur(
+        provider="vertex",
+        model="google/gemini-3.5-flash-lite",
+        prompt_tokens=1_000_000,
+        uncached_input_tokens=1_000_000,
+        cache_read_tokens=0,
+        output_tokens=0,
+        ts=post_jan12,
+    )
+    eur_flex = rsb.compute_call_net_eur(
+        provider="vertex",
+        model="google/gemini-3.5-flash-lite",
+        prompt_tokens=1_000_000,
+        uncached_input_tokens=1_000_000,
+        cache_read_tokens=0,
+        output_tokens=0,
+        service_tier="flex",
+        ts=post_jan12,
+    )
+    assert abs(eur_std - rsb.VERTEX_FLASH_LITE_UNCACHED_IN_EUR_PER_M) < 1e-5
+    assert abs(eur_flex - (rsb.VERTEX_FLASH_LITE_UNCACHED_IN_EUR_PER_M * 0.5)) < 1e-5
+
+
 
 
 
