@@ -489,6 +489,23 @@ OLDER_ARCHIVE_PREFIX_HEADING = (
 )
 _OLDER_ARCHIVE_PREFIX_TOKEN_RE = re.compile(r"\b([A-Za-z0-9_-]+)_\*\s*\((\d+)\)")
 _PRUNED_REF_SESSION_RE = re.compile(r"^cache/pruned/([A-Za-z0-9_-]+?)_\d{8}T\d{6}Z_")
+# Exactly what archive_list_for_summary appends: a known heading, then "- <path>/cache/pruned/<name>"
+# lines and/or the collapsed older-session prefix summary line.
+_ARCHIVE_LIST_HEADINGS_ALT = "|".join(re.escape(h) for h in ARCHIVE_LIST_KNOWN_HEADINGS)
+_ARCHIVE_LIST_BLOCK_RE = re.compile(
+    r"\n*(?:" + _ARCHIVE_LIST_HEADINGS_ALT + r")"
+    r"(?:(?:\n- [^\n]*cache/pruned/[A-Za-z0-9_.-]+)+(?:\n" + re.escape(OLDER_ARCHIVE_PREFIX_HEADING) + r"[^\n]*)?"
+    r"|\n" + re.escape(OLDER_ARCHIVE_PREFIX_HEADING) + r"[^\n]*)(?=\n|$)"
+)
+
+
+def strip_archive_list(summary: str) -> str:
+    """*summary* without the archive list block(s) a compaction appended (a summary written before lists
+    stopped re-stacking can carry several). Only the generated shape matches, so a quoted heading in summary
+    text survives. The lists stay on the stored rows the retention sweep reads."""
+    if not any(h in summary for h in ARCHIVE_LIST_KNOWN_HEADINGS):
+        return summary
+    return _ARCHIVE_LIST_BLOCK_RE.sub("", summary).rstrip()
 
 
 def _row_text(row: Any) -> str:

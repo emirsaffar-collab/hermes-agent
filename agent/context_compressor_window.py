@@ -159,7 +159,11 @@ class CompactionWindowMixin:
         """``_assemble_compressed`` with every archive a replaced row named, that neither the kept head and tail
         nor the generated summary still name, listed in the summary row: the summarizer never saw the pointers
         (it read the originals), and the list keeps the model's path back and the reference the retention
-        sweep keeps the file for. Prior compaction summary rows collapse to ``<session_id>_* (N)`` prefixes."""
+        sweep keeps the file for. An earlier handoff row that is already stored counts only for its unwrapped
+        prior-tail content in verbatim refs (collapsing its prior archive paths to ``<session_id>_* (N)``
+        prefixes): its own archive list stays on that stored row, which the sweep still reads, so lists never
+        re-stack. An unstored handoff (no session store) is the list's only copy, so it carries over."""
+        from agent.context_compressor import _DB_PERSISTED_MARKER
         from tools.tool_result_storage import (
             ancestor_archive_prefix_counts,
             archive_list_for_summary,
@@ -167,17 +171,23 @@ class CompactionWindowMixin:
         )
 
         summary_indices = getattr(scan, "summary_indices", None) or set()
-        window_rows = [
-            m for idx, m in enumerate(messages)
-            if idx not in summary_indices and not self._is_context_summary_message(m)
-        ]
-        prior_summary_rows = [
-            m for idx, m in enumerate(messages)
-            if idx in summary_indices or self._is_context_summary_message(m)
-        ]
-        named = pruned_archive_refs(window_rows)
-        ancestor_counts = ancestor_archive_prefix_counts(prior_summary_rows, exclude_refs=named)
-        kept = [*messages[:start], *messages[max(end, scan.tail_start):], {"content": summary}]
+        stored_summary_rows: list[dict[str, Any]] = []
+        named_rows: list[dict[str, Any]] = []
+        for idx, msg in enumerate(messages):
+            is_summary = idx in summary_indices or self._is_context_summary_message(msg)
+            is_stored = bool(msg.get(_DB_PERSISTED_MARKER) or isinstance(msg.get("_row_id"), int))
+            if is_summary and is_stored:
+                stored_summary_rows.append(msg)
+                stripped = self._strip_context_summary_handoff_message(msg)
+                if stripped is not None:
+                    named_rows.append(stripped)
+            else:
+                named_rows.append(msg)
+        named = pruned_archive_refs(named_rows)
+        ancestor_counts = ancestor_archive_prefix_counts(stored_summary_rows, exclude_refs=named)
+        # What the committed transcript really keeps: assembly drops standalone handoffs from the head and tail.
+        kept = [*self._assemble_head(messages, start), {"content": summary},
+                *self._assemble_tail(messages, end, scan.tail_start, scan.summary_indices)]
         return self._assemble_compressed(
             messages, start, end, scan, summary + archive_list_for_summary(named, kept, ancestor_counts),
         )
