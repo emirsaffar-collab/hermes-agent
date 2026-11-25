@@ -857,12 +857,15 @@ class PromptCacheWarmer:
             cached = int(u.cache_read_tokens + u.cache_write_tokens)
             uncached = int(u.input_tokens)
             # Vertex implicit prefix caching never reports cache_write_tokens; once a turn has
-            # established a cached prefix (or sent >=2,048 tokens on a warm window), the entire
-            # prompt up to its 256-token block boundary is cached for subsequent replays.
+            # established a cached prefix (or sent >=4,096 tokens on Gemini 4 / >=2,048 on
+            # Gemini 2.5/3.x within a warm window), the entire prompt up to its 256-token block
+            # boundary is cached for subsequent replays.
+            model_lower = str(getattr(self.agent, "model", "") or "").strip().lower()
+            min_implicit_tokens = 4096 if "gemini-4" in model_lower else 2048
             if (
                 str(getattr(self.agent, "provider", "") or "").strip().lower() == "vertex"
                 and int(u.cache_write_tokens) == 0
-                and (cached + uncached) >= 2048
+                and (cached + uncached) >= min_implicit_tokens
             ):
                 total = cached + uncached
                 tail = total % 256

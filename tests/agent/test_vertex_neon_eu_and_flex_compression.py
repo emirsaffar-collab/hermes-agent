@@ -458,3 +458,54 @@ def test_vertex_flex_timeout_cap_and_circuit_breaker(monkeypatch):
     )
     assert r4.id == "vflex-recovered"
     _VertexFlexCompletionsAdapter.reset_breaker()
+
+
+def test_usage_pricing_jan12_gemini4_write_surcharge_polarity(monkeypatch):
+    from datetime import UTC, datetime
+    from decimal import Decimal
+    from agent import usage_pricing as up
+
+    route_neon = up.BillingRoute(provider="google", model="gemini-4-neon")
+    route_hy = up.BillingRoute(provider="google", model="gemini-4-hydrogen")
+
+    # Before Jan 12, 2027 08:00 UTC (00:00 PT): base list rates ($3.00 / $1.50)
+    monkeypatch.setattr(up, "_UTC_NOW", lambda: datetime(2027, 1, 12, 7, 59, tzinfo=UTC))
+    e_neon_pre = up._lookup_official_docs_pricing(route_neon)
+    e_hy_pre = up._lookup_official_docs_pricing(route_hy)
+    assert e_neon_pre is not None and e_neon_pre.input_cost_per_million == Decimal("3.00")
+    assert e_neon_pre.cache_read_cost_per_million == Decimal("0.15")
+    assert e_hy_pre is not None and e_hy_pre.input_cost_per_million == Decimal("1.50")
+
+    # At/after Jan 12, 2027 08:00 UTC: 1.25x uncached input surcharge ($3.75 / $1.875), cache read & output unchanged
+    monkeypatch.setattr(up, "_UTC_NOW", lambda: datetime(2027, 1, 12, 8, 0, tzinfo=UTC))
+    e_neon_post = up._lookup_official_docs_pricing(route_neon)
+    e_hy_post = up._lookup_official_docs_pricing(route_hy)
+    assert e_neon_post is not None and e_neon_post.input_cost_per_million == Decimal("3.75")
+    assert e_neon_post.cache_read_cost_per_million == Decimal("0.15")
+    assert e_neon_post.output_cost_per_million == Decimal("15.00")
+    assert e_neon_post.pricing_version is not None and e_neon_post.pricing_version.endswith("-post-jan12-write-1.25x")
+    assert e_hy_post is not None and e_hy_post.input_cost_per_million == Decimal("1.875")
+    assert e_hy_post.cache_read_cost_per_million == Decimal("0.075")
+
+
+def test_warmer_vertex_gemini4_4096_implicit_cache_floor():
+    from agent.prompt_cache_lifecycle.warmer import PromptCacheWarmer
+
+    def _split(model: str, prompt_tokens: int):
+        agent = SimpleNamespace(provider="vertex", api_mode="chat_completions", model=model)
+        warmer = PromptCacheWarmer(agent)
+        resp = SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=10,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+            )
+        )
+        return warmer._prompt_split(resp)
+
+    # Gemini 4 requires >= 4,096 tokens for Vertex implicit cache; 3,000 must stay uncached
+    assert _split("google/gemini-4-neon", 3000) == (0, 3000)
+    assert _split("google/gemini-4-neon", 4096) == (4096, 0)
+    assert _split("google/gemini-4-hydrogen", 4200) == (4096, 104)
+    # Gemini 3.8 retains the 2,048-token implicit cache floor
+    assert _split("google/gemini-3.8-flash", 3000) == (2816, 184)

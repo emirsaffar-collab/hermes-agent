@@ -521,8 +521,17 @@ _MODEL_NORMALIZERS = {"anthropic": _normalize_anthropic_model_name, "bedrock": _
 
 
 def _apply_google_promo_cliff(model: str, entry: PricingEntry) -> PricingEntry:
-    """Apply documented Gemini 4 Argon/Carbon (2026-12-01 UTC) and Flash 3.8 (2027-01-01 UTC) 2x rate cliffs."""
+    """Apply documented Gemini 4 Argon/Carbon (2026-12-01 UTC) and Flash 3.8 (2027-01-01 UTC) 2x rate cliffs,
+    plus the Gemini 4 Neon/Hydrogen 1.25x uncached-input write surcharge starting 2027-01-12 00:00 PT (08:00 UTC)."""
     now = _UTC_NOW()
+    if model in ("gemini-4-neon", "gemini-4-hydrogen") and now >= datetime(2027, 1, 12, 8, tzinfo=UTC):
+        if entry.input_cost_per_million is not None:
+            return replace(
+                entry,
+                input_cost_per_million=entry.input_cost_per_million * Decimal("1.25"),
+                pricing_version=f"{entry.pricing_version}-post-jan12-write-1.25x",
+            )
+        return entry
     suffix = None
     if model in ("gemini-4-argon", "gemini-4-carbon") and now >= datetime(2026, 12, 1, 0, tzinfo=UTC):
         suffix = "post-dec1-2x"
