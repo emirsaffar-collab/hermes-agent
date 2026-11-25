@@ -1639,6 +1639,8 @@ class GatewayStartupMixin:
             self._spawn_supervised(getattr(self, method), method[1:])
         from gateway.runtime_downgrade_exit import runtime_downgrade_watcher
         self._spawn_supervised(lambda: runtime_downgrade_watcher(self), "runtime_downgrade_watcher")
+        from gateway.code_skew_exit import code_skew_idle_watcher
+        self._spawn_supervised(lambda: code_skew_idle_watcher(self), "code_skew_idle_watcher")
         # Scale-to-zero watcher ONLY when opted in, messaging is relay-only/absent, and a wakeUrl exists.
         try:
             if self._scale_to_zero_should_arm():
