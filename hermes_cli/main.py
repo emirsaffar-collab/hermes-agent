@@ -2505,10 +2505,15 @@ def cmd_dashboard(args):
         from hermes_cli.dashboard_procs import BACKEND_LOCK_NAME
         from hermes_cli.serve_supervisor import run_serve_supervisor
 
+        _sup_token = _ssh_session_token
+        if not _sup_token and os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN"):
+            from hermes_cli.web_server_session_token import resolve_session_token
+            _sup_token = resolve_session_token()
+
         run_serve_supervisor(
             host=args.host,
             port=args.port,
-            session_token=_ssh_session_token,
+            session_token=_sup_token,
             ssh_owner_nonce=_ssh_owner_nonce,
             ssh_lock_path=Path(_token_file).parent / BACKEND_LOCK_NAME if _token_file else None,
             isolated=True,

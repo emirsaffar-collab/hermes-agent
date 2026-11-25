@@ -56,6 +56,11 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 _log = logging.getLogger("hermes.serve_supervisor")
 
+# v2: ingress WS auth (zero unauth token injection), real tui_gateway event/params.type
+# envelope parsing, client.capabilities replay, cross-gen session rehydration,
+# enforced max_draining_workers=1, and authenticated busy_ledger drain checks.
+SUPERVISOR_PROTOCOL_VERSION = 2
+
 _READY_PORT_RE = re.compile(r"HERMES_(?:BACKEND|DASHBOARD)_READY\s+port=(\d+)")
 _HOP_BY_HOP_HEADERS = frozenset({
     "connection",
@@ -74,6 +79,9 @@ _TURN_START_METHODS = frozenset({
     "prompt.send",
     "prompt.submit",
     "prompt.retry",
+    "prompt.background",
+    "prompt.btw",
+    "prompt.enqueue",
     "session.prompt",
     "session.send",
     "sessions.prompt",
@@ -97,6 +105,7 @@ _SESSION_SCOPED_PREFIXES = (
     "approval.",
     "clarify.",
     "permissions.",
+    "subagent.",
     "subagents.",
 )
 
@@ -138,6 +147,8 @@ _TERMINAL_TURN_METHODS = frozenset({
 })
 
 _TERMINAL_EVENT_TYPES = frozenset({
+    "message.complete",
+    "error",
     "turn_complete",
     "turn_done",
     "turn_ended",
@@ -159,7 +170,17 @@ _ACTIVE_TURN_METHODS = frozenset({
     "turn.running",
 })
 
+_ACTIVE_EVENT_TYPES = frozenset({
+    "message.start",
+    "turn_started",
+    "running",
+    "streaming",
+    "in_progress",
+})
+
 _SESSION_PATH_RE = re.compile(r"^/api/sessions/([^/]+)(?:/|$)")
+_SESSION_LIFECYCLE_METHODS = frozenset({"session.create", "session.resume", "sessions.create"})
+_SESSION_CLOSE_METHODS = frozenset({"session.close", "sessions.close"})
 
 
 def _extract_session_id(params: Any) -> Optional[str]:
@@ -192,6 +213,12 @@ def _is_terminal_notification(method: str, params: Any) -> bool:
         ev = str(params.get("type") or params.get("event") or params.get("status") or "").lower()
         if ev in _TERMINAL_EVENT_TYPES:
             return True
+        if method == "event" and ev == "session.info":
+            if params.get("running") is False:
+                return True
+            payload = params.get("payload")
+            if isinstance(payload, dict) and payload.get("running") is False:
+                return True
     return False
 
 
@@ -202,9 +229,40 @@ def _is_turn_start_notification(method: str, params: Any) -> bool:
         return True
     if isinstance(params, dict):
         ev = str(params.get("type") or params.get("event") or params.get("status") or "").lower()
-        if ev in ("turn_started", "running", "streaming", "in_progress"):
+        if ev in _ACTIVE_EVENT_TYPES:
             return True
+        if method == "event" and ev == "session.info":
+            if params.get("running") is True:
+                return True
+            payload = params.get("payload")
+            if isinstance(payload, dict) and payload.get("running") is True:
+                return True
     return False
+
+
+def _extract_request_cancel_id(method: str, params: Any) -> Optional[str]:
+    """Return cancelled srq-* request id if frame is a request.cancel notification."""
+    if not isinstance(params, dict):
+        return None
+    if method == "request.cancel":
+        rid = params.get("id")
+        return str(rid) if rid is not None else None
+    if method == "event" and str(params.get("type") or "").lower() == "request.cancel":
+        payload = params.get("payload")
+        if isinstance(payload, dict) and payload.get("id") is not None:
+            return str(payload["id"])
+        if params.get("id") is not None:
+            return str(params["id"])
+    return None
+
+
+def _strip_single_use_ticket_qs(query_string: str) -> str:
+    """Remove single-use ?ticket= parameter before connecting to a rolled-over worker."""
+    if not query_string:
+        return ""
+    from urllib.parse import parse_qsl
+    pairs = [(k, v) for k, v in parse_qsl(query_string, keep_blank_values=True) if k.lower() != "ticket"]
+    return urlencode(pairs)
 
 
 def _write_machine_sentinel_line(line: str) -> None:
@@ -290,12 +348,15 @@ class ClientWsMux:
         client_ws: WebSocket,
         query_string: str,
         extra_headers: dict[str, str],
+        subprotocols: Optional[list[str]] = None,
     ) -> None:
         self.supervisor = supervisor
         self.client_ws = client_ws
         self.query_string = query_string
         self.extra_headers = extra_headers
+        self.subprotocols = list(subprotocols or [])
         self._send_lock = asyncio.Lock()
+        self._accepted = asyncio.Event()
         self._closed = False
 
         # gen -> websockets client connection
@@ -309,9 +370,21 @@ class ClientWsMux:
         self.pending_srq: dict[Any, int] = {}
         # Pending client->worker request IDs: req_id -> worker gen
         self.pending_reqs: dict[Any, int] = {}
-        # Cached initial hello frame to replay transparently to newly rolled-over workers
+        # Pending request metadata: req_id -> (method, params)
+        self._pending_req_meta: dict[Any, tuple[str, dict[str, Any]]] = {}
+        # Cached handshake frames to replay transparently to newly rolled-over workers
         self._hello_frame: Optional[dict[str, Any]] = None
-        self._synthetic_hello_ids: set[str] = set()
+        self._capabilities_frames: list[dict[str, Any]] = []
+        self._synthetic_init_ids: set[str] = set()
+        self._synthetic_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        # Set True ONLY after initial upstream worker accepts the client's real credentials.
+        self._client_authenticated: bool = False
+        # Cross-gen session tracking and bidirectional runtime-sid aliasing:
+        # client_sid -> {"stored_key": str, "cwd": Optional[str], "profile": Optional[str], "known_gens": set[int]}
+        self._session_meta: dict[str, dict[str, Any]] = {}
+        self._sid_to_worker: dict[tuple[str, int], str] = {}
+        self._sid_from_worker: dict[tuple[str, int], str] = {}
+        self._rehydrate_locks: dict[tuple[str, int], asyncio.Lock] = {}
 
     def active_sessions_for_gen(self, gen: int) -> set[str]:
         return {sid for sid, g in self.active_turn_pins.items() if g == gen}
@@ -328,9 +401,95 @@ class ClientWsMux:
     async def send_to_client(self, text: str) -> None:
         if self._closed:
             return
+        await self._accepted.wait()
+        if self._closed:
+            return
         async with self._send_lock:
             if not self._closed:
                 await self.client_ws.send_text(text)
+
+    def _to_client_sid(self, worker_sid: Optional[str], gen: int) -> Optional[str]:
+        if not worker_sid:
+            return worker_sid
+        return self._sid_from_worker.get((worker_sid, gen), worker_sid)
+
+    def _to_worker_sid(self, client_sid: str, gen: int) -> str:
+        return self._sid_to_worker.get((client_sid, gen), client_sid)
+
+    @staticmethod
+    def _rewrite_sid_in_dict(obj: Any, old_sid: str, new_sid: str) -> bool:
+        """Replace matching runtime session_id fields in-place; return True if mutated."""
+        if not isinstance(obj, dict) or old_sid == new_sid:
+            return False
+        changed = False
+        for key in ("session_id", "sessionId", "sid"):
+            if obj.get(key) == old_sid:
+                obj[key] = new_sid
+                changed = True
+        return changed
+
+    async def _send_synthetic_rpc(self, worker: WorkerInstance, up: Any, method: str, params: dict[str, Any], timeout_s: float = 15.0) -> Optional[dict[str, Any]]:
+        syn_id = f"__sup_syn_{worker.gen}_{secrets.token_hex(6)}"
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._synthetic_futures[syn_id] = fut
+        try:
+            await up.send(json.dumps({"jsonrpc": "2.0", "id": syn_id, "method": method, "params": params}))
+            return await asyncio.wait_for(fut, timeout=timeout_s)
+        except Exception as exc:
+            _log.debug("Synthetic RPC %s to gen=%s failed: %s", method, worker.gen, exc)
+            return None
+        finally:
+            self._synthetic_futures.pop(syn_id, None)
+
+    async def _ensure_session_on_worker(self, client_sid: str, worker: WorkerInstance) -> None:
+        """Transparently rehydrate an idle session onto a new worker generation after rollover."""
+        meta = self._session_meta.get(client_sid)
+        if not meta or worker.gen in meta["known_gens"]:
+            return
+        lock = self._rehydrate_locks.setdefault((client_sid, worker.gen), asyncio.Lock())
+        async with lock:
+            if worker.gen in meta["known_gens"]:
+                return
+            up = await self.ensure_upstream(worker)
+            stored_key = meta.get("stored_key") or ""
+            resp: Optional[dict[str, Any]] = None
+            if stored_key:
+                resume_params: dict[str, Any] = {
+                    "session_id": stored_key,
+                    "omit_messages": True,
+                }
+                if meta.get("profile"):
+                    resume_params["profile"] = meta["profile"]
+                resp = await self._send_synthetic_rpc(worker, up, "session.resume", resume_params)
+            new_worker_sid: Optional[str] = None
+            if isinstance(resp, dict) and isinstance(resp.get("result"), dict):
+                cand = resp["result"].get("session_id")
+                if isinstance(cand, str) and cand.strip():
+                    new_worker_sid = cand.strip()
+            if not new_worker_sid:
+                # Fallback for brand-new empty tabs not yet persisted to state.db
+                create_params: dict[str, Any] = {}
+                if meta.get("cwd"):
+                    create_params["cwd"] = meta["cwd"]
+                if meta.get("profile"):
+                    create_params["profile"] = meta["profile"]
+                resp2 = await self._send_synthetic_rpc(worker, up, "session.create", create_params)
+                if isinstance(resp2, dict) and isinstance(resp2.get("result"), dict):
+                    cand2 = resp2["result"].get("session_id")
+                    if isinstance(cand2, str) and cand2.strip():
+                        new_worker_sid = cand2.strip()
+                        sk2 = resp2["result"].get("stored_session_id") or resp2["result"].get("session_key")
+                        if isinstance(sk2, str) and sk2.strip():
+                            meta["stored_key"] = sk2.strip()
+            if new_worker_sid:
+                self._sid_to_worker[(client_sid, worker.gen)] = new_worker_sid
+                self._sid_from_worker[(new_worker_sid, worker.gen)] = client_sid
+                meta["known_gens"].add(worker.gen)
+                _log.debug(
+                    "Rehydrated session %s -> worker_sid=%s on gen=%s (stored_key=%s)",
+                    client_sid, new_worker_sid, worker.gen, stored_key or "-",
+                )
 
     async def ensure_upstream(self, worker: WorkerInstance) -> Any:
         existing = self._upstreams.get(worker.gen)
@@ -341,35 +500,61 @@ class ClientWsMux:
             existing = self._upstreams.get(worker.gen)
             if existing is not None:
                 return existing
+            is_rollover_upstream = self._client_authenticated
+            qs = _strip_single_use_ticket_qs(self.query_string) if is_rollover_upstream else self.query_string
             url = f"{worker.ws_base_url}/api/ws"
-            if self.query_string:
-                url = f"{url}?{self.query_string}"
+            if qs:
+                url = f"{url}?{qs}"
             headers = dict(self.extra_headers)
-            if self.supervisor.session_token and "x-hermes-session-token" not in {
-                k.lower() for k in headers
-            }:
-                headers["X-Hermes-Session-Token"] = self.supervisor.session_token
-            ws = await websockets.connect(
-                url,
-                additional_headers=headers,
-                max_size=64 * 1024 * 1024,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=5,
-            )
+            subprotos = list(self.subprotocols)
+            # SECURITY (P0-1): NEVER inject self.supervisor.session_token on the initial
+            # unauthenticated handshake. Only attach the supervisor token when opening a
+            # secondary upstream to a rolled-over worker AFTER the initial worker already
+            # authenticated this client connection.
+            if is_rollover_upstream:
+                headers = {
+                    k: v for k, v in headers.items()
+                    if k.lower() != "x-hermes-gateway-ticket"
+                }
+                subprotos = [
+                    p for p in subprotos
+                    if not p.startswith("hermes-gateway-ticket.")
+                ]
+                if self.supervisor.session_token and "x-hermes-session-token" not in {
+                    k.lower() for k in headers
+                }:
+                    headers["X-Hermes-Session-Token"] = self.supervisor.session_token
+            connect_kwargs: dict[str, Any] = {
+                "additional_headers": headers,
+                "max_size": 64 * 1024 * 1024,
+                "ping_interval": 20,
+                "ping_timeout": 20,
+                "close_timeout": 5,
+            }
+            if subprotos:
+                connect_kwargs["subprotocols"] = subprotos
+            ws = await websockets.connect(url, **connect_kwargs)
+            self._client_authenticated = True
             self._upstreams[worker.gen] = ws
             self._reader_tasks[worker.gen] = asyncio.create_task(
                 self._pump_upstream(worker, ws),
                 name=f"ws-mux-upstream-gen-{worker.gen}",
             )
-            # Replay client hello to newly opened worker after rollover so it has
-            # the client's protocol version / profile capabilities.
-            if self._hello_frame is not None and worker.gen != self.supervisor.initial_gen:
-                syn_id = f"__sup_hello_{worker.gen}_{secrets.token_hex(4)}"
-                self._synthetic_hello_ids.add(syn_id)
-                replay = dict(self._hello_frame)
-                replay["id"] = syn_id
-                await ws.send(json.dumps(replay))
+            # Replay client capabilities (real tui_gateway handshake) + legacy hello to newly
+            # rolled-over workers so gen-(N+1) accepts server_requests (approvals/clarify/vault).
+            if is_rollover_upstream:
+                for idx, cap_frame in enumerate(list(self._capabilities_frames)):
+                    syn_id = f"__sup_cap_{worker.gen}_{idx}_{secrets.token_hex(4)}"
+                    self._synthetic_init_ids.add(syn_id)
+                    replay = dict(cap_frame)
+                    replay["id"] = syn_id
+                    await ws.send(json.dumps(replay))
+                if self._hello_frame is not None:
+                    syn_id = f"__sup_hello_{worker.gen}_{secrets.token_hex(4)}"
+                    self._synthetic_init_ids.add(syn_id)
+                    replay = dict(self._hello_frame)
+                    replay["id"] = syn_id
+                    await ws.send(json.dumps(replay))
             return ws
 
     async def detach_worker(self, gen: int) -> None:
@@ -382,13 +567,20 @@ class ClientWsMux:
                 await ws.close()
             except Exception:
                 pass
-        # Clean up any leftover pins referencing this departed worker
+        # Clean up any leftover pins and aliases referencing this departed worker
         for sid in [s for s, g in self.active_turn_pins.items() if g == gen]:
             self.active_turn_pins.pop(sid, None)
         for rid in [r for r, g in self.pending_srq.items() if g == gen]:
             self.pending_srq.pop(rid, None)
         for rid in [r for r, g in self.pending_reqs.items() if g == gen]:
             self.pending_reqs.pop(rid, None)
+            self._pending_req_meta.pop(rid, None)
+        for k in [k for k in self._sid_to_worker if k[1] == gen]:
+            self._sid_to_worker.pop(k, None)
+        for k in [k for k in self._sid_from_worker if k[1] == gen]:
+            self._sid_from_worker.pop(k, None)
+        for meta in self._session_meta.values():
+            meta["known_gens"].discard(gen)
 
     async def _pump_upstream(self, worker: WorkerInstance, ws: Any) -> None:
         try:
@@ -439,21 +631,71 @@ class ClientWsMux:
         # 1. Server-initiated request (e.g. srq-123 approval / clarify prompt)
         if has_method and has_id:
             self.pending_srq[msg["id"]] = worker.gen
+            params = msg.get("params")
+            worker_sid = _extract_session_id(params)
+            client_sid = self._to_client_sid(worker_sid, worker.gen)
+            if worker_sid and client_sid and client_sid != worker_sid:
+                self._rewrite_sid_in_dict(params, worker_sid, client_sid)
+                raw = json.dumps(msg)
             await self.send_to_client(raw)
             return
 
-        # 2. Response to a client request (or synthetic hello replay)
+        # 2. Response to a client request (or synthetic init/rehydration RPC)
         if has_id and not has_method:
             rid = msg["id"]
-            if isinstance(rid, str) and rid in self._synthetic_hello_ids:
-                self._synthetic_hello_ids.discard(rid)
-                return
+            if isinstance(rid, str):
+                fut = self._synthetic_futures.pop(rid, None)
+                if fut is not None:
+                    if not fut.done():
+                        fut.set_result(msg)
+                    return
+                if rid in self._synthetic_init_ids:
+                    self._synthetic_init_ids.discard(rid)
+                    return
             self.pending_reqs.pop(rid, None)
+            req_meta = self._pending_req_meta.pop(rid, None)
+            # Track session.create / session.resume metadata so idle sessions can be
+            # transparently rehydrated onto gen-(N+1) after rollover.
+            if req_meta is not None and isinstance(msg.get("result"), dict):
+                req_method, req_params = req_meta
+                res = msg["result"]
+                if req_method in _SESSION_LIFECYCLE_METHODS:
+                    created_sid = res.get("session_id")
+                    stored_key = res.get("stored_session_id") or res.get("session_key") or res.get("resumed") or ""
+                    if isinstance(created_sid, str) and created_sid.strip():
+                        csid = created_sid.strip()
+                        meta = self._session_meta.setdefault(
+                            csid,
+                            {
+                                "stored_key": "",
+                                "cwd": req_params.get("cwd") if isinstance(req_params, dict) else None,
+                                "profile": req_params.get("profile") if isinstance(req_params, dict) else None,
+                                "known_gens": set(),
+                            },
+                        )
+                        if isinstance(stored_key, str) and stored_key.strip():
+                            meta["stored_key"] = stored_key.strip()
+                        meta["known_gens"].add(worker.gen)
+                        if res.get("running") is True:
+                            self.active_turn_pins[csid] = worker.gen
+                elif req_method in _SESSION_CLOSE_METHODS:
+                    closed_sid = _extract_session_id(req_params)
+                    if closed_sid:
+                        self._session_meta.pop(closed_sid, None)
+            # Translate worker_sid back to client_sid in result payload if aliased
+            if isinstance(msg.get("result"), dict):
+                res_sid = _extract_session_id(msg["result"])
+                client_res_sid = self._to_client_sid(res_sid, worker.gen)
+                if res_sid and client_res_sid and client_res_sid != res_sid:
+                    self._rewrite_sid_in_dict(msg["result"], res_sid, client_res_sid)
+                    raw = json.dumps(msg)
             # If a turn-start RPC returned an immediate JSON-RPC error, release turn pin
             if "error" in msg:
-                # Best-effort: error payload may include sessionId
+                # Best-effort: error payload may include sessionId; also check req_meta
                 err_data = msg.get("error", {}).get("data") if isinstance(msg.get("error"), dict) else None
-                sid = _extract_session_id(err_data)
+                sid = self._to_client_sid(_extract_session_id(err_data), worker.gen)
+                if not sid and req_meta is not None:
+                    sid = _extract_session_id(req_meta[1])
                 if sid and self.active_turn_pins.get(sid) == worker.gen:
                     self.active_turn_pins.pop(sid, None)
             await self.send_to_client(raw)
@@ -463,7 +705,14 @@ class ClientWsMux:
         if has_method and not has_id:
             method = msg["method"]
             params = msg.get("params")
-            sid = _extract_session_id(params)
+            cancel_rid = _extract_request_cancel_id(method, params)
+            if cancel_rid is not None:
+                self.pending_srq.pop(cancel_rid, None)
+            worker_sid = _extract_session_id(params)
+            sid = self._to_client_sid(worker_sid, worker.gen)
+            if worker_sid and sid and sid != worker_sid:
+                self._rewrite_sid_in_dict(params, worker_sid, sid)
+                raw = json.dumps(msg)
             if sid:
                 if _is_terminal_notification(method, params):
                     if self.active_turn_pins.get(sid) == worker.gen:
@@ -472,7 +721,7 @@ class ClientWsMux:
                     self.active_turn_pins[sid] = worker.gen
             # Suppress redundant global/unpinned broadcasts from draining workers
             if worker.draining:
-                if sid:
+                if sid or cancel_rid is not None:
                     # Always forward notifications for sessions that ran on this draining worker
                     # (including the terminal notification that just cleared the pin!).
                     await self.send_to_client(raw)
@@ -504,6 +753,10 @@ class ClientWsMux:
 
         if method == "hello" and has_id:
             self._hello_frame = dict(msg)
+        elif method == "client.capabilities" and has_id:
+            # Record every client.capabilities call in order (Desktop may send
+            # server_requests and desktop_local in separate calls).
+            self._capabilities_frames.append(dict(msg))
 
         if _is_session_scoped_method(method):
             sid = _extract_session_id(params)
@@ -523,17 +776,26 @@ class ClientWsMux:
         return self.supervisor.active_worker
 
     async def run(self) -> None:
-        # Eagerly establish upstream connection to active worker on WS accept
+        # Establish authenticated upstream connection BEFORE accepting client WS
+        # so unauthenticated / invalid-credential clients are rejected pre-accept.
         active = self.supervisor.active_worker
         if active is None or not active.is_alive():
             await self.client_ws.close(code=1013, reason="no active worker")
             return
         try:
-            await self.ensure_upstream(active)
+            up = await self.ensure_upstream(active)
         except Exception as exc:
             _log.warning("Failed to connect upstream /api/ws to gen=%s: %s", active.gen, exc)
-            await self.client_ws.close(code=1011, reason="upstream connect failed")
+            code = 4401 if ("401" in str(exc) or "403" in str(exc) or "4401" in str(exc)) else 1011
+            try:
+                await self.client_ws.close(code=code, reason="upstream connect failed")
+            except Exception:
+                pass
             return
+
+        negotiated_subprotocol = getattr(up, "subprotocol", None)
+        await self.client_ws.accept(subprotocol=negotiated_subprotocol)
+        self._accepted.set()
 
         try:
             while not self._closed:
@@ -588,16 +850,32 @@ class ClientWsMux:
                 await self.send_to_client(json.dumps(err))
             return
 
+        method = msg.get("method", "") if isinstance(msg.get("method"), str) else ""
+        params = msg.get("params")
+        client_sid = _extract_session_id(params) if _is_session_scoped_method(method) else None
+
         if "method" in msg and "id" in msg and msg["id"] is not None:
             self.pending_reqs[msg["id"]] = target.gen
+            self._pending_req_meta[msg["id"]] = (method, dict(params) if isinstance(params, dict) else {})
 
         try:
             up = await self.ensure_upstream(target)
+            # Transparently rehydrate idle session on rolled-over worker before forwarding
+            if client_sid and client_sid in self._session_meta:
+                await self._ensure_session_on_worker(client_sid, target)
+                worker_sid = self._to_worker_sid(client_sid, target.gen)
+                if worker_sid != client_sid and isinstance(params, dict):
+                    fwd_msg = dict(msg)
+                    fwd_params = dict(params)
+                    self._rewrite_sid_in_dict(fwd_params, client_sid, worker_sid)
+                    fwd_msg["params"] = fwd_params
+                    raw = json.dumps(fwd_msg)
             await up.send(raw)
         except Exception as exc:
             _log.warning("Forwarding client frame to gen=%s failed: %s", target.gen, exc)
             if "id" in msg and msg["id"] is not None:
                 self.pending_reqs.pop(msg["id"], None)
+                self._pending_req_meta.pop(msg["id"], None)
                 err = {
                     "jsonrpc": "2.0",
                     "id": msg["id"],
@@ -607,8 +885,13 @@ class ClientWsMux:
 
     async def close(self) -> None:
         self._closed = True
+        self._accepted.set()
         for gen in list(self._upstreams.keys()):
             await self.detach_worker(gen)
+
+
+class RolloverCapExceededError(RuntimeError):
+    """Raised when rollover is blocked because max_draining_workers is already reached."""
 
 
 class ServeSupervisor:
@@ -628,13 +911,22 @@ class ServeSupervisor:
         worker_ready_timeout_s: float = 45.0,
         drain_poll_s: float = 1.0,
         drain_settle_s: float = 1.0,
-        max_draining_workers: int = 3,
+        max_draining_workers: int = 1,
+        drain_max_s: Optional[float] = None,
     ) -> None:
         self.host = host
         self.requested_port = port
         self.bound_port: int = port
         # Always hold a single consistent session token across all worker generations.
-        self.session_token: str = session_token or secrets.token_hex(32)
+        # Honor HERMES_DASHBOARD_SESSION_TOKEN (including file:<path>) when no explicit
+        # session_token was passed (P0-2: launchd ai.hermes.serve :9119 token parity).
+        if session_token:
+            self.session_token = session_token
+        elif os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN"):
+            from hermes_cli.web_server_session_token import resolve_session_token
+            self.session_token = resolve_session_token()
+        else:
+            self.session_token = secrets.token_hex(32)
         self.ssh_owner_nonce = ssh_owner_nonce
         self.ssh_lock_path = ssh_lock_path
         self.isolated = isolated
@@ -643,7 +935,14 @@ class ServeSupervisor:
         self.worker_ready_timeout_s = worker_ready_timeout_s
         self.drain_poll_s = drain_poll_s
         self.drain_settle_s = drain_settle_s
-        self.max_draining_workers = max_draining_workers
+        self.max_draining_workers = max(1, int(max_draining_workers))
+        if drain_max_s is None:
+            raw_max = os.environ.get("HERMES_SUPERVISOR_DRAIN_MAX_S", "1800")
+            try:
+                drain_max_s = max(5.0, float(raw_max))
+            except ValueError:
+                drain_max_s = 1800.0
+        self.drain_max_s = float(drain_max_s)
 
         self.started_at = time.time()
         self.initial_gen = 1
@@ -861,9 +1160,65 @@ class ServeSupervisor:
             return True
         return any(c.has_inflight_work_for_gen(gen) for c in list(self._clients))
 
+    async def _worker_is_idle(self, worker: WorkerInstance) -> bool:
+        """Query the worker's own /api/health/idle (busy_ledger + background jobs).
+
+        Returns:
+          - True if worker reports idle=True, or returns 404 (minimal mock worker without /api/health/idle).
+          - False if worker reports idle=False, or probe fails/times out (fail-closed so active
+            background turns / subagents are never killed prematurely).
+        """
+        if self._http_client is None:
+            return True
+        try:
+            resp = await self._http_client.get(
+                f"{worker.base_url}/api/health/idle",
+                headers={"X-Hermes-Session-Token": self.session_token},
+                timeout=3.0,
+            )
+            if resp.status_code == 404:
+                return True
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    return data.get("idle") is not False
+            return False
+        except Exception:
+            return False
+
     async def rollover(self, reason: str = "api") -> dict[str, Any]:
         """Spawn a new worker generation, health-verify it, atomically flip, and drain old."""
         async with self._rollover_lock:
+            # Enforce max_draining_workers cap BEFORE spawning another worker (P0-5: RAM/WAL guard).
+            draining_live = [
+                w for w in self._workers.values()
+                if w.draining and not w.retired and w.is_alive()
+            ]
+            if len(draining_live) >= self.max_draining_workers:
+                await self._drain_sweep_once()
+                draining_live = [
+                    w for w in self._workers.values()
+                    if w.draining and not w.retired and w.is_alive()
+                ]
+            if len(draining_live) >= self.max_draining_workers:
+                gens = [w.gen for w in draining_live]
+                msg = (
+                    f"rollover blocked: {len(draining_live)} draining worker(s) already active "
+                    f"(gens={gens}, cap={self.max_draining_workers})"
+                )
+                rec = {
+                    "ts": round(time.time(), 2),
+                    "reason": reason,
+                    "ok": False,
+                    "error": msg,
+                    "active_gen": self.active_worker.gen if self.active_worker else None,
+                    "draining_gens": gens,
+                }
+                self._rollover_history.append(rec)
+                if len(self._rollover_history) > 20:
+                    del self._rollover_history[: len(self._rollover_history) - 20]
+                raise RolloverCapExceededError(msg)
+
             self._rollover_in_progress = True
             t0 = time.monotonic()
             old_worker = self.active_worker
@@ -924,12 +1279,24 @@ class ServeSupervisor:
 
     async def _drain_sweep_once(self) -> None:
         now = time.monotonic()
+        wall_now = time.time()
         draining = [w for w in list(self._workers.values()) if w.draining and not w.retired]
         for w in draining:
             if not w.is_alive():
                 await self._retire_worker(w)
                 continue
+            # Hard drain deadline prevents a wedged worker from holding RAM/WAL forever.
+            if w.draining_since is not None and (wall_now - w.draining_since) >= self.drain_max_s:
+                _log.warning(
+                    "Draining worker-gen-%s (pid=%s) exceeded drain_max_s=%.1fs; retiring",
+                    w.gen, w.pid, self.drain_max_s,
+                )
+                await self._retire_worker(w)
+                continue
             if self._has_inflight_work(w.gen):
+                self._idle_since.pop(w.gen, None)
+                continue
+            if not await self._worker_is_idle(w):
                 self._idle_since.pop(w.gen, None)
                 continue
             first_idle = self._idle_since.setdefault(w.gen, now)
@@ -955,6 +1322,40 @@ class ServeSupervisor:
             hdr = request.query_params.get("token") or ""
         return bool(hdr) and secrets.compare_digest(hdr, self.session_token)
 
+    def _ws_ingress_auth_check(self, websocket: WebSocket) -> Optional[str]:
+        """Fail-closed ingress check on WebSocket upgrades BEFORE accepting or forwarding.
+
+        Returns None if the caller presents either:
+          - a valid supervisor session token (constant-time verified here), OR
+          - a delegated credential mechanism (one-use ticket or session cookie) that
+            the upstream worker's authoritative auth gate will verify pre-accept.
+        Returns a short rejection reason string if the connection must be rejected immediately.
+        """
+        tok = (websocket.headers.get("x-hermes-session-token") or "").strip()
+        if not tok:
+            auth = (websocket.headers.get("authorization") or "").strip()
+            if auth.lower().startswith("bearer "):
+                tok = auth[7:].strip()
+        if not tok:
+            tok = (websocket.query_params.get("token") or "").strip()
+        if tok:
+            if secrets.compare_digest(tok, self.session_token):
+                return None
+            return "invalid_session_token"
+
+        # Single-use ticket (query param, header, or Sec-WebSocket-Protocol subprotocol)
+        if (websocket.query_params.get("ticket") or "").strip():
+            return None
+        if (websocket.headers.get("x-hermes-gateway-ticket") or "").strip():
+            return None
+        raw_proto = websocket.headers.get("sec-websocket-protocol") or ""
+        if any(p.strip().startswith("hermes-gateway-ticket.") for p in raw_proto.split(",") if p.strip()):
+            return None
+        # Webapp session cookie (verified authoritatively by upstream worker pre-accept)
+        if (websocket.headers.get("cookie") or "").strip():
+            return None
+        return "missing_credential"
+
     def status_payload(self) -> dict[str, Any]:
         active = self.active_worker
         draining = [
@@ -966,6 +1367,7 @@ class ServeSupervisor:
         for c in list(self._clients):
             all_pins.update(c.active_turn_pins)
         return {
+            "protocol_version": SUPERVISOR_PROTOCOL_VERSION,
             "pid": os.getpid(),
             "host": self.host,
             "port": self.bound_port,
@@ -975,6 +1377,9 @@ class ServeSupervisor:
             "active_worker_pid": active.pid if active else None,
             "active_worker_port": active.port if active else None,
             "active_worker_commit": active.commit if active else "",
+            "worker_started_at": round(active.started_at, 2) if active else None,
+            "max_draining_workers": self.max_draining_workers,
+            "drain_max_s": self.drain_max_s,
             "draining_workers": draining,
             "active_turn_pins": all_pins,
             "connected_ws_clients": len(self._clients),
@@ -1015,10 +1420,13 @@ class ServeSupervisor:
                 if data.get("commit"):
                     active.commit = str(data["commit"])
                 data["supervisor"] = {
+                    "protocol_version": SUPERVISOR_PROTOCOL_VERSION,
                     "pid": os.getpid(),
                     "active_gen": active.gen,
                     "active_worker_pid": active.pid,
                     "active_worker_commit": active.commit,
+                    "worker_started_at": round(active.started_at, 2),
+                    "max_draining_workers": self.max_draining_workers,
                     "draining_count": len(sup_meta["draining_workers"]),
                     "draining_workers": sup_meta["draining_workers"],
                     "rollover_in_progress": self._rollover_in_progress,
@@ -1043,6 +1451,11 @@ class ServeSupervisor:
         try:
             rec = await self.rollover(reason=reason)
             return JSONResponse({"ok": True, "rollover": rec, "supervisor": self.status_payload()})
+        except RolloverCapExceededError as exc:
+            return JSONResponse(
+                {"ok": False, "error": str(exc), "supervisor": self.status_payload()},
+                status_code=409,
+            )
         except Exception as exc:
             return JSONResponse(
                 {"ok": False, "error": str(exc), "supervisor": self.status_payload()},
@@ -1156,15 +1569,32 @@ class ServeSupervisor:
             media_type=upstream.headers.get("content-type"),
         )
 
-    async def _handle_api_ws(self, websocket: WebSocket) -> None:
-        await websocket.accept()
+    @staticmethod
+    def _extract_ws_headers_and_subprotocols(websocket: WebSocket) -> tuple[dict[str, str], list[str]]:
         extra_headers: dict[str, str] = {}
-        for k in ("x-hermes-session-token", "authorization", "cookie", "origin"):
+        for k in (
+            "x-hermes-session-token",
+            "authorization",
+            "cookie",
+            "origin",
+            "x-hermes-gateway-ticket",
+        ):
             val = websocket.headers.get(k)
             if val:
                 extra_headers[k] = val
+        raw_proto = websocket.headers.get("sec-websocket-protocol") or ""
+        subprotocols = [p.strip() for p in raw_proto.split(",") if p.strip()]
+        return extra_headers, subprotocols
+
+    async def _handle_api_ws(self, websocket: WebSocket) -> None:
+        reject_reason = self._ws_ingress_auth_check(websocket)
+        if reject_reason is not None:
+            _log.warning("/api/ws ingress auth rejected: %s", reject_reason)
+            await websocket.close(code=4401, reason=f"auth: {reject_reason}")
+            return
+        extra_headers, subprotocols = self._extract_ws_headers_and_subprotocols(websocket)
         qs = urlencode(list(websocket.query_params.multi_items())) if websocket.query_params else ""
-        mux = ClientWsMux(self, websocket, qs, extra_headers)
+        mux = ClientWsMux(self, websocket, qs, extra_headers, subprotocols=subprotocols)
         self._clients.add(mux)
         try:
             await mux.run()
@@ -1172,31 +1602,37 @@ class ServeSupervisor:
             self._clients.discard(mux)
 
     async def _handle_generic_ws_tunnel(self, websocket: WebSocket) -> None:
+        reject_reason = self._ws_ingress_auth_check(websocket)
+        if reject_reason is not None:
+            _log.warning("%s ingress auth rejected: %s", websocket.url.path, reject_reason)
+            await websocket.close(code=4401, reason=f"auth: {reject_reason}")
+            return
         worker = self.active_worker
         if worker is None or not worker.is_alive():
             await websocket.close(code=1013, reason="no active worker")
             return
-        await websocket.accept()
-        extra_headers: dict[str, str] = {}
-        for k in ("x-hermes-session-token", "authorization", "cookie", "origin"):
-            val = websocket.headers.get(k)
-            if val:
-                extra_headers[k] = val
-        if "x-hermes-session-token" not in {k.lower() for k in extra_headers}:
-            extra_headers["X-Hermes-Session-Token"] = self.session_token
+        # SECURITY (P0-1): Forward client credentials verbatim; NEVER inject self.session_token.
+        extra_headers, subprotocols = self._extract_ws_headers_and_subprotocols(websocket)
         path = websocket.url.path
         qs = urlencode(list(websocket.query_params.multi_items())) if websocket.query_params else ""
         url = f"{worker.ws_base_url}{path}" + (f"?{qs}" if qs else "")
 
+        connect_kwargs: dict[str, Any] = {
+            "additional_headers": extra_headers,
+            "max_size": 64 * 1024 * 1024,
+            "ping_interval": 20,
+            "ping_timeout": 20,
+        }
+        if subprotocols:
+            connect_kwargs["subprotocols"] = subprotocols
+
         self._secondary_ws_counts[worker.gen] = self._secondary_ws_counts.get(worker.gen, 0) + 1
+        accepted = False
         try:
-            async with websockets.connect(
-                url,
-                additional_headers=extra_headers,
-                max_size=64 * 1024 * 1024,
-                ping_interval=20,
-                ping_timeout=20,
-            ) as up:
+            async with websockets.connect(url, **connect_kwargs) as up:
+                await websocket.accept(subprotocol=getattr(up, "subprotocol", None))
+                accepted = True
+
                 async def _c2u() -> None:
                     while True:
                         msg = await websocket.receive()
@@ -1226,8 +1662,11 @@ class ServeSupervisor:
                         pass
         except Exception as exc:
             _log.debug("Secondary WS tunnel %s ended: %s", path, exc)
+            code = 1011
+            if not accepted and ("401" in str(exc) or "403" in str(exc) or "4401" in str(exc)):
+                code = 4401
             try:
-                await websocket.close(code=1011)
+                await websocket.close(code=code)
             except Exception:
                 pass
         finally:
@@ -1366,11 +1805,20 @@ def run_serve_supervisor(
         server.lifespan = config.lifespan_class(config)
 
         loop = asyncio.get_running_loop()
+
+        async def _safe_sighup_rollover() -> None:
+            try:
+                await sup.rollover(reason="sighup")
+            except RolloverCapExceededError as exc:
+                _log.warning("SIGHUP rollover skipped: %s", exc)
+            except Exception as exc:
+                _log.error("SIGHUP rollover failed: %s", exc)
+
         if hasattr(signal, "SIGHUP"):
             try:
                 loop.add_signal_handler(
                     signal.SIGHUP,
-                    lambda: asyncio.create_task(sup.rollover(reason="sighup")),
+                    lambda: asyncio.create_task(_safe_sighup_rollover()),
                 )
             except (NotImplementedError, RuntimeError):
                 pass
