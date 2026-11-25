@@ -1854,11 +1854,75 @@ class AsyncBedrockAuxiliaryClient(_AsyncAuxiliaryClientBase):
 class _VertexFlexCompletionsAdapter:
     """Calls Vertex native ``:generateContent`` with Sync Flex (0.50x) for ``aux:compression``
     on eligible models (``gemini-3.8-flash``), falling back transparently to the standard
-    OpenAI-compatible Vertex client on any transport/API/empty-content error."""
+    OpenAI-compatible Vertex client on any transport/API/empty-content error.
+
+    The Flex attempt is strictly timeout-capped (default 25s, never inheriting
+    ``_COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0``) and guarded by a process-local
+    circuit breaker (default 2 consecutive failures -> 15 min direct-to-standard bypass)
+    so peak-hour Flex saturation cannot stall compression until the 300s watchdog aborts.
+    """
+
+    _DEFAULT_FLEX_TIMEOUT_S = 25.0
+    _MIN_FLEX_TIMEOUT_S = 5.0
+    _MAX_FLEX_TIMEOUT_S = 60.0
+    _DEFAULT_BREAKER_THRESHOLD = 2
+    _DEFAULT_BREAKER_COOLDOWN_S = 900.0
+
+    _BREAKER_LOCK = threading.Lock()
+    _consecutive_failures = 0
+    _open_until = 0.0
 
     def __init__(self, fallback_client: Any, model: str):
         self._fallback_client = fallback_client
         self._model = model
+
+    @classmethod
+    def reset_breaker(cls) -> None:
+        with cls._BREAKER_LOCK:
+            cls._consecutive_failures = 0
+            cls._open_until = 0.0
+
+    @classmethod
+    def _resolve_flex_timeout(cls, caller_timeout: Any) -> float:
+        raw_cap = os.environ.get("HERMES_VERTEX_FLEX_TIMEOUT_S", "").strip()
+        cap = cls._DEFAULT_FLEX_TIMEOUT_S
+        if raw_cap:
+            try:
+                parsed = float(raw_cap)
+                if parsed > 0:
+                    cap = max(cls._MIN_FLEX_TIMEOUT_S, min(cls._MAX_FLEX_TIMEOUT_S, parsed))
+            except ValueError:
+                pass
+        if caller_timeout is not None:
+            try:
+                ct = float(caller_timeout)
+                if ct > 0:
+                    return min(ct, cap)
+            except (TypeError, ValueError):
+                pass
+        return cap
+
+    @classmethod
+    def _breaker_params(cls) -> tuple[int, float]:
+        threshold = cls._DEFAULT_BREAKER_THRESHOLD
+        raw_th = os.environ.get("HERMES_VERTEX_FLEX_BREAKER_THRESHOLD", "").strip()
+        if raw_th:
+            try:
+                parsed_th = int(raw_th)
+                if parsed_th >= 1:
+                    threshold = parsed_th
+            except ValueError:
+                pass
+        cooldown = cls._DEFAULT_BREAKER_COOLDOWN_S
+        raw_cd = os.environ.get("HERMES_VERTEX_FLEX_BREAKER_COOLDOWN_S", "").strip()
+        if raw_cd:
+            try:
+                parsed_cd = float(raw_cd)
+                if parsed_cd >= 0:
+                    cooldown = parsed_cd
+            except ValueError:
+                pass
+        return threshold, cooldown
 
     def create(self, **kwargs) -> Any:
         from agent.vertex_adapter import call_vertex_native_flex
@@ -1869,11 +1933,26 @@ class _VertexFlexCompletionsAdapter:
             resp = self._fallback_client.chat.completions.create(**kwargs)
             _notify_aux_provider_response()
             return resp
+        now_mono = time.monotonic()
+        with self._BREAKER_LOCK:
+            remaining_s = self._open_until - now_mono
+        if remaining_s > 0:
+            logger.debug(
+                "VertexFlexCompressionAuxiliaryClient: flex circuit open (%.0fs remaining); routing directly to standard Vertex",
+                remaining_s,
+            )
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs.pop("stream", None)
+            resp = self._fallback_client.chat.completions.create(**fallback_kwargs)
+            _notify_aux_provider_response()
+            return resp
+
         max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
         stop = kwargs.get("stop")
         if isinstance(stop, str):
             stop = [stop]
-        timeout_val = kwargs.get("timeout")
+        flex_timeout = self._resolve_flex_timeout(kwargs.get("timeout"))
+        flex_failed = False
         try:
             resp = call_vertex_native_flex(
                 messages=kwargs.get("messages", []),
@@ -1882,15 +1961,35 @@ class _VertexFlexCompletionsAdapter:
                 temperature=kwargs.get("temperature"),
                 top_p=kwargs.get("top_p"),
                 stop=stop,
-                timeout=float(timeout_val) if timeout_val else 90.0,
+                timeout=flex_timeout,
             )
             content = getattr(resp.choices[0].message, "content", "") if getattr(resp, "choices", None) else ""
             if isinstance(content, str) and content.strip():
+                with self._BREAKER_LOCK:
+                    type(self)._consecutive_failures = 0
+                    type(self)._open_until = 0.0
                 _notify_aux_provider_response()
                 return resp
+            flex_failed = True
             logger.warning("VertexFlexCompressionAuxiliaryClient: empty flex response; falling back to standard Vertex")
         except Exception as exc:
-            logger.warning("VertexFlexCompressionAuxiliaryClient: flex failed (%s); falling back to standard Vertex", exc)
+            flex_failed = True
+            logger.warning(
+                "VertexFlexCompressionAuxiliaryClient: flex failed after %.1fs cap (%s); falling back to standard Vertex",
+                flex_timeout,
+                exc,
+            )
+        if flex_failed:
+            threshold, cooldown = self._breaker_params()
+            with self._BREAKER_LOCK:
+                type(self)._consecutive_failures += 1
+                if cooldown > 0 and type(self)._consecutive_failures >= threshold:
+                    type(self)._open_until = time.monotonic() + cooldown
+                    logger.warning(
+                        "VertexFlexCompressionAuxiliaryClient: flex circuit tripped for %.0fs after %d consecutive failures; routing directly to standard Vertex",
+                        cooldown,
+                        type(self)._consecutive_failures,
+                    )
         fallback_kwargs = dict(kwargs)
         fallback_kwargs.pop("stream", None)
         resp = self._fallback_client.chat.completions.create(**fallback_kwargs)

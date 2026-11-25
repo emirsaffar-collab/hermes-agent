@@ -367,3 +367,88 @@ def test_usage_pricing_google_dec1_and_jan1_cliffs(monkeypatch):
     assert flash_post is not None and flash_post.input_cost_per_million == Decimal("1.50")
     assert flash_post.output_cost_per_million == Decimal("7.50")
     assert flash_post.cache_read_cost_per_million == Decimal("0.15")
+
+
+def test_vertex_flex_timeout_cap_and_circuit_breaker(monkeypatch):
+    """RCA 2026-11-25 regression: Flex must NEVER inherit _COMPRESSION_TIMEOUT_FLOOR_SECONDS (300s)
+    and must trip a process-local circuit breaker after consecutive failures to bypass Flex directly
+    to standard Vertex without burning 300s watchdog stalls."""
+    from agent.auxiliary_client import (
+        _COMPRESSION_TIMEOUT_FLOOR_SECONDS,
+        _VertexFlexCompletionsAdapter,
+    )
+
+    _VertexFlexCompletionsAdapter.reset_breaker()
+    monkeypatch.delenv("HERMES_VERTEX_FLEX_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("HERMES_VERTEX_FLEX_BREAKER_THRESHOLD", raising=False)
+    monkeypatch.delenv("HERMES_VERTEX_FLEX_BREAKER_COOLDOWN_S", raising=False)
+
+    seen_timeouts: list[float] = []
+    flex_calls = {"n": 0}
+    fb_calls = {"n": 0}
+
+    def _fake_fb(**kw):
+        fb_calls["n"] += 1
+        return SimpleNamespace(
+            id=f"std-{fb_calls['n']}",
+            choices=[SimpleNamespace(index=0, message=SimpleNamespace(role="assistant", content="std ok"), finish_reason="stop")],
+        )
+
+    fb_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=_fake_fb)))
+    adapter = _VertexFlexCompletionsAdapter(fb_client, "google/gemini-3.8-flash")
+
+    def _slow_timeout(**kw):
+        flex_calls["n"] += 1
+        seen_timeouts.append(kw["timeout"])
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr(va, "call_vertex_native_flex", _slow_timeout)
+
+    # Call 1: caller passes 300.0s floor -> Flex must be capped at 25.0s (strictly <= 30.0s)
+    r1 = adapter.create(
+        model="google/gemini-3.8-flash",
+        messages=[{"role": "user", "content": "compress 1"}],
+        timeout=_COMPRESSION_TIMEOUT_FLOOR_SECONDS,
+    )
+    assert r1.id == "std-1"
+    assert seen_timeouts == [25.0]
+    assert seen_timeouts[0] <= 30.0
+
+    # Smaller caller timeout (12.0s) is respected rather than raised to 25.0s
+    r2 = adapter.create(
+        model="google/gemini-3.8-flash",
+        messages=[{"role": "user", "content": "compress 2"}],
+        timeout=12.0,
+    )
+    assert r2.id == "std-2"
+    assert seen_timeouts == [25.0, 12.0]
+    assert flex_calls["n"] == 2
+
+    # Call 3: circuit breaker is now OPEN after 2 consecutive failures -> Flex NOT called at all
+    r3 = adapter.create(
+        model="google/gemini-3.8-flash",
+        messages=[{"role": "user", "content": "compress 3"}],
+        timeout=_COMPRESSION_TIMEOUT_FLOOR_SECONDS,
+    )
+    assert r3.id == "std-3"
+    assert flex_calls["n"] == 2, "Circuit breaker failed to bypass Flex after 2 consecutive failures!"
+    assert fb_calls["n"] == 3
+
+    # After cooldown expires (simulated via reset) and a Flex call succeeds, breaker resets cleanly
+    _VertexFlexCompletionsAdapter.reset_breaker()
+    monkeypatch.setattr(
+        va,
+        "call_vertex_native_flex",
+        lambda **kw: SimpleNamespace(
+            id="vflex-recovered",
+            service_tier="flex",
+            choices=[SimpleNamespace(index=0, message=SimpleNamespace(role="assistant", content="flex ok"), finish_reason="stop")],
+        ),
+    )
+    r4 = adapter.create(
+        model="google/gemini-3.8-flash",
+        messages=[{"role": "user", "content": "compress 4"}],
+        timeout=_COMPRESSION_TIMEOUT_FLOOR_SECONDS,
+    )
+    assert r4.id == "vflex-recovered"
+    _VertexFlexCompletionsAdapter.reset_breaker()
