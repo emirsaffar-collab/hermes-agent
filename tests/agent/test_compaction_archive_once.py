@@ -192,3 +192,35 @@ def test_multihop_compaction_collapses_ancestor_archives_to_session_prefixes_and
         os.utime(path, (old, old))
     assert cleanup_spillover_cache(max_age_hours=1) == 0
     assert _archived(home) == all_files
+
+
+def test_strip_deterministic_lean_sections_strips_exact_archive_blocks_and_preserves_prose():
+    from agent.context_compressor import _strip_deterministic_lean_sections
+    from tools.tool_result_storage import ARCHIVE_LIST_HEADING, LEGACY_ARCHIVE_LIST_HEADING
+
+    for heading in (ARCHIVE_LIST_HEADING, LEGACY_ARCHIVE_LIST_HEADING):
+        sample = (
+            "## Key Findings\n"
+            "- Fact 1\n\n"
+            f"{heading}\n"
+            "- ~/.hermes/cache/pruned/a.json\n"
+            "Older archived sessions in ~/.hermes/cache/pruned/: foo (2)\n\n"
+            "## Remaining Work\n"
+            "- Ship fix\n"
+        )
+        cleaned = _strip_deterministic_lean_sections(sample)
+        assert heading not in cleaned
+        assert "~/.hermes/cache/pruned/a.json" not in cleaned
+        assert "## Remaining Work" in cleaned
+        assert "- Ship fix" in cleaned
+
+    prose_sample = (
+        "## Key Findings\n\n"
+        "Archived tool output (files in ~/.hermes/cache/pruned/) was being bulk-read by subagents.\n\n"
+        "## Remaining Work\n"
+        "- Deploy fix to staging\n"
+    )
+    cleaned_prose = _strip_deterministic_lean_sections(prose_sample)
+    assert "Archived tool output (files in ~/.hermes/cache/pruned/)" in cleaned_prose
+    assert "## Remaining Work" in cleaned_prose
+    assert "- Deploy fix to staging" in cleaned_prose

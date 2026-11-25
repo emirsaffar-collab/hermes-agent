@@ -172,6 +172,18 @@ MAY_2027_MONTHLY_INFRA_TARGET_EUR = 10500.0
 
 TIER1_NON_INTERACTIVE_15M_CAP_EUR = 4.00
 TIER1_NON_INTERACTIVE_1H_CAP_EUR = 10.00
+# Interactive subagent fan-out caps (per logical child compaction lineage + concurrency-scaled parent family).
+# Per-child 15m cap (€3.00) isolates a single runaway child without collateral-killing healthy siblings.
+# Family 15m cap scales with distinct active logical children (>=€0.05): max(€4, min(€10, €2 + €1.50 * N)).
+TIER1_INTERACTIVE_SUBAGENT_CHILD_15M_CAP_EUR = 3.00
+TIER1_INTERACTIVE_SUBAGENT_CHILD_1H_CAP_EUR = 8.00
+TIER1_INTERACTIVE_SUBAGENT_FAMILY_15M_BASE_EUR = 2.00
+TIER1_INTERACTIVE_SUBAGENT_FAMILY_15M_PER_CHILD_EUR = 1.50
+TIER1_INTERACTIVE_SUBAGENT_FAMILY_15M_MAX_EUR = 10.00
+TIER1_INTERACTIVE_SUBAGENT_FAMILY_1H_BASE_EUR = 6.00
+TIER1_INTERACTIVE_SUBAGENT_FAMILY_1H_PER_CHILD_EUR = 3.00
+TIER1_INTERACTIVE_SUBAGENT_FAMILY_1H_MAX_EUR = 20.00
+TIER1_INTERACTIVE_SUBAGENT_ACTIVE_CHILD_MIN_EUR = 0.05
 TIER1_NON_INTERACTIVE_CACHE_RESET_COUNT = 4
 TIER1_NON_INTERACTIVE_CACHE_RESET_MIN_EUR = 0.60
 TIER0_CRITICAL_CACHE_RESET_COUNT = 8
@@ -184,53 +196,91 @@ TIER1_RUNAWAY_DESKTOP_15M_CAP_EUR = 10.00
 TIER1_RUNAWAY_DESKTOP_1H_CAP_EUR = 20.00
 
 _SESSION_PARENT_MAP: dict[str, str] = {}
+_SESSION_PARENT_EDGE_KIND: dict[str, str] = {}
 
 
-def record_session_parent(child_session_id: str, parent_session_id: str, now: float | None = None) -> None:
+def record_session_parent(
+    child_session_id: str,
+    parent_session_id: str,
+    now: float | None = None,
+    *,
+    overwrite: bool = True,
+    edge_kind: str = "spawn",
+) -> None:
     if not (child_session_id and parent_session_id and child_session_id != parent_session_id):
         return
-    _SESSION_PARENT_MAP[child_session_id] = parent_session_id
+    kind = "compaction" if str(edge_kind or "").strip().lower() == "compaction" else "spawn"
+    if overwrite or child_session_id not in _SESSION_PARENT_MAP or (
+        kind == "compaction" and _SESSION_PARENT_EDGE_KIND.get(child_session_id) != "compaction"
+    ):
+        _SESSION_PARENT_MAP[child_session_id] = parent_session_id
+        _SESSION_PARENT_EDGE_KIND[child_session_id] = kind
     ts_now = float(now if now is not None else time.time())
     try:
         con = _connect()
         try:
             with con:
-                con.execute(
-                    """
-                    INSERT OR REPLACE INTO session_parent_lineage (
-                        child_session_id, parent_session_id, updated_at
-                    ) VALUES (?, ?, ?)
-                    """,
-                    (child_session_id, parent_session_id, ts_now),
-                )
+                if overwrite:
+                    con.execute(
+                        """
+                        INSERT OR REPLACE INTO session_parent_lineage (
+                            child_session_id, parent_session_id, updated_at, edge_kind
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (child_session_id, parent_session_id, ts_now, kind),
+                    )
+                elif kind == "compaction":
+                    con.execute(
+                        """
+                        INSERT INTO session_parent_lineage (
+                            child_session_id, parent_session_id, updated_at, edge_kind
+                        ) VALUES (?, ?, ?, 'compaction')
+                        ON CONFLICT(child_session_id) DO UPDATE SET
+                            parent_session_id = excluded.parent_session_id,
+                            updated_at = excluded.updated_at,
+                            edge_kind = 'compaction'
+                        WHERE session_parent_lineage.edge_kind != 'compaction'
+                        """,
+                        (child_session_id, parent_session_id, ts_now),
+                    )
+                else:
+                    con.execute(
+                        """
+                        INSERT OR IGNORE INTO session_parent_lineage (
+                            child_session_id, parent_session_id, updated_at, edge_kind
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (child_session_id, parent_session_id, ts_now, kind),
+                    )
         finally:
             con.close()
     except Exception:
         pass
 
 
-def _lookup_persisted_parent_session_id(child_session_id: str) -> str:
+def _lookup_persisted_parent_edge(child_session_id: str) -> tuple[str, str]:
     if not child_session_id:
-        return ""
-    cached = _SESSION_PARENT_MAP.get(child_session_id, "")
-    if cached:
-        return cached
+        return "", "spawn"
     try:
         con = _connect()
         try:
             row = con.execute(
-                "SELECT parent_session_id FROM session_parent_lineage WHERE child_session_id = ? LIMIT 1",
+                "SELECT parent_session_id, edge_kind FROM session_parent_lineage WHERE child_session_id = ? LIMIT 1",
                 (child_session_id,),
             ).fetchone()
             if row and row[0]:
                 parent_sid = str(row[0]).strip()
+                kind = str(row[1] or "spawn").strip().lower()
                 if parent_sid and parent_sid != child_session_id:
                     _SESSION_PARENT_MAP[child_session_id] = parent_sid
-                    return parent_sid
+                    _SESSION_PARENT_EDGE_KIND[child_session_id] = kind
+                    return parent_sid, kind
         finally:
             con.close()
     except Exception:
-        pass
+        cached = _SESSION_PARENT_MAP.get(child_session_id, "")
+        if cached:
+            return cached, _SESSION_PARENT_EDGE_KIND.get(child_session_id, "spawn")
     if not os.environ.get("HERMES_AI_SPEND_DB_PATH"):
         state_db = Path.home() / ".hermes" / "state.db"
         if state_db.is_file():
@@ -244,13 +294,21 @@ def _lookup_persisted_parent_session_id(child_session_id: str) -> str:
                     if srow and srow[0]:
                         parent_sid = str(srow[0]).strip()
                         if parent_sid and parent_sid != child_session_id:
-                            record_session_parent(child_session_id, parent_sid)
-                            return parent_sid
+                            record_session_parent(child_session_id, parent_sid, overwrite=False, edge_kind="spawn")
+                            return parent_sid, "spawn"
                 finally:
                     scon.close()
             except Exception:
                 pass
-    return ""
+    cached = _SESSION_PARENT_MAP.get(child_session_id, "")
+    if cached:
+        return cached, _SESSION_PARENT_EDGE_KIND.get(child_session_id, "spawn")
+    return "", "spawn"
+
+
+def _lookup_persisted_parent_session_id(child_session_id: str) -> str:
+    parent_sid, _kind = _lookup_persisted_parent_edge(child_session_id)
+    return parent_sid
 
 
 def _resolve_lineage_session_ids(
@@ -258,22 +316,67 @@ def _resolve_lineage_session_ids(
     parent_session_id: str = "",
     lineage_session_ids: tuple[str, ...] | list[str] | set[str] = (),
     max_depth: int = 128,
+    *,
+    persist_parent: bool = True,
 ) -> tuple[str, ...]:
-    if parent_session_id and session_id and session_id != parent_session_id:
-        record_session_parent(session_id, parent_session_id)
+    if parent_session_id and session_id and session_id != parent_session_id and persist_parent:
+        record_session_parent(session_id, parent_session_id, overwrite=False, edge_kind="spawn")
     sids: list[str] = [session_id] if session_id else []
     seen = set(sids)
-    cur_sid = parent_session_id or _lookup_persisted_parent_session_id(session_id)
+    cur_sid = _lookup_persisted_parent_session_id(session_id) or parent_session_id
     while cur_sid and cur_sid not in seen and len(sids) < max_depth:
         sids.append(cur_sid)
         seen.add(cur_sid)
         cur_sid = _lookup_persisted_parent_session_id(cur_sid)
-    for extra in lineage_session_ids or ():
+    for extra in (parent_session_id, *(lineage_session_ids or ())):
         es = str(extra or "").strip()
-        if es and es not in seen and len(sids) < max_depth:
+        while es and es not in seen and len(sids) < max_depth:
             sids.append(es)
             seen.add(es)
+            es = _lookup_persisted_parent_session_id(es)
     return tuple(sids) or (session_id,)
+
+
+def _resolve_compaction_lineage_ids(
+    session_id: str,
+    stop_session_id: str = "",
+    lineage_session_ids: tuple[str, ...] | list[str] | set[str] = (),
+    max_depth: int = 128,
+) -> tuple[str, ...]:
+    """Return a session's own compaction-rotation lineage (following ONLY edge_kind='compaction').
+
+    Never crosses 'spawn' edges and stops strictly before stop_session_id, so nested interactive
+    subagents (desk -> sub_A -> sub_B) never pull sub_A into sub_B's own lineage or quarantine.
+    """
+    stop_sid = str(stop_session_id or "").strip()
+    sids: list[str] = []
+    seen: set[str] = set()
+
+    def _walk_compaction(start_sid: str) -> None:
+        cur = start_sid
+        while cur and cur != stop_sid and cur not in seen and len(sids) < max_depth:
+            seen.add(cur)
+            sids.append(cur)
+            nxt, kind = _lookup_persisted_parent_edge(cur)
+            if not nxt or kind != "compaction":
+                break
+            cur = nxt
+
+    root = str(session_id or "").strip()
+    if root:
+        _walk_compaction(root)
+    for extra in lineage_session_ids or ():
+        es = str(extra or "").strip()
+        if not es or es == stop_sid or es.startswith("cron_job:"):
+            continue
+        _walk_compaction(es)
+    return tuple(sids) or (session_id,)
+
+
+def _compaction_root_id(session_id: str, stop_session_id: str = "") -> str:
+    """Return the earliest compaction-chain root for a session (never crossing 'spawn' edges)."""
+    chain = _resolve_compaction_lineage_ids(session_id, stop_session_id=stop_session_id)
+    return chain[-1] if chain else str(session_id or "").strip()
 
 TIER0_CRITICAL_CRON_15M_SAFETY_CAP_EUR = 12.00
 
@@ -533,10 +636,14 @@ def _connect() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS session_parent_lineage (
             child_session_id TEXT PRIMARY KEY,
             parent_session_id TEXT NOT NULL,
-            updated_at REAL NOT NULL
+            updated_at REAL NOT NULL,
+            edge_kind TEXT NOT NULL DEFAULT 'spawn'
         )
         """
     )
+    lineage_cols = {row[1] for row in con.execute("PRAGMA table_info(session_parent_lineage)").fetchall()}
+    if "edge_kind" not in lineage_cols:
+        con.execute("ALTER TABLE session_parent_lineage ADD COLUMN edge_kind TEXT NOT NULL DEFAULT 'spawn'")
     return con
 
 
@@ -1156,6 +1263,10 @@ def evaluate_realtime_spend_breaker(
     is_bg_review = src == "background_review"
     cron_job_tag = str(job_name or "").strip() if src == "cron" else ""
     effective_session_id = f"background_review:{session_id}" if is_bg_review else session_id
+    _subagent_has_compaction_extras = (
+        src == "subagent"
+        and any(str(x or "").strip() and str(x or "").strip() != p_sid for x in lineage_session_ids)
+    )
     all_lineage_sids = (
         (effective_session_id,)
         if is_bg_review
@@ -1163,6 +1274,7 @@ def evaluate_realtime_spend_breaker(
             session_id,
             p_sid,
             tuple(lineage_session_ids) + ((f"cron_job:{cron_job_tag}",) if cron_job_tag else ()),
+            persist_parent=not _subagent_has_compaction_extras,
         )
     )
 
@@ -1174,7 +1286,9 @@ def evaluate_realtime_spend_breaker(
                 cur.execute(
                     """
                     SELECT source FROM llm_call_ledger
-                    WHERE session_id = ? AND source NOT IN ('log_tail', 'background_review', 'subagent')
+                    WHERE session_id = ?
+                      AND source NOT IN ('log_tail', 'background_review', 'subagent')
+                      AND source NOT LIKE 'aux:%'
                     ORDER BY ts DESC LIMIT 1
                     """,
                     (p_sid,),
@@ -1186,27 +1300,51 @@ def evaluate_realtime_spend_breaker(
                 src == "subagent"
                 and p_src in ("desktop", "mobile", "tui", "tui_gateway", "gui", "web")
                 and bool(p_sid)
+                and not p_sid.lower().startswith("cron_")
             )
-            family_job_tag = (
-                f"parent:{p_sid}"
-                if (src == "subagent" and p_sid)
-                else cron_job_tag
+            parent_compaction_sids: tuple[str, ...] = (
+                _resolve_compaction_lineage_ids(p_sid) if (is_interactive_subagent and p_sid) else ()
+            )
+            canonical_parent_root = parent_compaction_sids[-1] if parent_compaction_sids else p_sid
+            family_job_tags: tuple[str, ...] = (
+                tuple(f"parent:{anc}" for anc in parent_compaction_sids)
+                if parent_compaction_sids
+                else ((f"parent:{p_sid}",) if (src == "subagent" and p_sid) else ((cron_job_tag,) if cron_job_tag else ()))
+            )
+            family_quarantine_key = (
+                f"subagent_family:{canonical_parent_root}"
+                if (is_interactive_subagent and canonical_parent_root)
+                else ""
+            )
+            own_subagent_sids: tuple[str, ...] = (
+                _resolve_compaction_lineage_ids(session_id, stop_session_id=p_sid, lineage_session_ids=lineage_session_ids)
+                if is_interactive_subagent
+                else ()
             )
             spend_sids = (
-                (session_id,)
-                if (is_interactive_subagent or is_bg_review)
-                else all_lineage_sids
+                own_subagent_sids
+                if is_interactive_subagent
+                else ((session_id,) if is_bg_review else all_lineage_sids)
             )
 
-            # 1) Check explicit quarantine table (including full parent/compaction lineage)
-            q_placeholders = ",".join("?" for _ in all_lineage_sids)
+            # 1) Check explicit quarantine table (interactive subagent checks own compaction chain + family key + parent)
+            q_sids = (
+                tuple(dict.fromkeys((*own_subagent_sids, *( (family_quarantine_key,) if family_quarantine_key else () ), *parent_compaction_sids)))
+                if is_interactive_subagent
+                else all_lineage_sids
+            )
+            q_placeholders = ",".join("?" for _ in q_sids)
             cur.execute(
                 f"SELECT reason, net_eur_window FROM quarantined_sessions WHERE session_id IN ({q_placeholders}) AND expires_at > ? ORDER BY expires_at DESC LIMIT 1",
-                (*all_lineage_sids, ts_now),
+                (*q_sids, ts_now),
             )
             q_row = cur.fetchone()
             # 2) Per-session (and subagent-family / compression-rotation lineage) 15m and 1h spend + cache resets
             s_placeholders = ",".join("?" for _ in spend_sids)
+            own_eur_15m = 0.0
+            own_eur_1h = 0.0
+            n_active_children_15m = 1
+            n_active_children_1h = 1
             if is_bg_review:
                 cur.execute(
                     f"""
@@ -1216,22 +1354,135 @@ def evaluate_realtime_spend_breaker(
                     """,
                     (*spend_sids, ts_now - 900.0),
                 )
-            elif family_job_tag:
+                s_eur_15m, s_resets_15m, s_calls_15m = cur.fetchone()
+                s_eur_15m = float(s_eur_15m or 0.0)
+                s_resets_15m = int(s_resets_15m or 0)
+                s_calls_15m = int(s_calls_15m or 0)
+                cur.execute(
+                    f"SELECT COALESCE(SUM(net_eur), 0.0), COUNT(*) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source = 'background_review' AND ts >= ?",
+                    (*spend_sids, ts_now - 3600.0),
+                )
+                r_1h_row = cur.fetchone()
+                s_eur_1h = float(r_1h_row[0] or 0.0)
+                s_calls_1h = int(r_1h_row[1] or 0)
+            elif is_interactive_subagent:
+                cur.execute(
+                    f"""
+                    SELECT COALESCE(SUM(net_eur), 0.0), COALESCE(SUM(cache_reset), 0), COUNT(*)
+                    FROM llm_call_ledger
+                    WHERE session_id IN ({s_placeholders}) AND source != 'background_review' AND ts >= ?
+                    """,
+                    (*spend_sids, ts_now - 900.0),
+                )
+                own_eur_15m, s_resets_15m, s_calls_15m = cur.fetchone()
+                own_eur_15m = float(own_eur_15m or 0.0)
+                s_resets_15m = int(s_resets_15m or 0)
+                s_calls_15m = int(s_calls_15m or 0)
+
+                cur.execute(
+                    f"""
+                    SELECT COALESCE(SUM(net_eur), 0.0), COUNT(*)
+                    FROM llm_call_ledger
+                    WHERE session_id IN ({s_placeholders}) AND source != 'background_review' AND ts >= ?
+                    """,
+                    (*spend_sids, ts_now - 3600.0),
+                )
+                r_own_1h = cur.fetchone()
+                own_eur_1h = float(r_own_1h[0] or 0.0)
+                s_calls_1h = int(r_own_1h[1] or 0)
+
+                fj_placeholders = ",".join("?" for _ in family_job_tags)
+                cur.execute(
+                    f"""
+                    SELECT COALESCE(SUM(net_eur), 0.0)
+                    FROM llm_call_ledger
+                    WHERE (session_id IN ({s_placeholders}) OR job_name IN ({fj_placeholders}))
+                      AND source != 'background_review' AND ts >= ?
+                    """,
+                    (*spend_sids, *family_job_tags, ts_now - 900.0),
+                )
+                s_eur_15m = float((cur.fetchone() or (0.0,))[0] or 0.0)
+
+                cur.execute(
+                    f"""
+                    SELECT COALESCE(SUM(net_eur), 0.0)
+                    FROM llm_call_ledger
+                    WHERE (session_id IN ({s_placeholders}) OR job_name IN ({fj_placeholders}))
+                      AND source != 'background_review' AND ts >= ?
+                    """,
+                    (*spend_sids, *family_job_tags, ts_now - 3600.0),
+                )
+                s_eur_1h = float((cur.fetchone() or (0.0,))[0] or 0.0)
+
+                # Count distinct logical children (collapsed to compaction root) with >= €0.05 spend
+                # so spawning €0 dummy children cannot inflate N and evade the family cap.
+                cur.execute(
+                    f"""
+                    SELECT session_id, COALESCE(SUM(net_eur), 0.0)
+                    FROM llm_call_ledger
+                    WHERE (session_id IN ({s_placeholders}) OR job_name IN ({fj_placeholders}))
+                      AND source = 'subagent' AND ts >= ?
+                    GROUP BY session_id
+                    """,
+                    (*spend_sids, *family_job_tags, ts_now - 900.0),
+                )
+                root_spend_15m: dict[str, float] = {}
+                for row_sid, row_eur in cur.fetchall():
+                    if row_sid:
+                        croot = _compaction_root_id(str(row_sid), stop_session_id=p_sid)
+                        root_spend_15m[croot] = root_spend_15m.get(croot, 0.0) + float(row_eur or 0.0)
+                n_active_children_15m = max(
+                    1,
+                    sum(1 for v in root_spend_15m.values() if v >= TIER1_INTERACTIVE_SUBAGENT_ACTIVE_CHILD_MIN_EUR),
+                )
+
+                cur.execute(
+                    f"""
+                    SELECT session_id, COALESCE(SUM(net_eur), 0.0)
+                    FROM llm_call_ledger
+                    WHERE (session_id IN ({s_placeholders}) OR job_name IN ({fj_placeholders}))
+                      AND source = 'subagent' AND ts >= ?
+                    GROUP BY session_id
+                    """,
+                    (*spend_sids, *family_job_tags, ts_now - 3600.0),
+                )
+                root_spend_1h: dict[str, float] = {}
+                for row_sid, row_eur in cur.fetchall():
+                    if row_sid:
+                        croot = _compaction_root_id(str(row_sid), stop_session_id=p_sid)
+                        root_spend_1h[croot] = root_spend_1h.get(croot, 0.0) + float(row_eur or 0.0)
+                n_active_children_1h = max(
+                    1,
+                    sum(1 for v in root_spend_1h.values() if v >= TIER1_INTERACTIVE_SUBAGENT_ACTIVE_CHILD_MIN_EUR),
+                )
+            elif family_job_tags:
+                fj_placeholders = ",".join("?" for _ in family_job_tags)
                 cur.execute(
                     f"""
                     SELECT COALESCE(SUM(net_eur), 0.0),
                            COALESCE(SUM(CASE WHEN session_id IN ({s_placeholders}) THEN cache_reset ELSE 0 END), 0),
                            COUNT(*)
                     FROM llm_call_ledger
-                    WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND source != 'background_review' AND ts >= ?
+                    WHERE (session_id IN ({s_placeholders}) OR job_name IN ({fj_placeholders})) AND source != 'background_review' AND ts >= ?
                     """,
                     (
                         *spend_sids,
                         *spend_sids,
-                        family_job_tag,
+                        *family_job_tags,
                         ts_now - 900.0,
                     ),
                 )
+                s_eur_15m, s_resets_15m, s_calls_15m = cur.fetchone()
+                s_eur_15m = float(s_eur_15m or 0.0)
+                s_resets_15m = int(s_resets_15m or 0)
+                s_calls_15m = int(s_calls_15m or 0)
+                cur.execute(
+                    f"SELECT COALESCE(SUM(net_eur), 0.0), COUNT(*) FROM llm_call_ledger WHERE (session_id IN ({s_placeholders}) OR job_name IN ({fj_placeholders})) AND source != 'background_review' AND ts >= ?",
+                    (*spend_sids, *family_job_tags, ts_now - 3600.0),
+                )
+                r_1h_row = cur.fetchone()
+                s_eur_1h = float(r_1h_row[0] or 0.0)
+                s_calls_1h = int(r_1h_row[1] or 0)
             else:
                 cur.execute(
                     f"""
@@ -1240,29 +1491,17 @@ def evaluate_realtime_spend_breaker(
                     """,
                     (*spend_sids, ts_now - 900.0),
                 )
-            s_eur_15m, s_resets_15m, s_calls_15m = cur.fetchone()
-            s_eur_15m = float(s_eur_15m or 0.0)
-            s_resets_15m = int(s_resets_15m or 0)
-            s_calls_15m = int(s_calls_15m or 0)
-
-            if is_bg_review:
-                cur.execute(
-                    f"SELECT COALESCE(SUM(net_eur), 0.0), COUNT(*) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source = 'background_review' AND ts >= ?",
-                    (*spend_sids, ts_now - 3600.0),
-                )
-            elif family_job_tag:
-                cur.execute(
-                    f"SELECT COALESCE(SUM(net_eur), 0.0), COUNT(*) FROM llm_call_ledger WHERE (session_id IN ({s_placeholders}) OR job_name = ?) AND source != 'background_review' AND ts >= ?",
-                    (*spend_sids, family_job_tag, ts_now - 3600.0),
-                )
-            else:
+                s_eur_15m, s_resets_15m, s_calls_15m = cur.fetchone()
+                s_eur_15m = float(s_eur_15m or 0.0)
+                s_resets_15m = int(s_resets_15m or 0)
+                s_calls_15m = int(s_calls_15m or 0)
                 cur.execute(
                     f"SELECT COALESCE(SUM(net_eur), 0.0), COUNT(*) FROM llm_call_ledger WHERE session_id IN ({s_placeholders}) AND source != 'background_review' AND ts >= ?",
                     (*spend_sids, ts_now - 3600.0),
                 )
-            r_1h_row = cur.fetchone()
-            s_eur_1h = float(r_1h_row[0] or 0.0)
-            s_calls_1h = int(r_1h_row[1] or 0)
+                r_1h_row = cur.fetchone()
+                s_eur_1h = float(r_1h_row[0] or 0.0)
+                s_calls_1h = int(r_1h_row[1] or 0)
 
             # 3) Estate 15m and Today spend (plus non-interactive pool so interactive spikes do not starve crons)
             cur.execute(
@@ -1362,42 +1601,110 @@ def evaluate_realtime_spend_breaker(
 
     # Tier 1A: Non-interactive per-session (and subagent-family / cron-job-family) runaway breaker
     if not is_interactive:
-        cap_15m = TIER0_CRITICAL_CRON_15M_SAFETY_CAP_EUR if is_tier0 else TIER1_NON_INTERACTIVE_15M_CAP_EUR
-        if s_eur_15m >= cap_15m:
-            reason = f"tier1_session_15m_cap (€{s_eur_15m:.2f} >= €{cap_15m:.2f})"
-            quarantine_session(effective_session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
-            if p_sid and src == "subagent" and not is_interactive_subagent:
-                quarantine_session(p_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
-            if cron_job_tag:
-                quarantine_session(f"cron_job:{cron_job_tag}", reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
-            return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
-        if not is_tier0 and s_eur_1h >= TIER1_NON_INTERACTIVE_1H_CAP_EUR:
-            reason = f"tier1_session_1h_cap (€{s_eur_1h:.2f} >= €{TIER1_NON_INTERACTIVE_1H_CAP_EUR:.2f})"
-            quarantine_session(effective_session_id, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
-            if p_sid and src == "subagent" and not is_interactive_subagent:
-                quarantine_session(p_sid, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
-            if cron_job_tag:
-                quarantine_session(f"cron_job:{cron_job_tag}", reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
-            return {"allowed": False, "reason": reason, "session_net_eur_1h": s_eur_1h}
-        reset_cap = (
-            TIER0_CRITICAL_CACHE_RESET_COUNT
-            if is_tier0
-            else TIER1_NON_INTERACTIVE_CACHE_RESET_COUNT
-        )
-        reset_min_eur = (
-            TIER0_CRITICAL_CACHE_RESET_MIN_EUR
-            if is_tier0
-            else TIER1_NON_INTERACTIVE_CACHE_RESET_MIN_EUR
-        )
-        if (
-            s_resets_15m >= reset_cap
-            and s_eur_15m >= reset_min_eur
-        ):
-            reason = f"tier1_cache_reset_storm (resets={s_resets_15m}, €{s_eur_15m:.2f} in 15m)"
-            quarantine_session(effective_session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
-            if p_sid and src == "subagent" and not is_interactive_subagent:
-                quarantine_session(p_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
-            return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
+        if is_interactive_subagent:
+            # 1) Per-child compaction-lineage isolation FIRST so one runaway child never collateral-kills siblings.
+            if own_eur_15m >= TIER1_INTERACTIVE_SUBAGENT_CHILD_15M_CAP_EUR:
+                reason = (
+                    f"tier1_session_15m_cap (scope=own €{own_eur_15m:.2f} >= "
+                    f"€{TIER1_INTERACTIVE_SUBAGENT_CHILD_15M_CAP_EUR:.2f})"
+                )
+                for l_sid in own_subagent_sids:
+                    quarantine_session(l_sid, reason, own_eur_15m, ttl_s=1800.0, now=ts_now)
+                return {"allowed": False, "reason": reason, "session_net_eur_15m": own_eur_15m}
+            if own_eur_1h >= TIER1_INTERACTIVE_SUBAGENT_CHILD_1H_CAP_EUR:
+                reason = (
+                    f"tier1_session_1h_cap (scope=own €{own_eur_1h:.2f} >= "
+                    f"€{TIER1_INTERACTIVE_SUBAGENT_CHILD_1H_CAP_EUR:.2f})"
+                )
+                for l_sid in own_subagent_sids:
+                    quarantine_session(l_sid, reason, own_eur_1h, ttl_s=3600.0, now=ts_now)
+                return {"allowed": False, "reason": reason, "session_net_eur_1h": own_eur_1h}
+            if (
+                s_resets_15m >= TIER1_NON_INTERACTIVE_CACHE_RESET_COUNT
+                and own_eur_15m >= TIER1_NON_INTERACTIVE_CACHE_RESET_MIN_EUR
+            ):
+                reason = (
+                    f"tier1_cache_reset_storm (scope=own resets={s_resets_15m}, €{own_eur_15m:.2f} in 15m)"
+                )
+                for l_sid in own_subagent_sids:
+                    quarantine_session(l_sid, reason, own_eur_15m, ttl_s=1800.0, now=ts_now)
+                return {"allowed": False, "reason": reason, "session_net_eur_15m": own_eur_15m}
+
+            # 2) Concurrency-scaled parent-family ceiling (N active logical children with >= €0.05 spend).
+            # Never tied to estate_today >= €195 (normal Desktop traffic crosses €195 early daily).
+            family_cap_15m = max(
+                TIER1_NON_INTERACTIVE_15M_CAP_EUR,
+                min(
+                    TIER1_INTERACTIVE_SUBAGENT_FAMILY_15M_MAX_EUR,
+                    TIER1_INTERACTIVE_SUBAGENT_FAMILY_15M_BASE_EUR
+                    + TIER1_INTERACTIVE_SUBAGENT_FAMILY_15M_PER_CHILD_EUR * n_active_children_15m,
+                ),
+            )
+            family_cap_1h = max(
+                TIER1_NON_INTERACTIVE_1H_CAP_EUR,
+                min(
+                    TIER1_INTERACTIVE_SUBAGENT_FAMILY_1H_MAX_EUR,
+                    TIER1_INTERACTIVE_SUBAGENT_FAMILY_1H_BASE_EUR
+                    + TIER1_INTERACTIVE_SUBAGENT_FAMILY_1H_PER_CHILD_EUR * n_active_children_1h,
+                ),
+            )
+            if s_eur_15m >= family_cap_15m:
+                reason = (
+                    f"tier1_session_15m_cap (scope=family n_children={n_active_children_15m} "
+                    f"€{s_eur_15m:.2f} >= €{family_cap_15m:.2f})"
+                )
+                if family_quarantine_key:
+                    quarantine_session(family_quarantine_key, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+                for l_sid in own_subagent_sids:
+                    quarantine_session(l_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+                return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
+            if s_eur_1h >= family_cap_1h:
+                reason = (
+                    f"tier1_session_1h_cap (scope=family n_children={n_active_children_1h} "
+                    f"€{s_eur_1h:.2f} >= €{family_cap_1h:.2f})"
+                )
+                if family_quarantine_key:
+                    quarantine_session(family_quarantine_key, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
+                for l_sid in own_subagent_sids:
+                    quarantine_session(l_sid, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
+                return {"allowed": False, "reason": reason, "session_net_eur_1h": s_eur_1h}
+        else:
+            cap_15m = TIER0_CRITICAL_CRON_15M_SAFETY_CAP_EUR if is_tier0 else TIER1_NON_INTERACTIVE_15M_CAP_EUR
+            if s_eur_15m >= cap_15m:
+                reason = f"tier1_session_15m_cap (€{s_eur_15m:.2f} >= €{cap_15m:.2f})"
+                quarantine_session(effective_session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+                if p_sid and src == "subagent" and not is_interactive_subagent:
+                    quarantine_session(p_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+                if cron_job_tag:
+                    quarantine_session(f"cron_job:{cron_job_tag}", reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+                return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
+            if not is_tier0 and s_eur_1h >= TIER1_NON_INTERACTIVE_1H_CAP_EUR:
+                reason = f"tier1_session_1h_cap (€{s_eur_1h:.2f} >= €{TIER1_NON_INTERACTIVE_1H_CAP_EUR:.2f})"
+                quarantine_session(effective_session_id, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
+                if p_sid and src == "subagent" and not is_interactive_subagent:
+                    quarantine_session(p_sid, reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
+                if cron_job_tag:
+                    quarantine_session(f"cron_job:{cron_job_tag}", reason, s_eur_1h, ttl_s=3600.0, now=ts_now)
+                return {"allowed": False, "reason": reason, "session_net_eur_1h": s_eur_1h}
+            reset_cap = (
+                TIER0_CRITICAL_CACHE_RESET_COUNT
+                if is_tier0
+                else TIER1_NON_INTERACTIVE_CACHE_RESET_COUNT
+            )
+            reset_min_eur = (
+                TIER0_CRITICAL_CACHE_RESET_MIN_EUR
+                if is_tier0
+                else TIER1_NON_INTERACTIVE_CACHE_RESET_MIN_EUR
+            )
+            if (
+                s_resets_15m >= reset_cap
+                and s_eur_15m >= reset_min_eur
+            ):
+                reason = f"tier1_cache_reset_storm (resets={s_resets_15m}, €{s_eur_15m:.2f} in 15m)"
+                quarantine_session(effective_session_id, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+                if p_sid and src == "subagent" and not is_interactive_subagent:
+                    quarantine_session(p_sid, reason, s_eur_15m, ttl_s=1800.0, now=ts_now)
+                return {"allowed": False, "reason": reason, "session_net_eur_15m": s_eur_15m}
 
     # Tier 1B: Progress-aware Desktop stalled loop breaker + hard single-turn / compaction-chain runaway ceiling
     if is_interactive:

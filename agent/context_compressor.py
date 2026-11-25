@@ -1033,10 +1033,24 @@ def _strip_deterministic_lean_sections(text: str) -> str:
     if not text:
         return text
     cleaned = without_skill_safety_rule(text)
-    from tools.tool_result_storage import ARCHIVE_LIST_HEADING
-    arch_idx = cleaned.find("\n\n" + ARCHIVE_LIST_HEADING)
-    if arch_idx >= 0:
-        cleaned = cleaned[:arch_idx]
+    from tools.tool_result_storage import ARCHIVE_LIST_KNOWN_HEADINGS
+    for _heading in ARCHIVE_LIST_KNOWN_HEADINGS:
+        _marker = "\n\n" + _heading + "\n"
+        while True:
+            _arch_idx = cleaned.find(_marker)
+            if _arch_idx < 0:
+                break
+            _body_start = _arch_idx + len(_marker)
+            _body = cleaned[_body_start:]
+            if not (_body.startswith("- ") or _body.startswith("Older archived sessions in ")):
+                break
+            _end_idx = _body_start
+            for _line in _body.splitlines(keepends=True):
+                if _line.startswith("- ") or _line.startswith("Older archived sessions in "):
+                    _end_idx += len(_line)
+                else:
+                    break
+            cleaned = cleaned[:_arch_idx] + cleaned[_end_idx:]
     deterministic_headings = {
         _LEAN_ANCHOR_HEADING.strip(),
         _LEAN_USER_MESSAGES_HEADING.strip(),

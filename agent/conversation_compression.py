@@ -1619,7 +1619,12 @@ def _adopt_live_compression_child(
     with contextlib.suppress(Exception):
         from agent.realtime_spend_breaker import record_session_parent
         if parent_session_id and child_session_id:
-            record_session_parent(child_session_id, parent_session_id)
+            record_session_parent(
+                child_session_id,
+                parent_session_id,
+                overwrite=False,
+                edge_kind="compaction",
+            )
     with contextlib.suppress(Exception):
         from agent.vertex_adapter import migrate_vertex_sticky_region
         migrate_vertex_sticky_region(parent_session_id, child_session_id)
@@ -3451,7 +3456,12 @@ def _publish_rotated_compaction(
     with contextlib.suppress(Exception):
         from agent.realtime_spend_breaker import record_session_parent
         if old_session_id and new_session_id:
-            record_session_parent(new_session_id, old_session_id)
+            record_session_parent(
+                new_session_id,
+                old_session_id,
+                overwrite=True,
+                edge_kind="compaction",
+            )
     with contextlib.suppress(Exception):
         from agent.vertex_adapter import migrate_vertex_sticky_region
         migrate_vertex_sticky_region(old_session_id, new_session_id)

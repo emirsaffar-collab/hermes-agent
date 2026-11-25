@@ -267,8 +267,8 @@ def test_interactive_desktop_subagent_allowed_under_tier3_but_capped_by_tier1_fa
     assert v_desk_sub_stalled["allowed"] is False
     assert "tier3_daily_hard_cap" in v_desk_sub_stalled["reason"]
 
-    # 3) If parent spawns multiple fresh child session_ids that collectively burn >= €4.00 in 15m,
-    #    family lineage ('parent:desk_root_1') trips Tier 1A and quarantines the parent lineage!
+    # 3) 3 healthy parallel interactive siblings (~€1.61 each = €4.85 < N=3 dynamic cap €6.50)
+    #    MUST remain allowed even while estate_today >= €195 (normal Desktop daily spend).
     for idx in range(3):
         rsb.record_realtime_llm_call(
             session_id=f"sub_desk_child_{idx}",
@@ -277,10 +277,37 @@ def test_interactive_desktop_subagent_allowed_under_tier3_but_capped_by_tier1_fa
             provider="vertex",
             model="google/gemini-4-argon",
             prompt_tokens=900_000,
-            uncached_input_tokens=900_000,  # ~€1.61 net each -> 3 * €1.61 = €4.85 >= €4.00
+            uncached_input_tokens=900_000,  # ~€1.61 net each -> 3 * €1.61 = €4.85 < €6.50 (N=3)
             cache_read_tokens=0,
             output_tokens=1_000,
             request_id=f"req_fam_{idx}",
+        )
+
+    v_desk_sub_healthy_3 = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_desk_child_2",
+        source="subagent",
+        parent_session_id="desk_root_1",
+        parent_source="desktop",
+        making_productive_progress=True,
+    )
+    assert v_desk_sub_healthy_3["allowed"] is True
+    assert v_desk_sub_healthy_3["reason"] == "interactive_subagent_allowed"
+
+    # Pushing those 3 siblings past the N=3 dynamic family cap (€6.50: +€0.72 each -> ~€7.01)
+    # MUST trip tier1_session_15m_cap and quarantine subagent_family:desk_root_1 so a fresh 4th
+    # child cannot inflate N and evade the family cap, while desktop itself stays unquarantined.
+    for idx in range(3):
+        rsb.record_realtime_llm_call(
+            session_id=f"sub_desk_child_{idx}",
+            source="subagent",
+            job_name="parent:desk_root_1",
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=400_000,
+            uncached_input_tokens=400_000,  # +~€0.72 each -> family ~€7.01 >= €6.50
+            cache_read_tokens=0,
+            output_tokens=1_000,
+            request_id=f"req_fam_over_{idx}",
         )
 
     v_desk_sub_capped = rsb.evaluate_realtime_spend_breaker(
@@ -292,6 +319,17 @@ def test_interactive_desktop_subagent_allowed_under_tier3_but_capped_by_tier1_fa
     )
     assert v_desk_sub_capped["allowed"] is False
     assert "tier1_session_15m_cap" in v_desk_sub_capped["reason"]
+    assert "scope=family n_children=3" in v_desk_sub_capped["reason"]
+
+    v_desk_sub_fresh_5 = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_desk_child_fresh_5",
+        source="subagent",
+        parent_session_id="desk_root_1",
+        parent_source="desktop",
+        making_productive_progress=True,
+    )
+    assert v_desk_sub_fresh_5["allowed"] is False
+    assert "quarantined:tier1_session_15m_cap" in v_desk_sub_fresh_5["reason"]
 
     # 4) Verify _build_result_entry never masquerades realtime_spend_breaker exit as max_iterations
     child_stub = SimpleNamespace(
@@ -608,3 +646,157 @@ def test_mid_fallback_switch_model_preserves_openrouter_fallback_chain_and_regio
 
 
 
+
+
+def test_interactive_subagent_isolation_dynamic_caps_and_edge_cases(tmp_path, monkeypatch):
+    """Regression suite covering cross-compaction isolation, N-sibling dynamic cap,
+    single-child compaction anti-inflation, nested subagent spawn isolation, and
+    Desktop parent compaction carry-over."""
+    db_file = tmp_path / "ai-spend-realtime.db"
+    status_file = tmp_path / "ai-cost-realtime-status.json"
+    monkeypatch.setenv("HERMES_AI_SPEND_DB_PATH", str(db_file))
+    monkeypatch.setenv("HERMES_AI_SPEND_STATUS_PATH", str(status_file))
+    rsb._SESSION_PARENT_MAP.clear()
+    rsb._SESSION_PARENT_EDGE_KIND.clear()
+    now = 1_795_566_900.0
+
+    def _record_eur(sid, *, source, job_name="", eur=1.0, cache_reset=0, req_id="", ts=None):
+        # At google/gemini-4-argon vertex pricing, ~560_000 uncached_in ≈ €1.00 net.
+        # cache_reset=1 triggers automatically when prompt > 110k, uncached > 70k, cached < 42k.
+        tokens = round(eur * 560_000)
+        if cache_reset:
+            uncached = max(120_000, tokens)
+            cached = 0
+        else:
+            uncached = tokens
+            cached = 50_000
+        return rsb.record_realtime_llm_call(
+            session_id=sid,
+            source=source,
+            job_name=job_name,
+            provider="vertex",
+            model="google/gemini-4-argon",
+            prompt_tokens=uncached + cached,
+            uncached_input_tokens=uncached,
+            cache_read_tokens=cached,
+            output_tokens=0,
+            request_id=req_id or f"req_{sid}_{ts}",
+            ts=ts if ts is not None else now,
+        )
+
+    # Case 1: Cross-compaction 2+2 reset storm isolates ONLY runaway child; healthy sibling survives
+    desk1 = "desk_case1"
+    _record_eur(desk1, source="desktop", eur=1.0, req_id="c1_desk", ts=now - 300)
+    rsb.record_session_parent("c1_v2", "c1_v1", overwrite=True, edge_kind="compaction")
+    for i, sid in enumerate(["c1_v1", "c1_v1", "c1_v2", "c1_v2"]):
+        _record_eur(
+            sid, source="subagent", job_name=f"parent:{desk1}", eur=0.45, cache_reset=1, req_id=f"c1_r_{i}", ts=now - 100 + i * 10
+        )
+    _record_eur("c1_healthy", source="subagent", job_name=f"parent:{desk1}", eur=1.10, req_id="c1_ok", ts=now - 20)
+    d_storm = rsb.evaluate_realtime_spend_breaker(
+        session_id="c1_v2",
+        source="subagent",
+        job_name=f"parent:{desk1}",
+        parent_session_id=desk1,
+        parent_source="desktop",
+        lineage_session_ids=("c1_v1",),
+        now=now,
+    )
+    assert d_storm["allowed"] is False
+    assert "tier1_cache_reset_storm" in d_storm["reason"]
+    assert rsb._lookup_persisted_parent_session_id("c1_v2") == "c1_v1"
+    d_sib = rsb.evaluate_realtime_spend_breaker(
+        session_id="c1_healthy",
+        source="subagent",
+        job_name=f"parent:{desk1}",
+        parent_session_id=desk1,
+        parent_source="desktop",
+        now=now + 1,
+    )
+    assert d_sib["allowed"] is True
+
+    # Case 2: Dual-runaway N=2 dynamic cap (€5.00) catches ~€2.70 × 2 = ~€5.40
+    desk2 = "desk_case2"
+    _record_eur(desk2, source="desktop", eur=1.0, req_id="c2_desk", ts=now - 300)
+    for sid in ("d2_a", "d2_b"):
+        _record_eur(sid, source="subagent", job_name=f"parent:{desk2}", eur=2.70, req_id=f"c2_{sid}", ts=now - 15)
+    d_dual = rsb.evaluate_realtime_spend_breaker(
+        session_id="d2_b",
+        source="subagent",
+        job_name=f"parent:{desk2}",
+        parent_session_id=desk2,
+        parent_source="desktop",
+        now=now,
+    )
+    assert d_dual["allowed"] is False
+    assert "tier1_session_15m_cap" in d_dual["reason"]
+    assert "n_children=2" in d_dual["reason"]
+
+    # Case 3: Single-child 3-hop compaction counts as n_children=1, hits €3.00 per-child cap
+    desk3 = "desk_case3"
+    _record_eur(desk3, source="desktop", eur=1.0, req_id="c3_desk", ts=now - 300)
+    rsb.record_session_parent("c3_v2", "c3_v1", overwrite=True, edge_kind="compaction")
+    rsb.record_session_parent("c3_v3", "c3_v2", overwrite=True, edge_kind="compaction")
+    for idx, sid in enumerate(("c3_v1", "c3_v2", "c3_v3")):
+        _record_eur(sid, source="subagent", job_name=f"parent:{desk3}", eur=1.10, req_id=f"c3_{idx}", ts=now - 60 + idx * 10)
+    d_3hop = rsb.evaluate_realtime_spend_breaker(
+        session_id="c3_v3",
+        source="subagent",
+        job_name=f"parent:{desk3}",
+        parent_session_id=desk3,
+        parent_source="desktop",
+        lineage_session_ids=("c3_v2",),
+        now=now,
+    )
+    assert d_3hop["allowed"] is False
+    assert "tier1_session_15m_cap" in d_3hop["reason"]
+    assert "scope=own" in d_3hop["reason"]
+
+    # Case 4: Nested subagent (desk4 -> sub_A -> sub_B -> sub_B_v2) NEVER quarantines sub_A
+    desk4 = "desk_case4"
+    _record_eur(desk4, source="desktop", eur=1.0, req_id="c4_desk", ts=now - 300)
+    rsb.record_session_parent("sub_A", desk4, overwrite=True, edge_kind="spawn")
+    rsb.record_session_parent("sub_B", "sub_A", overwrite=True, edge_kind="spawn")
+    rsb.record_session_parent("sub_B_v2", "sub_B", overwrite=True, edge_kind="compaction")
+    _record_eur("sub_A", source="subagent", job_name=f"parent:{desk4}", eur=1.20, req_id="c4_a", ts=now - 50)
+    for i, sid in enumerate(("sub_B", "sub_B", "sub_B_v2", "sub_B_v2")):
+        _record_eur(
+            sid, source="subagent", job_name=f"parent:{desk4}", eur=0.35, cache_reset=1, req_id=f"c4_b_{i}", ts=now - 40 + i * 5
+        )
+    d_nested = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_B_v2",
+        source="subagent",
+        job_name=f"parent:{desk4}",
+        parent_session_id=desk4,
+        parent_source="desktop",
+        lineage_session_ids=("sub_B",),
+        now=now,
+    )
+    assert d_nested["allowed"] is False
+    assert "tier1_cache_reset_storm" in d_nested["reason"]
+    d_sub_a = rsb.evaluate_realtime_spend_breaker(
+        session_id="sub_A",
+        source="subagent",
+        job_name=f"parent:{desk4}",
+        parent_session_id=desk4,
+        parent_source="desktop",
+        now=now + 1,
+    )
+    assert d_sub_a["allowed"] is True
+
+    # Case 5: Desktop parent compaction (desk5_v1 -> desk5_v2) preserves family spend
+    _record_eur("desk5_v1", source="desktop", eur=1.0, req_id="c5_desk", ts=now - 300)
+    rsb.record_session_parent("desk5_v2", "desk5_v1", overwrite=True, edge_kind="compaction")
+    _record_eur("d5_child1", source="subagent", job_name="parent:desk5_v1", eur=2.70, req_id="c5_1", ts=now - 40)
+    _record_eur("d5_child2", source="subagent", job_name="parent:desk5_v2", eur=2.70, req_id="c5_2", ts=now - 10)
+    d_desk_rot = rsb.evaluate_realtime_spend_breaker(
+        session_id="d5_child2",
+        source="subagent",
+        job_name="parent:desk5_v2",
+        parent_session_id="desk5_v2",
+        parent_source="desktop",
+        now=now,
+    )
+    assert d_desk_rot["allowed"] is False
+    assert "tier1_session_15m_cap" in d_desk_rot["reason"]
+    assert "scope=family" in d_desk_rot["reason"]

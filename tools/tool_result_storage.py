@@ -477,7 +477,12 @@ def archive_compaction_drops(
     return archive_pruned_originals(messages, dropped, session_id)
 
 
-ARCHIVE_LIST_HEADING = "Archived tool output (exact originals; read_file a path to recover one):"
+LEGACY_ARCHIVE_LIST_HEADING = "Archived tool output (exact originals; read_file a path to recover one):"
+ARCHIVE_LIST_HEADING = (
+    "Archived tool output (do NOT bulk read_file; use search_files on "
+    "~/.hermes/cache/pruned if a specific detail is missing):"
+)
+ARCHIVE_LIST_KNOWN_HEADINGS = (ARCHIVE_LIST_HEADING, LEGACY_ARCHIVE_LIST_HEADING)
 OLDER_ARCHIVE_PREFIX_HEADING = (
     "Older archived sessions in ~/.hermes/cache/pruned/ "
     "(use search_files with path='~/.hermes/cache/pruned' and file_glob='<prefix>*' to locate):"
