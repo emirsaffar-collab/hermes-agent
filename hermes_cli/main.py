@@ -2435,6 +2435,23 @@ def _dashboard_prepare_runtime(args, headless_backend) -> bool:
     return False
 
 
+def _should_use_serve_supervisor() -> bool:
+    """Return True when the Blue-Green Front-Door Supervisor is enabled for `serve --isolated`."""
+    env_raw = os.environ.get("HERMES_ZERO_DOWNTIME_SUPERVISOR")
+    if env_raw is not None:
+        return env_raw.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        dash = cfg.get("dashboard") or {}
+        if isinstance(dash, dict) and "zero_downtime_supervisor" in dash:
+            return bool(dash["zero_downtime_supervisor"])
+    except Exception:
+        pass
+    return False
+
+
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     _token_file = getattr(args, "ssh_session_token_file", None)
@@ -2460,6 +2477,45 @@ def cmd_dashboard(args):
     apply_nofile_soft_limit()
 
     _ssh_session_token = _read_ssh_session_token_file(_token_file) if _token_file else None
+    _worker_token_fd = getattr(args, "worker_token_fd", None)
+    if _worker_token_fd is not None:
+        try:
+            _raw_tok = b""
+            while True:
+                _chunk = os.read(int(_worker_token_fd), 4096)
+                if not _chunk:
+                    break
+                _raw_tok += _chunk
+        finally:
+            try:
+                os.close(int(_worker_token_fd))
+            except OSError:
+                pass
+        _fd_tok = _raw_tok.decode("utf-8", errors="ignore").strip()
+        if _fd_tok:
+            _ssh_session_token = _fd_tok
+    _worker_gen = getattr(args, "worker_gen", None)
+    if (
+        _headless_backend
+        and getattr(args, "isolated", False)
+        and _worker_gen is None
+        and not getattr(args, "no_supervisor", False)
+        and _should_use_serve_supervisor()
+    ):
+        from hermes_cli.dashboard_procs import BACKEND_LOCK_NAME
+        from hermes_cli.serve_supervisor import run_serve_supervisor
+
+        run_serve_supervisor(
+            host=args.host,
+            port=args.port,
+            session_token=_ssh_session_token,
+            ssh_owner_nonce=_ssh_owner_nonce,
+            ssh_lock_path=Path(_token_file).parent / BACKEND_LOCK_NAME if _token_file else None,
+            isolated=True,
+            open_profile=getattr(args, "open_profile", "") or "",
+        )
+        return
+
     _mcp_discovery_after_bind = _dashboard_prepare_runtime(args, _headless_backend)
 
     from hermes_cli.dashboard_procs import BACKEND_LOCK_NAME
@@ -2490,6 +2546,7 @@ def cmd_dashboard(args):
         start_mcp_discovery_after_bind=_mcp_discovery_after_bind,
         # The validated token file lives in desktop-ssh/<ownershipId>/, next to the Desktop's lock.
         ssh_lock_path=Path(_token_file).parent / BACKEND_LOCK_NAME if _token_file else None,
+        worker_gen=_worker_gen,
     )
 
 

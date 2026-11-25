@@ -34,3 +34,31 @@ def test_health_reports_the_boot_commit_from_version_info(monkeypatch, commit):
     assert body["ok"] is True
     assert "commit" in body, "attaching clients key the boot-identity decision on this field"
     assert body["commit"] == commit
+
+
+def test_health_boot_commit_survives_checkout_sha_and_refresh_reads(monkeypatch):
+    """read_checkout_sha() and get_code_identity(refresh=True) must never poison GET /api/health."""
+    from starlette.testclient import TestClient
+
+    from hermes_cli import version_info as vi
+    import hermes_cli.web_server as ws
+
+    boot_sha = "001cf05f46000000000000000000000000000001"
+    moved_sha = "cfc7c9919c000000000000000000000000000002"
+    current = {"sha": boot_sha}
+
+    vi._reset_version_info_cache()
+    monkeypatch.setattr(vi, "_compute_version_info", lambda: _info(current["sha"]))
+    monkeypatch.setattr(vi, "installed_commit_sha", lambda: current["sha"])
+    try:
+        client = TestClient(ws.app)
+        assert client.get("/api/health").json()["commit"] == boot_sha
+
+        # Simulate git pull / install-stamp moving HEAD on disk under the running server.
+        current["sha"] = moved_sha
+        assert vi.read_checkout_sha() == moved_sha
+        assert vi.get_code_identity(refresh=True)["sha"] == moved_sha
+        # Process-boot /api/health MUST still report boot_sha, not moved_sha!
+        assert client.get("/api/health").json()["commit"] == boot_sha
+    finally:
+        vi._reset_version_info_cache()

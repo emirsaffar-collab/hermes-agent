@@ -290,12 +290,8 @@ def _stamp_or_none() -> VersionInfo | None:
         return None
 
 
-def get_version_info() -> VersionInfo:
-    """Return cached provenance from install stamp, git, or unknown."""
-    global _cached_version_info
-    if _cached_version_info is not None:
-        return _cached_version_info
-
+def _compute_version_info() -> VersionInfo:
+    """Resolve provenance from install stamp, live git, or unknown without mutating the boot cache."""
     # 1. Install stamp (packaged builds: Docker, Nix)
     info = _stamp_or_none()
 
@@ -308,9 +304,21 @@ def get_version_info() -> VersionInfo:
     # 3. Unknown — no stamp, no git
     if info is None:
         info = VersionInfo("unknown", "unknown", None, None, None, "unknown")
-
-    _cached_version_info = info
     return info
+
+
+def get_version_info() -> VersionInfo:
+    """Return cached boot-time provenance from install stamp, git, or unknown.
+
+    Pinned for the life of the process so ``GET /api/health`` always reports the code
+    this process booted from even when an updater or skew probe re-reads disk HEAD.
+    """
+    global _cached_version_info
+    if _cached_version_info is not None:
+        return _cached_version_info
+
+    _cached_version_info = _compute_version_info()
+    return _cached_version_info
 
 
 def hermes_user_agent(product: str = "hermes-cli") -> str:
@@ -333,14 +341,11 @@ def get_code_identity(refresh: bool = False) -> dict:
     second, unknown third), so every consumer shares one resolution
     policy. Returned dicts are fresh copies, never the shared cache.
 
-    ``refresh=True`` drops the per-process cache first — the updater uses
-    it to re-read identity after swapping the checkout out from under the
-    running process.
+    ``refresh=True`` re-reads on-disk identity without clearing the process-boot
+    cache (:func:`get_version_info`), so long-lived servers never self-poison
+    ``GET /api/health`` after an updater or inventory probe inspects disk HEAD.
     """
-    global _cached_version_info
-    if refresh:
-        _cached_version_info = None
-    info = get_version_info()
+    info = _compute_version_info() if refresh else get_version_info()
     return {
         "sha": info.commit,
         "short_sha": info.commit[:8] if info.commit else None,
@@ -351,14 +356,13 @@ def get_code_identity(refresh: bool = False) -> dict:
 
 
 def read_checkout_sha() -> str | None:
-    """The running install's commit, re-read now: the stamp's, else ``git rev-parse HEAD``.
+    """The on-disk checkout's commit, re-read now: the stamp's, else ``git rev-parse HEAD``.
 
     Same answer as ``get_code_identity(refresh=True)["sha"]`` for one git call instead of the
-    whole provenance walk (the tag scan alone costs ~0.35 s in a large clone), which the
-    pending-restart check on every CLI start was paying just to compare SHAs. Drops the cached
-    identity like that refresh does: the checkout may have moved under this process.
+    whole provenance walk (the tag scan alone costs ~0.35 s in a large clone). Preserves the
+    process-boot :func:`get_version_info` cache so long-lived servers keep reporting their true
+    boot commit on ``GET /api/health``.
     """
-    _reset_version_info_cache()
     return installed_commit_sha()
 
 

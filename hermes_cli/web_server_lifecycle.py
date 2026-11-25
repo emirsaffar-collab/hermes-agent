@@ -382,6 +382,50 @@ def _start_parent_death_watchdog() -> None:
     threading.Thread(target=_loop, daemon=True, name="serve-parent-watchdog").start()
 
 
+def _start_supervisor_exit_watchdog() -> None:
+    """Exit when the Front-Door Supervisor (HERMES_SUPERVISOR_PID) dies.
+
+    Prevents orphaned worker-gen-N processes if the supervisor receives SIGKILL.
+    """
+    raw_pid = os.environ.get("HERMES_SUPERVISOR_PID")
+    try:
+        sup_pid = int(raw_pid or "")
+    except (TypeError, ValueError):
+        return
+    if sup_pid <= 1:
+        return
+
+    try:
+        poll = max(0.2, float(os.environ.get("HERMES_SUPERVISOR_WATCHDOG_POLL_S", "1.5")))
+    except (TypeError, ValueError):
+        poll = 1.5
+
+    def _sup_alive() -> bool:
+        if os.name != "nt" and os.getppid() == 1:
+            return False
+        try:
+            os.kill(sup_pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    def _loop() -> None:
+        while _sup_alive():
+            time.sleep(poll)
+        try:
+            _log.warning(
+                "Supervisor-exit watchdog: Front-Door Supervisor PID %s exited; shutting down worker.",
+                sup_pid,
+            )
+        except Exception:
+            pass
+        _request_orphan_shutdown()
+
+    threading.Thread(target=_loop, daemon=True, name="serve-supervisor-watchdog").start()
+
+
 # Port-conflict sentinel (#93608): uvicorn's bind_socket() turns EADDRINUSE into
 # a bare ERROR + exit 1, indistinguishable from a crash for the Desktop spawn.
 # We probe the exact bind first and emit ONE machine-readable stdout line plus a

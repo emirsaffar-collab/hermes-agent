@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from hermes_cli.version_info import _git_version_info, _reset_version_info_cache
+from hermes_cli.version_info import _git_version_info
 
 
 def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
@@ -27,7 +27,6 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
     if info.commit is None:
         with suppress(FileNotFoundError):
             (root / "install-stamp.json").unlink()
-        _reset_version_info_cache()
         return None
     stamp = {
         "schemaVersion": 2,
@@ -64,7 +63,10 @@ def write_source_stamp(root: Path, *, adopted: bool = False) -> dict | None:
     finally:
         with suppress(OSError):
             os.unlink(tmp_name)
-    _reset_version_info_cache()
+    # Do NOT reset version_info's boot-time cache here: a long-lived server process that
+    # adopts or refreshes install-stamp.json must continue reporting the commit it booted from
+    # on GET /api/health (callers wanting live disk identity use installed_commit_sha() /
+    # get_code_identity(refresh=True)).
     # Every path that publishes a new checkout identity (completion handoff, the PM
     # updater's finish, boot-time adoption) moves the installers' receipt with it.
     refresh_bootstrap_receipt(root, stamp)

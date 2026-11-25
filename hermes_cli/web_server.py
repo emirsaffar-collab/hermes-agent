@@ -1225,6 +1225,7 @@ def _on_server_started(
     initial_profile: str,
     start_mcp_discovery_after_bind: bool,
     ssh_lock_path: Optional[Path] = None,
+    worker_gen: Optional[int] = None,
 ) -> None:
     """Post-bind arming on the serving loop right after ``server.startup()``.
 
@@ -1232,6 +1233,7 @@ def _on_server_started(
     announcement, browser open, deferred MCP discovery, loop-noise filter,
     loop heartbeat.
     """
+    is_supervised_worker = worker_gen is not None
     # Clear corpses from a previous unclean Desktop exit (crash/SIGKILL/update
     # handoff leaves an orphaned backend + its MCP subtree) before stacking a
     # new tree (EMFILE / missing tabs). The watchdog only protects *this*
@@ -1246,24 +1248,29 @@ def _on_server_started(
 
         reap_orphaned_mcp_helpers()
 
-    if is_desktop_owned_backend():
+    if is_desktop_owned_backend() and not is_supervised_worker:
         _best_effort("orphan desktop-local serve reap", _reap_desktop_serves)
     # Same sweep for stdio MCP helpers (#61514): positive identity only (spawn
     # ledger + spawner provably dead); anything alive or unprovable is untouched.
-    _best_effort("orphan MCP helper reap", _reap_mcp_helpers)
+    if not is_supervised_worker:
+        _best_effort("orphan MCP helper reap", _reap_mcp_helpers)
 
-    # No-op for standalone `hermes serve` (no HERMES_PARENT_PID).
-    _start_parent_death_watchdog()
+    if is_supervised_worker:
+        from hermes_cli.web_server_lifecycle import _start_supervisor_exit_watchdog
+        _start_supervisor_exit_watchdog()
+    else:
+        # No-op for standalone `hermes serve` (no HERMES_PARENT_PID).
+        _start_parent_death_watchdog()
     # SSH-isolated backends are detached from any parent on purpose (#91668); their liveness signal
     # is "does a client still hold a WebSocket" (#101626).
-    if getattr(app.state, "ssh_isolated_clients", None) is not None:
+    if not is_supervised_worker and getattr(app.state, "ssh_isolated_clients", None) is not None:
         from hermes_cli.web_server_idle_exit import DEFAULT_IDLE_GRACE_S, start_idle_watchdog
         try:
             grace = float((load_config().get("dashboard") or {}).get("ssh_isolated_idle_grace_s", DEFAULT_IDLE_GRACE_S))
         except (TypeError, ValueError):
             grace = DEFAULT_IDLE_GRACE_S
         start_idle_watchdog(server, app.state.ssh_isolated_clients, grace_s=grace)
-    if getattr(app.state, "ssh_isolated_clients", None) is not None or is_desktop_owned_backend():
+    if not is_supervised_worker and (getattr(app.state, "ssh_isolated_clients", None) is not None or is_desktop_owned_backend()):
         # The host's updater never restarts this backend (SSH-isolated: only the remote Desktop
         # client holds its token and owner nonce, #91668/#101626; Desktop-owned local serve:
         # the updater defers to the app's ledger-verified restart and the backend otherwise
@@ -1273,7 +1280,7 @@ def _on_server_started(
         from hermes_cli.web_server_skew_exit import start_code_skew_watchdog
 
         start_code_skew_watchdog(server)
-    if getattr(app.state, "ssh_isolated_clients", None) is not None and ssh_lock_path and _SSH_OWNER_NONCE:
+    if not is_supervised_worker and getattr(app.state, "ssh_isolated_clients", None) is not None and ssh_lock_path and _SSH_OWNER_NONCE:
         # A reconnect that cannot prove this pid is its own drops the lock without signalling us
         # and spawns a new nonce (#132034); retire (between turns) once the lock names that spawn.
         from hermes_cli.web_server_owner_exit import start_owner_watchdog
@@ -1294,8 +1301,14 @@ def _on_server_started(
         from hermes_cli.process_identity import attach_self_to_kill_on_close_job, register_self
 
         register_self(
-            "serve" if headless else "dashboard",
-            detail={"host": host, "port": actual_port, "profile": initial_profile or "", "isolated": isolated},
+            "serve-worker" if is_supervised_worker else ("serve" if headless else "dashboard"),
+            detail={
+                "host": host,
+                "port": actual_port,
+                "profile": initial_profile or "",
+                "isolated": isolated,
+                **({"worker_gen": worker_gen} if is_supervised_worker else {}),
+            },
         )
         attach_self_to_kill_on_close_job()
 
@@ -1305,12 +1318,12 @@ def _on_server_started(
     # for any profile find this process and attach instead of binding a second port. Published
     # after the bind so the record carries the real port, and beside — not instead of — the
     # spawn-ledger entry above, which Desktop's attach ladder reads.
-    _best_effort(
-        "host rendezvous publish",
-        lambda: _publish_host_rendezvous(host, actual_port, isolated=isolated),
-    )
-
-    _write_dashboard_ready_file(actual_port)
+    if not is_supervised_worker:
+        _best_effort(
+            "host rendezvous publish",
+            lambda: _publish_host_rendezvous(host, actual_port, isolated=isolated),
+        )
+        _write_dashboard_ready_file(actual_port)
     # Port-discovery sentinel parsed by the Desktop spawn. Written to fd 1:
     # tui_gateway.server redirects sys.stdout to stderr at import, and the
     # Desktop watches child.stdout (#96282). A headless `serve` announces the
@@ -1452,6 +1465,7 @@ def _start_server_runtime(
     ssh_owner_nonce: Optional[str] = None,
     start_mcp_discovery_after_bind: bool = False,
     ssh_lock_path: Optional[Path] = None,
+    worker_gen: Optional[int] = None,
 ):
     """Start the web UI server.
 
@@ -1466,11 +1480,14 @@ def _start_server_runtime(
     ``start_mcp_discovery_after_bind`` (Desktop ``serve``) defers MCP discovery
     until the ready sentinel is written so its SDK import can't hold the GIL
     against the pre-bind path.
+    ``worker_gen`` identifies a blue-green worker generation owned by the
+    Front-Door Supervisor (``hermes_cli.serve_supervisor``).
     """
     from hermes_cli.update_proxy_env import restore_user_proxy_env
     restore_user_proxy_env()  # a backend an update replayed keeps the user's proxy env, not the update's
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
+    app.state.worker_gen = worker_gen
 
     # Dashboard-mode starts don't route through main.py's `serve` path, which
     # applies the same RLIMIT_NOFILE floor (policy in resource_limits, #81547).
@@ -1557,6 +1574,7 @@ def _start_server_runtime(
                 initial_profile=initial_profile,
                 start_mcp_discovery_after_bind=start_mcp_discovery_after_bind,
                 ssh_lock_path=ssh_lock_path,
+                worker_gen=worker_gen,
             )
             if headless:
                 from hermes_cli.observability.shared_metrics_startup import record_process_ready

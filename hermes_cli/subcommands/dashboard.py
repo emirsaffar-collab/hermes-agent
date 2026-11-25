@@ -56,6 +56,14 @@ def _configure_serve_parser(parser, *, cmd_dashboard: Callable) -> None:
     parser.add_argument(
         "--ssh-owner-nonce", dest="ssh_owner_nonce", metavar="NONCE", default=None,
         help="Identify a Desktop-owned SSH backend process")
+    # Zero-downtime blue-green supervisor internals: workers receive --worker-gen N
+    # and --worker-token-fd <r_fd>; --no-supervisor bypasses the Front-Door Supervisor.
+    parser.add_argument(
+        "--worker-gen", dest="worker_gen", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worker-token-fd", dest="worker_token_fd", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--no-supervisor", dest="no_supervisor", action="store_true", default=False, help=argparse.SUPPRESS)
     parser.set_defaults(func=cmd_dashboard, no_open=True, headless_backend=True, command="serve")
 
 
