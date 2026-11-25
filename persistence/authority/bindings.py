@@ -297,6 +297,10 @@ class SessionBindingRepository(Protocol):
         """Every id holding a creation receipt, in store order."""
         ...
 
+    def acp_session_ids(self) -> list[SessionId]:
+        """Logical owner ids of open ACP-created local sessions."""
+        ...
+
     def list_lineages(self) -> list[LocalLineage]:
         """Every receipt's owner and lineage; undecodable receipts, non-string owners and non-list lineages are skipped and non-string members dropped."""
         ...

@@ -21,9 +21,10 @@ def test_boot_receipts_sql_and_moved_receipts_use_glob_and_skip_local_oneshots()
     assert "m.key GLOB ?" in _authority_local._BOOT_RECEIPTS_SQL
     assert "m.key NOT GLOB 'gateway.local_policy.v1:local-*'" in _authority_local._BOOT_RECEIPTS_SQL
     src_moved = inspect.getsource(hermes_state_local.moved_receipts)
-    assert "m.key NOT GLOB 'gateway.local_policy.v1:local-*'" in src_moved
+    assert "NONDEFAULT_POLICY_WHERE" in src_moved
+    assert "CROSS JOIN state_meta m ON m.key = ? || s.id" in src_moved
     src_runtime = inspect.getsource(run_runtime.recover_gateway_native_sessions)
-    assert "asyncio.to_thread" in src_runtime
+    assert "asyncio.to_thread" in src_runtime or "recover_local_sessions_async" in src_runtime
 
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -58,7 +59,11 @@ def test_boot_receipts_sql_and_moved_receipts_use_glob_and_skip_local_oneshots()
     ]
     assert rows == ["20261110_014015_008491"]
     moved = hermes_state_local.moved_receipts(conn)
-    assert list(moved.keys()) == ["20261110_014015_008491"]
+    assert set(moved.keys()) == {"local-123", "20261110_014015_008491"}
+    assert hermes_state_local.moved_receipts(conn, target_ids={"local-123"}) == {"local-123": ("local-123", "cli")}
+    assert hermes_state_local.moved_receipts(conn, sources={"desktop"}) == {
+        "20261110_014015_008491": ("20261110_014015_008491", "desktop")
+    }
 
 
 def test_turn_preflight_repairs_alternation_immediately_after_compression():

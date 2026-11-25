@@ -106,14 +106,15 @@ def release_handed_off_receipts(holder, *, epoch, lanes):
     restores from its route like any other platform session, and move the rest of its conversation
     there with it (``hand_off_conversations``). Only receipts whose CURRENT target a messaging lane
     now holds (a source in *lanes*): any other refused receipt stays as it is, logged when it is touched."""
+    if not lanes:
+        return {}
     with holder._read_ctx() as conn:
-        if not any(source in lanes for _, source in moved_receipts(conn).values()):
+        if not moved_receipts(conn, sources=lanes):
             return {}
 
     def write(conn):
         _epoch(conn, epoch)
-        moved = {owner: (target, source) for owner, (target, source) in moved_receipts(conn).items()
-                 if source in lanes}
+        moved = moved_receipts(conn, sources=lanes)
         return hand_off_conversations(conn, moved)
     return holder._execute_write(write)
 
@@ -176,7 +177,7 @@ def legacy_adoption_scan(holder, owner):
             " AND ifnull(chat_id,'')='' AND ifnull(origin_json,'')='') ORDER BY started_at, id",
             local + refused)]
         bound = {row[0] for row in conn.execute(
-            'SELECT key FROM state_meta WHERE key LIKE ? OR key LIKE ?', (POLICY_PREFIX + '%', LEGACY_PREFIX + '%'))}
+            'SELECT key FROM state_meta WHERE key GLOB ? OR key GLOB ?', (POLICY_PREFIX + '*', LEGACY_PREFIX + '*'))}
     return ids, {key[len(prefix):] for key in bound for prefix in (POLICY_PREFIX, LEGACY_PREFIX) if key.startswith(prefix)}
 
 
@@ -403,13 +404,25 @@ def local_session_ids(holder):
             'SELECT key FROM state_meta WHERE key GLOB ?', (POLICY_PREFIX + '*',))]
 
 
+def acp_session_ids(holder):
+    """Logical owner ids of open ACP-created local sessions, indexed on ``sessions.source``."""
+    with holder._read_ctx() as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT DISTINCT COALESCE(NULLIF(chat_id, ''), id) AS session_id "
+            "FROM sessions "
+            "WHERE (source = 'acp' OR (source = 'local' AND created_source = 'acp')) "
+            "AND ended_at IS NULL"
+        )]
+
+
 def local_lineages(holder):
-    """``(owner, lineage)`` of every receipt, as the catalog reads them: an undecodable receipt, a non-string owner
-    or a non-list lineage is skipped, and non-string members are dropped."""
-    from ..conversation._store.local import POLICY_PREFIX
+    """``(owner, lineage)`` of every receipt with a stored lineage, as the catalog reads them: an
+    undecodable receipt, a non-string owner or a non-list lineage is skipped, and non-string
+    members are dropped."""
+    from .._schema_ddl import NONDEFAULT_POLICY_WHERE
     found = []
     with holder._read_ctx() as conn:
-        rows = conn.execute('SELECT value FROM state_meta WHERE key GLOB ?', (POLICY_PREFIX + '*',)).fetchall()
+        rows = conn.execute(f'SELECT value FROM state_meta WHERE {NONDEFAULT_POLICY_WHERE}').fetchall()
     for (raw,) in rows:
         try:
             receipt = json.loads(raw)

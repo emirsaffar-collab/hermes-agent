@@ -18,8 +18,8 @@ def request_prompt_refresh(holder: StoreHolder, session_id: Optional[str] = None
 
     def _do(conn) -> int:
         row = conn.execute(
-            "SELECT MAX(CAST(value AS INTEGER)) FROM state_meta WHERE key = ? OR substr(key, 1, ?) = ?",
-            (PROFILE_KEY, len(SESSION_KEY_PREFIX), SESSION_KEY_PREFIX),
+            "SELECT MAX(CAST(value AS INTEGER)) FROM state_meta WHERE key = ? OR key GLOB ?",
+            (PROFILE_KEY, SESSION_KEY_PREFIX + "*"),
         ).fetchone()
         epoch = int(row[0] or 0) + 1
         conn.execute(

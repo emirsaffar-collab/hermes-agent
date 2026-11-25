@@ -402,14 +402,18 @@ _LIVE_ATTEMPT = frozenset({'running', 'stopping', 'deferred', 'indeterminate'})
 _STOPPING = frozenset({'stopping', 'deferred'})
 
 
+def _prefix_upper_bound(prefix: str) -> str:
+    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
 def _attempt_homes(conn: sqlite3.Connection, room_id: str, member_id: str,
                    statuses: frozenset[str] = _LIVE_ATTEMPT) -> dict[str, tuple[str, bool]]:
     """``{key: (home, live)}`` for every attempt home recorded for this member; live while its task row is still
     that attempt (same generation) in one of *statuses*. A file without driver tasks holds no live attempt."""
     prefix, found = MEMBER_HOMES_PREFIX + json.dumps([room_id, member_id], separators=(',', ':'))[:-1] + ',', {}
     tasks = table_exists(conn, 'hosted_room_driver_tasks')
-    for key, home in conn.execute('SELECT key, value FROM state_meta WHERE substr(key, 1, length(?))=?',
-                                  (prefix, prefix)).fetchall():
+    for key, home in conn.execute('SELECT key, value FROM state_meta WHERE key >= ? AND key < ?',
+                                  (prefix, _prefix_upper_bound(prefix))).fetchall():
         task_id, generation = json.loads(key[len(MEMBER_HOMES_PREFIX):])[2:]
         row = conn.execute('SELECT status, execution_generation FROM hosted_room_driver_tasks '
                            'WHERE room_id=? AND task_id=?', (room_id, task_id)).fetchone() if tasks else None
@@ -421,7 +425,7 @@ def _attempt_homes(conn: sqlite3.Connection, room_id: str, member_id: str,
 def _forget_room_member_homes_locked(conn: sqlite3.Connection, room_id: str) -> None:
     if table_exists(conn, "state_meta"):
         prefix = MEMBER_HOMES_PREFIX + json.dumps([room_id], separators=(',', ':'))[:-1] + ','
-        conn.execute('DELETE FROM state_meta WHERE substr(key, 1, length(?))=?', (prefix, prefix))
+        conn.execute('DELETE FROM state_meta WHERE key >= ? AND key < ?', (prefix, _prefix_upper_bound(prefix)))
 
 
 # The caller runs the epoch fence first.

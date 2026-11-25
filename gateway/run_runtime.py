@@ -864,7 +864,14 @@ async def settle_gateway_runtime(runner, budget=None, reason=None):
         except TimeoutError:
             logger.warning('Profile %s still has live writers at shutdown; its admissions stay for recovery',
                            getattr(authority, 'profile_id', '?'))
-    # Work settled above. ACP has no per-session destroy,
+    from gateway.run_api import stop_gateway_api
+    store = getattr(runner, 'session_ticket_store', None)
+    if store is not None:
+        store.revoke()
+    handle = getattr(runner, 'session_api', None)
+    if handle is not None:
+        await stop_gateway_api(handle)
+    # Work and sockets settled above. ACP has no per-session destroy,
     # so the stop is the end of every ACP session nobody is viewing (#118216).
     from gateway.session_acp_lifecycle import end_idle_acp_sessions
     for authority in _authorities(runner):
@@ -875,10 +882,3 @@ async def settle_gateway_runtime(runner, budget=None, reason=None):
             import logging
             logging.getLogger(__name__).warning('ACP sessions of %s not ended at shutdown',
                                                 getattr(authority, 'profile_id', '?'), exc_info=True)
-    from gateway.run_api import stop_gateway_api
-    store = getattr(runner, 'session_ticket_store', None)
-    if store is not None:
-        store.revoke()
-    handle = getattr(runner, 'session_api', None)
-    if handle is not None:
-        await stop_gateway_api(handle)

@@ -328,6 +328,21 @@ class InMemorySessionBindingRepository(ApiBindingVerbs, LineageWriteVerbs):
     def local_session_ids(self) -> list[SessionId]:
         return [SessionId(key[len(RECEIPT_PREFIX):]) for key in self._committed()[0] if isinstance(key, str) and key.startswith(RECEIPT_PREFIX)]
 
+    def acp_session_ids(self) -> list[SessionId]:
+        sessions = self._committed()[1]
+        seen: list[SessionId] = []
+        seen_set: set[str] = set()
+        for sid, row in sessions.items():
+            if row.get("ended_at") is not None:
+                continue
+            source = row.get("source")
+            if source == "acp" or (source == "local" and row.get("created_source") == "acp"):
+                owner = row.get("chat_id") or sid
+                if owner not in seen_set:
+                    seen_set.add(owner)
+                    seen.append(SessionId(owner))
+        return seen
+
     def list_lineages(self) -> list[LocalLineage]:
         found: list[LocalLineage] = []
         for key, raw in self._committed()[0].items():

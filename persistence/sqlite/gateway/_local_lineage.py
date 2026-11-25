@@ -7,27 +7,82 @@ from __future__ import annotations
 import json
 
 from .._schema import _title_rank
+from .._schema_ddl import NONDEFAULT_POLICY_WHERE
 from ..conversation._store.local import POLICY_PREFIX
 from ..conversation._store.local_migration import LEGACY_PREFIX
 
 
-def moved_receipts(conn, target_ids=None):
+def moved_receipts(conn, target_ids=None, sources=None):
     """``{owner id: (moved row id, its source)}`` of local receipts whose current physical target row
     now carries another lane's route. An explicit repoint (``/handoff``, a platform ``/resume``)
     rewrote that row's routing identity, so the receipt can never restore the conversation again
     (the stored identity check in ``gateway.session_local_recovery._checked_entry``). Only the
     current target counts: an earlier ``/new`` segment that moved leaves the conversation the
     receipt guards local, and releasing it would strand that transcript. *target_ids* narrows the
-    scan to the rows one repoint rewrote."""
-    rows = conn.execute(
-        "SELECT substr(m.key, ?), s.id, s.source FROM state_meta m JOIN sessions s "
-        "ON s.id = CASE WHEN m.key NOT GLOB 'gateway.local_policy.v1:local-*' AND json_valid(m.value) "
-        "THEN json_extract(m.value, '$.entry.session_id') END "
-        "WHERE m.key GLOB ? AND m.key NOT GLOB 'gateway.local_policy.v1:local-*' AND s.session_key IS NOT NULL "
-        "AND s.session_key IS NOT CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.route') END",
-        (len(POLICY_PREFIX) + 1, POLICY_PREFIX + '*')).fetchall()
-    return {owner: (target, source) for owner, target, source in rows
-            if target_ids is None or target in target_ids}
+    scan to the rows one repoint rewrote; *sources* narrows to rows whose current source is in
+    *sources*. Uses direct PK lookups for default receipts (``entry.session_id == owner``) and the
+    partial index ``idx_state_meta_local_policy_special`` (``NONDEFAULT_POLICY_WHERE``) for
+    repointed receipts, avoiding full ``state_meta`` scans while preserving ``local-*`` handoffs."""
+    if target_ids is not None:
+        target_tuple = tuple(dict.fromkeys(target_ids))
+        if not target_tuple:
+            return {}
+    else:
+        target_tuple = None
+    if sources is not None:
+        source_tuple = tuple(dict.fromkeys(sources))
+        if not source_tuple:
+            return {}
+    else:
+        source_tuple = None
+
+    found = {}
+
+    # Branch 1: default receipts where key = POLICY_PREFIX || s.id and entry.session_id = s.id.
+    where_s = ["s.session_key IS NOT NULL"]
+    params_1: list = [POLICY_PREFIX]
+    if target_tuple is not None:
+        where_s.append(f"s.id IN ({','.join('?' * len(target_tuple))})")
+        params_1.extend(target_tuple)
+    if source_tuple is not None:
+        where_s.append(f"s.source IN ({','.join('?' * len(source_tuple))})")
+        params_1.extend(source_tuple)
+    rows_default = conn.execute(
+        "SELECT s.id, s.source FROM sessions s "
+        "CROSS JOIN state_meta m ON m.key = ? || s.id "
+        f"WHERE {' AND '.join(where_s)} "
+        "AND json_valid(m.value) "
+        "AND json_extract(m.value, '$.entry.session_id') = s.id "
+        "AND s.session_key IS NOT json_extract(m.value, '$.route')",
+        params_1,
+    ).fetchall()
+    for sid, source in rows_default:
+        found[sid] = (sid, source)
+
+    # Branch 2: non-default receipts (repointed /new or /compress target, lineage, derived ids)
+    # via the partial index on NONDEFAULT_POLICY_WHERE.
+    where_2 = [
+        NONDEFAULT_POLICY_WHERE,
+        "s.session_key IS NOT NULL",
+        "s.session_key IS NOT json_extract(m.value, '$.route')",
+    ]
+    params_2: list = [len(POLICY_PREFIX) + 1]
+    if target_tuple is not None:
+        where_2.append(f"s.id IN ({','.join('?' * len(target_tuple))})")
+        params_2.extend(target_tuple)
+    if source_tuple is not None:
+        where_2.append(f"s.source IN ({','.join('?' * len(source_tuple))})")
+        params_2.extend(source_tuple)
+    rows_nondefault = conn.execute(
+        "SELECT substr(m.key, ?), s.id, s.source FROM state_meta m "
+        "JOIN sessions s ON s.id = json_extract(m.value, '$.entry.session_id') "
+        f"WHERE {' AND '.join(where_2)}",
+        params_2,
+    ).fetchall()
+    for owner, target, source in rows_nondefault:
+        found[owner] = (target, source)
+
+    return found
 
 
 def release_receipts(conn, owners):

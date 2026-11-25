@@ -214,3 +214,26 @@ def test_release_handed_off_receipts_hands_the_conversation_to_the_lane(backend,
     owner_row = store_a.sessions.get(sid)
     assert (owner_row.session_key, owner_row.source, owner_row.chat_id) == ("agent:main:telegram:dm:1", "telegram", "1")
     assert store_a.sessions.get(SessionId("seg-2")).title == "Named chat"
+
+
+def test_acp_session_ids_lists_only_open_acp_owners(backend, scope_a):
+    # CONTRACT: ``acp_session_ids`` returns the logical owner id of every open session with source='acp'
+    # or (source='local' and created_source='acp'), skipping ended rows and non-ACP sessions.
+    store_a = backend.open(scope_a)
+    epoch = begin(store_a)
+    acp_open = make_binding(
+        "local-acp-open", route="route-acp-open", request_id="req-acp-open",
+        policy={"source": "acp"}, created_source="acp",
+    )
+    acp_ended = make_binding(
+        "local-acp-ended", route="route-acp-ended", request_id="req-acp-ended",
+        policy={"source": "acp"}, created_source="acp",
+    )
+    gui_open = make_binding(
+        "local-gui-open", route="route-gui-open", request_id="req-gui-open",
+        policy={"source": "gui"}, created_source="gui",
+    )
+    for b in (acp_open, acp_ended, gui_open):
+        store_a.bindings.reserve(epoch=epoch, binding=b, owner=None)
+    store_a.sessions.end(acp_ended.session_id, "acp_disconnect")
+    assert set(store_a.bindings.acp_session_ids()) == {acp_open.session_id}
