@@ -162,7 +162,11 @@ def record_aux_usage(
         try:
             from agent.realtime_spend_breaker import record_realtime_llm_call
             _aux_rid = getattr(response, "id", None)
-            _aux_tier = getattr(usage, "service_tier", None) or getattr(response, "service_tier", None)
+            _aux_tier = (
+                getattr(usage, "service_tier", None)
+                or (usage.raw_usage.get("service_tier") if isinstance(usage.raw_usage, dict) else None)
+                or getattr(response, "service_tier", None)
+            )
             _aux_region = None
             if base_url and str(provider or "").lower() == "vertex":
                 from agent.vertex_adapter import parse_vertex_base_url as _parse_vbu

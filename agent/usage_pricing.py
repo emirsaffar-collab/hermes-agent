@@ -577,6 +577,17 @@ def _openai_served_tier_entry(model: str, tier: Optional[str]) -> Optional[Prici
     return replace(entry, **rates, pricing_version=f"{entry.pricing_version}-{tier}-{multiplier}x")
 
 
+def _google_flex_tier_entry(entry: PricingEntry) -> PricingEntry:
+    """Vertex / Gemini API Sync Flex bills at 50% of standard per-million token rates."""
+    flex_mult = Decimal("0.5")
+    rates = {
+        field.name: value * flex_mult
+        for field in fields(PricingEntry)
+        if "cost_per_million" in field.name and (value := getattr(entry, field.name)) is not None
+    }
+    return replace(entry, **rates, pricing_version=f"{entry.pricing_version}-flex-0.5x")
+
+
 def _served_fast(usage: CanonicalUsage) -> bool:
     """Anthropic names the speed that served a fast-mode request in ``usage.speed``."""
     return isinstance(usage.raw_usage, dict) and usage.raw_usage.get("speed") == "fast"
@@ -850,6 +861,8 @@ def estimate_usage_cost(
             entry = served_entry
         elif served_tier == "ultrafast":
             return _unknown_cost("official_docs_snapshot", "ultrafast pricing unavailable for model")
+    if entry and route.provider == "google" and served_tier in {"flex", "on_demand_flex"}:
+        entry = _google_flex_tier_entry(entry)
     if not entry:
         return _unknown_cost("none")
 

@@ -4292,7 +4292,7 @@ def _try_configured_fallback_chain(
         fb_model = fb_model_raw or None
         label = f"fallback_chain[{i}]({fb_provider})"
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = _resolve_fallback_entry(entry, task=task)
         except Exception:
             fb_client, resolved_model = None, None
         if fb_client is not None and _fallback_lane(fb_client, resolved_model or fb_model, label) not in skip_lanes:
@@ -4328,7 +4328,9 @@ def _fallback_entry_api_key(entry: dict[str, Any]) -> Optional[str]:
     return resolve_entry_api_key(entry)
 
 
-def _resolve_fallback_entry(entry: dict[str, Any]) -> tuple[Optional[Any], Optional[str]]:
+def _resolve_fallback_entry(
+    entry: dict[str, Any], *, task: Optional[str] = None,
+) -> tuple[Optional[Any], Optional[str]]:
     """Resolve one fallback entry through the central provider router."""
     provider = str(entry.get("provider") or "").strip()
     model = str(entry.get("model") or "").strip() or None
@@ -4338,6 +4340,7 @@ def _resolve_fallback_entry(entry: dict[str, Any]) -> tuple[Optional[Any], Optio
         provider, model=model, explicit_base_url=str(entry.get("base_url") or "").strip() or None,
         explicit_api_key=_fallback_entry_api_key(entry),
         api_mode=str(entry.get("api_mode") or entry.get("transport") or "").strip() or None,
+        task=task,
     )
     if client is not None:
         with contextlib.suppress(Exception):
@@ -4383,7 +4386,7 @@ def _try_main_fallback_chain(
             tried.append(f"{label} (unhealthy)")
             continue
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = _resolve_fallback_entry(entry, task=task)
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
