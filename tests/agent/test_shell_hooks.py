@@ -813,3 +813,50 @@ def test_fast_accept_pre_tool_hook_two_way_polarity():
     ledger_cmd = {"tool_name": "terminal", "args": {"command": "echo 123 >> .approved-shas"}}
     assert shell_hooks._fast_accept_pre_tool_hook("/path/to/ledger-write-guard-hermes.sh", ledger_cmd) is False
 
+
+@pytest.mark.platforms("posix")
+def test_darwin_shebang_argv_resolves_direct_interpreter(tmp_path):
+    import os
+    import shutil
+
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+    # 1. Direct interpreter shebang (#!/bin/sh) -> ["/bin/sh", script, "--flag"]
+    s_direct = tmp_path / "direct.sh"
+    s_direct.write_text("#!/bin/sh\nexit 0\n")
+    s_direct.chmod(0o755)
+    assert shell_hooks._darwin_shebang_argv([str(s_direct), "--flag"], env) == [
+        "/bin/sh", str(s_direct), "--flag"
+    ]
+
+    # 2. /usr/bin/env shebang -> resolves to actual Mach-O binary on PATH
+    s_env = tmp_path / "env.sh"
+    s_env.write_text("#!/usr/bin/env sh\nexit 0\n")
+    s_env.chmod(0o755)
+    expected_sh = shutil.which("sh", path=env["PATH"])
+    assert expected_sh is not None
+    assert shell_hooks._darwin_shebang_argv([str(s_env)], env) == [expected_sh, str(s_env)]
+
+    # 3. Non-executable script (0o644) must remain unchanged so Popen raises PermissionError
+    s_noexec = tmp_path / "noexec.sh"
+    s_noexec.write_text("#!/bin/sh\nexit 0\n")
+    s_noexec.chmod(0o644)
+    assert shell_hooks._darwin_shebang_argv([str(s_noexec)], env) == [str(s_noexec)]
+
+    # 4. Non-shebang binary / plain file must remain unchanged
+    s_bin = tmp_path / "plain.bin"
+    s_bin.write_bytes(b"\xcf\xfa\xed\xfe\x00\x00")
+    s_bin.chmod(0o755)
+    assert shell_hooks._darwin_shebang_argv([str(s_bin)], env) == [str(s_bin)]
+
+    # 5. env -S flag form must fall back unchanged (not emulate env flags)
+    s_env_s = tmp_path / "envs.sh"
+    s_env_s.write_text("#!/usr/bin/env -S sh -e\nexit 0\n")
+    s_env_s.chmod(0o755)
+    assert shell_hooks._darwin_shebang_argv([str(s_env_s)], env) == [str(s_env_s)]
+
+    # 6. Missing path must remain unchanged
+    missing = str(tmp_path / "does-not-exist.sh")
+    assert shell_hooks._darwin_shebang_argv([missing], env) == [missing]
+
+

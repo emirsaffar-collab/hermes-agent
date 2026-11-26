@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -505,6 +506,59 @@ def _windows_script_argv(argv: list[str]) -> list[str]:
     return [_find_bash(), *argv]
 
 
+def _darwin_shebang_argv(argv: list[str], env: dict[str, str]) -> list[str]:
+    """Bypass macOS XNU kernel ``#!`` execution for hook scripts (``data.kalloc.1024`` wired leak).
+
+    On macOS 26.x/27.x, kernel-resolved nested ``#!`` executions leak 1 KiB per spawn into wired
+    zone ``data.kalloc.1024`` (never freed until reboot). Parsing the shebang in userspace and
+    exec'ing the Mach-O interpreter directly preserves exact POSIX semantics (including
+    ``PermissionError`` on non-executable scripts) while dropping kernel zone growth to 0.
+    """
+    exe = argv[0]
+    if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
+        return argv
+    try:
+        with open(exe, "rb") as fh:
+            head = fh.read(256)
+    except OSError:
+        return argv
+    if not head.startswith(b"#!"):
+        return argv
+    first_line = head.splitlines()[0][2:].decode("utf-8", "replace").strip()
+    if not first_line:
+        return argv
+    parts = first_line.split(None, 1)
+    interp = parts[0]
+    arg = parts[1].strip() if len(parts) == 2 else ""
+
+    resolved: Optional[str] = None
+    extra: list[str] = []
+    if interp == "/usr/bin/env":
+        if not arg:
+            return argv
+        env_parts = arg.split()
+        # Preserve kernel handling for ``env -S ...`` / flag forms rather than emulating env flags.
+        if not env_parts or env_parts[0].startswith("-"):
+            return argv
+        resolved = shutil.which(env_parts[0], path=env.get("PATH"))
+        extra = env_parts[1:]
+    else:
+        if os.path.isfile(interp) and os.access(interp, os.X_OK):
+            resolved = interp
+            if arg:
+                extra = [arg]
+    if not resolved or not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
+        return argv
+    # Never replace one shebang with another shebang (avoid nested #! leak).
+    try:
+        with open(resolved, "rb") as fh:
+            if fh.read(2) == b"#!":
+                return argv
+    except OSError:
+        return argv
+    return [resolved, *extra, *argv]
+
+
 def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
     """The single subprocess site: run ``spec.command`` with ``stdin_json`` on stdin. Same result keys for every outcome."""
     result: dict[str, Any] = {"returncode": None, "stdout": "", "stderr": "", "timed_out": False, "elapsed_seconds": 0.0, "error": None}
@@ -532,12 +586,15 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
     # script must not inherit; single-profile runs keep the process env byte-for-byte as before.
     from agent.secret_scope import is_multiplex_active
     from tools.environments.local import build_subprocess_env
+    sub_env = build_subprocess_env(scrub_secrets=is_multiplex_active())
     try:
         if IS_WINDOWS:
             argv = _windows_script_argv(argv)
+        elif sys.platform == "darwin":
+            argv = _darwin_shebang_argv(argv, sub_env)
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding='utf-8', errors='replace', shell=False,
-                                env=build_subprocess_env(scrub_secrets=is_multiplex_active()), **popen_kwargs)
+                                env=sub_env, **popen_kwargs)
     except Exception as exc:
         for cls, msg in _POPEN_ERRORS:
             if isinstance(exc, cls):
