@@ -649,4 +649,35 @@ def test_rtc_merge_fragment_immediately_updates_last_audio_activity_above_dtx_fl
     assert "vid.videoWidth > 0" in _PARTICIPANT_COUNT_JS
 
 
+def test_build_chromium_launch_kwargs_disables_audio_output_for_receive_only_rtc(monkeypatch, tmp_path):
+    from plugins.google_meet.meet_bot import _BotConfig, _build_chromium_launch_kwargs
+
+    monkeypatch.delenv("HERMES_MEET_ALLOW_AUDIO_OUTPUT", raising=False)
+    monkeypatch.delenv("HERMES_MEET_NO_FAKE_DEVICE", raising=False)
+
+    # Receive-only RTC recorder decouples from OS coreaudiod/mlock via --disable-audio-output
+    cfg_rx = _BotConfig(out_dir=tmp_path, rtc_audio=True, headed=True)
+    kw_rx = _build_chromium_launch_kwargs(cfg_rx, realtime_enabled=False)
+    assert "--disable-audio-output" in kw_rx["args"]
+    assert kw_rx["ignore_default_args"] == ["--mute-audio"]
+    assert "--autoplay-policy=no-user-gesture-required" in kw_rx["args"]
+    assert kw_rx["headless"] is False
+
+    # Realtime mode keeps hardware/virtual audio output enabled
+    kw_rt = _build_chromium_launch_kwargs(cfg_rx, realtime_enabled=True)
+    assert "--disable-audio-output" not in kw_rt["args"]
+
+    # Explicit escape hatch restores hardware audio output
+    monkeypatch.setenv("HERMES_MEET_ALLOW_AUDIO_OUTPUT", "1")
+    kw_opt = _build_chromium_launch_kwargs(cfg_rx, realtime_enabled=False)
+    assert "--disable-audio-output" not in kw_opt["args"]
+
+    # Non-RTC mode does not pass --disable-audio-output
+    monkeypatch.delenv("HERMES_MEET_ALLOW_AUDIO_OUTPUT", raising=False)
+    cfg_no_rtc = _BotConfig(out_dir=tmp_path, rtc_audio=False, headed=False)
+    kw_no_rtc = _build_chromium_launch_kwargs(cfg_no_rtc, realtime_enabled=False)
+    assert "--disable-audio-output" not in kw_no_rtc["args"]
+
+
+
 

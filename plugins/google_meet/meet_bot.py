@@ -2183,6 +2183,40 @@ _CONTEXT_ARGS = {
     "permissions": ["microphone", "camera"]}
 
 
+def _build_chromium_launch_kwargs(cfg: _BotConfig, realtime_enabled: bool) -> dict:
+    """Build Playwright ``chromium.launch`` kwargs for a Meet bot session.
+
+    Receive-only WebRTC recorder bots (``cfg.rtc_audio`` without realtime audio output)
+    pass ``--disable-audio-output`` so Chromium clocks WebAudio/WebRTC playout on its
+    internal software timer instead of opening macOS ``coreaudiod`` (``BuiltInSpeakerDevice``).
+    When macOS kernel wired memory exceeds ``vm.global_user_wire_limit``, ``coreaudiod``
+    fails ``HALB_SharedBuffer::Lock`` (``mlock`` errno 35 / Error 2003329396), freezing
+    ``AudioContext`` in ``suspended`` and silently dropping ``MediaRecorder`` to 0 bytes;
+    ``--disable-audio-output`` bypasses ``coreaudiod`` completely while preserving full
+    remote WebRTC RTP decode + Opus capture.
+    """
+    chrome_args = ["--use-fake-ui-for-media-stream", "--disable-blink-features=AutomationControlled"]
+    # The fake silent mic breaks remote audio reception in some Meet builds (A/B receipt
+    # 2026-09-21: spike with real-device grant captured speech, fake-device bot got digital
+    # silence) — HERMES_MEET_NO_FAKE_DEVICE=1 opts into the real media stack.
+    _no_fake = os.environ.get("HERMES_MEET_NO_FAKE_DEVICE", "").lower() in {"1", "true", "yes"}
+    if not realtime_enabled and not _no_fake:
+        chrome_args.insert(1, "--use-fake-device-for-media-stream")  # silent fake mic
+    launch_kwargs: dict = dict(headless=not cfg.headed, args=chrome_args)
+    if cfg.headed:
+        chrome_args.append("--window-position=-2000,-2000")
+    if cfg.rtc_audio:
+        # headless Chromium ships --mute-audio by default — remote streams record
+        # as digital silence without dropping it.
+        launch_kwargs["ignore_default_args"] = ["--mute-audio"]
+        chrome_args.append("--autoplay-policy=no-user-gesture-required")
+        _allow_out = os.environ.get("HERMES_MEET_ALLOW_AUDIO_OUTPUT", "").lower() in {"1", "true", "yes"}
+        if not realtime_enabled and not _allow_out:
+            chrome_args.append("--disable-audio-output")
+        launch_kwargs["args"] = chrome_args
+    return launch_kwargs
+
+
 def run_bot() -> int:
     cfg = _config_from_env()
     if not _is_safe_meet_url(cfg.url):
@@ -2211,14 +2245,8 @@ def run_bot() -> int:
         if rt["bridge"]:
             rt["bridge"].teardown()
         return 3
-    chrome_args = ["--use-fake-ui-for-media-stream", "--disable-blink-features=AutomationControlled"]
-    # The fake silent mic breaks remote audio reception in some Meet builds (A/B receipt
-    # 2026-09-21: spike with real-device grant captured speech, fake-device bot got digital
-    # silence) — HERMES_MEET_NO_FAKE_DEVICE=1 opts into the real media stack.
-    _no_fake = os.environ.get("HERMES_MEET_NO_FAKE_DEVICE", "").lower() in {"1", "true", "yes"}
-    if not rt["enabled"] and not _no_fake:
-        chrome_args.insert(1, "--use-fake-device-for-media-stream")  # silent fake mic
-    elif rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
+    launch_kwargs = _build_chromium_launch_kwargs(cfg, realtime_enabled=bool(rt["enabled"]))
+    if rt["enabled"] and rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
         # Playwright's launch() takes no env: set PULSE_SOURCE on ourselves so Chrome inherits it.
         os.environ["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
     context_args = dict(_CONTEXT_ARGS)
@@ -2259,15 +2287,6 @@ def run_bot() -> int:
 
     try:
         with sync_playwright() as pw:
-            launch_kwargs = dict(headless=not cfg.headed, args=chrome_args)
-            if cfg.headed:
-                chrome_args.append("--window-position=-2000,-2000")
-            if cfg.rtc_audio:
-                # headless Chromium ships --mute-audio by default — remote streams record
-                # as digital silence without dropping it.
-                launch_kwargs["ignore_default_args"] = ["--mute-audio"]
-                chrome_args.append("--autoplay-policy=no-user-gesture-required")
-                launch_kwargs["args"] = chrome_args
             browser = pw.chromium.launch(
                 channel="chromium", executable_path=chromium_executable(), **launch_kwargs)
             context = browser.new_context(**context_args)
