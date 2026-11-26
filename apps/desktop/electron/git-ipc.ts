@@ -25,6 +25,7 @@ import {
 } from './git-review-ops'
 import {
   addWorktree,
+  inspectWorktreeBeforeClose,
   listBaseBranches,
   listBranches,
   listWorktrees,
@@ -48,6 +49,10 @@ export function registerGitIpc({ resolveGitBinary, resolveGhBinary }: GitIpcDeps
 
   ipcMain.handle('hermes:git:worktreeRemove', async (_event, repoPath, worktreePath, options) =>
     removeWorktree(repoPath, worktreePath, options || {}, resolveGitBinary())
+  )
+
+  ipcMain.handle('hermes:git:worktreeInspectClose', async (_event, worktreePath) =>
+    inspectWorktreeBeforeClose(worktreePath, resolveGitBinary())
   )
 
   ipcMain.handle('hermes:git:branchSwitch', async (_event, repoPath, branch) =>

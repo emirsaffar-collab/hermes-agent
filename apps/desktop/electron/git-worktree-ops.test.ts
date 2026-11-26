@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -8,11 +9,19 @@ import { test } from 'vitest'
 
 import {
   addWorktree,
+  allocateWorktreePort,
+  canonicalWorktreePath,
   ensureGitRepo,
+  fnv1a32,
+  inspectWorktreeBeforeClose,
   listBaseBranches,
   listBranches,
   parseWorktrees,
+  preferredWorktreePort,
+  readWorktreeMeta,
+  resolveWorktreeGitDir,
   sanitizeBranch,
+  seedWorktreeIncludes,
   switchBranch
 } from './git-worktree-ops'
 
@@ -627,5 +636,292 @@ test('switchBranch: repo dir still validates the branch name and switches', asyn
     assert.deepEqual(result, { branch: 'main' })
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// Exact same 20-path parity vector asserted in
+// tests/hermes_cli/test_worktree_lifecycle.py.
+const FNV1A_PARITY_VECTORS: Array<[string, string, number, number]> = [
+  ['/', '/', 705468254, 24254],
+  ['/repo/.worktrees/feat-a', '/repo/.worktrees/feat-a', 3426949478, 24478],
+  ['/repo/.worktrees/feat-a/', '/repo/.worktrees/feat-a', 3426949478, 24478],
+  ['/repo//.worktrees/./feat-a', '/repo/.worktrees/feat-a', 3426949478, 24478],
+  ['/repo/sub/../.worktrees/feat-b', '/repo/.worktrees/feat-b', 3410171859, 24859],
+  ['/workspace/wt-p0-worktree-lifecycle', '/workspace/wt-p0-worktree-lifecycle', 295605217, 24217],
+  ['/workspace/wt-p0-inline-diff-review', '/workspace/wt-p0-inline-diff-review', 3861790023, 24023],
+  ['/home/dev/my project/.worktrees/branch-1', '/home/dev/my project/.worktrees/branch-1', 2343543345, 24345],
+  ['/srv/app/.worktrees/subagent-01234567', '/srv/app/.worktrees/subagent-01234567', 873649153, 24153],
+  ['/srv/app/.worktrees/subagent-89abcdef', '/srv/app/.worktrees/subagent-89abcdef', 4001957601, 24601],
+  [
+    '/opt/repos/hermes-agent/.worktrees/fix-utf8-åäö',
+    '/opt/repos/hermes-agent/.worktrees/fix-utf8-åäö',
+    937307044,
+    24044
+  ],
+  [
+    '/opt/repos/hermes-agent/.worktrees/日本語-ブランチ',
+    '/opt/repos/hermes-agent/.worktrees/日本語-ブランチ',
+    688011444,
+    24444
+  ],
+  ['/var/lib/ci/workspace-alpha/.worktrees/pr-42', '/var/lib/ci/workspace-alpha/.worktrees/pr-42', 2059532272, 24272],
+  ['/var/lib/ci/workspace-beta/.worktrees/pr-42', '/var/lib/ci/workspace-beta/.worktrees/pr-42', 376157556, 24556],
+  ['C:\\Users\\dev\\repo\\.worktrees\\feat-win', 'C:/Users/dev/repo/.worktrees/feat-win', 4281742425, 24425],
+  ['c:/Users/dev/repo/.worktrees/feat-win/', 'C:/Users/dev/repo/.worktrees/feat-win', 4281742425, 24425],
+  ['D:\\work\\a\\..\\b\\.worktrees\\task-9', 'D:/work/b/.worktrees/task-9', 2868306633, 24633],
+  ['/a/b/c/d/e/f/g/h/i/j/.worktrees/deep-tree', '/a/b/c/d/e/f/g/h/i/j/.worktrees/deep-tree', 285225627, 24627],
+  [
+    '/repo/.worktrees/feat_with_underscores.and.dots-123',
+    '/repo/.worktrees/feat_with_underscores.and.dots-123',
+    564407567,
+    24567
+  ],
+  ['/repo/.worktrees/edge-case@2026+build#7', '/repo/.worktrees/edge-case@2026+build#7', 4151808203, 24203]
+]
+
+test('fnv1a32 & preferredWorktreePort: exact 20-path parity with Python', () => {
+  assert.equal(FNV1A_PARITY_VECTORS.length, 20)
+
+  for (const [rawPath, expectedCanonical, expectedHash, expectedPort] of FNV1A_PARITY_VECTORS) {
+    const canonical = canonicalWorktreePath(rawPath)
+
+    assert.equal(canonical, expectedCanonical, `canonical mismatch for ${rawPath}`)
+    assert.equal(fnv1a32(canonical), expectedHash, `hash mismatch for ${rawPath}`)
+    const port = preferredWorktreePort(rawPath)
+
+    assert.equal(port, expectedPort, `port mismatch for ${rawPath}`)
+    assert.ok(port >= 24000 && port < 25000)
+  }
+})
+
+test('allocateWorktreePort: persists metadata and falls back linearly on bind collision', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-port-'))
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 't@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir })
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'root'], { cwd: dir })
+
+    const wtDir = path.join(dir, '.worktrees', 'port-collision')
+
+    execFileSync('git', ['worktree', 'add', wtDir, '-b', 'feat/port-collision'], { cwd: dir })
+
+    const preferred = preferredWorktreePort(wtDir)
+    const expectedNext = 24000 + ((preferred - 24000 + 1) % 1000)
+
+    const blocker = net.createServer()
+
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject)
+      blocker.listen({ host: '127.0.0.1', port: preferred, exclusive: true }, () => resolve())
+    })
+
+    try {
+      const allocated = await allocateWorktreePort(wtDir, {
+        probeBind: true,
+        branch: 'feat/port-collision',
+        baseRef: 'main'
+      })
+
+      assert.equal(allocated, expectedNext)
+
+      const gitDir = await resolveWorktreeGitDir(wtDir)
+
+      assert.ok(gitDir)
+      assert.ok(fs.existsSync(path.join(gitDir, 'hermes-worktree-meta.json')))
+
+      const meta = await readWorktreeMeta(wtDir)
+
+      assert.ok(meta)
+      assert.equal(meta.port, expectedNext)
+      assert.equal(meta.branch, 'feat/port-collision')
+      assert.equal(meta.baseRef, 'main')
+
+      // Re-allocating reuses the persisted free port deterministically.
+      assert.equal(await allocateWorktreePort(wtDir, { probeBind: true }), expectedNext)
+    } finally {
+      await new Promise<void>(resolve => blocker.close(() => resolve()))
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('addWorktree & seedWorktreeIncludes: seeds .env* with 0600, enforces guardrails, and returns port', async () => {
+  const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-seed-'))
+  const dir = path.join(outer, 'repo')
+
+  fs.mkdirSync(dir)
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 't@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir })
+    fs.writeFileSync(path.join(dir, '.env.example'), 'KEY=example\n')
+    fs.writeFileSync(
+      path.join(dir, '.gitignore'),
+      '.env\n.env.*\n!.env.example\n*.local.json\nnode_modules/\n.venv/\ntarget/\n.next/\ndist/\n'
+    )
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+
+    // Valid ignored .env
+    fs.writeFileSync(path.join(dir, '.env'), 'SECRET=hello\n')
+    // Unmatched ignored file
+    fs.writeFileSync(path.join(dir, 'extra.local.json'), '{"skip":true}\n')
+    // Symlink escaping repo root
+    const outsideFile = path.join(outer, 'outside-secret.txt')
+
+    fs.writeFileSync(outsideFile, 'ESCAPE=1\n')
+    fs.symlinkSync(outsideFile, path.join(dir, '.env.escape'))
+    // > 10 MB file
+    const hugePath = path.join(dir, '.env.huge')
+    const fd = fs.openSync(hugePath, 'w')
+
+    fs.writeSync(fd, Buffer.from('x'), 0, 1, 10 * 1024 * 1024 + 1)
+    fs.closeSync(fd)
+
+    // Heavy directories
+    for (const heavy of ['node_modules', '.venv', 'target', '.next', 'dist']) {
+      fs.mkdirSync(path.join(dir, heavy), { recursive: true })
+      fs.writeFileSync(path.join(dir, heavy, '.env'), `HEAVY=${heavy}\n`)
+    }
+
+    const res = await addWorktree(dir, { name: 'seeded' }, 'git')
+
+    assert.ok(res.port >= 24000 && res.port < 25000)
+    assert.deepEqual(res.seededFiles, ['.env'])
+    assert.equal(fs.readFileSync(path.join(res.path, '.env'), 'utf8'), 'SECRET=hello\n')
+    assert.equal(fs.existsSync(path.join(res.path, 'extra.local.json')), false)
+    assert.equal(fs.existsSync(path.join(res.path, '.env.escape')), false)
+    assert.equal(fs.existsSync(path.join(res.path, '.env.huge')), false)
+
+    for (const heavy of ['node_modules', '.venv', 'target', '.next', 'dist']) {
+      assert.equal(fs.existsSync(path.join(res.path, heavy, '.env')), false)
+    }
+
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(path.join(res.path, '.env')).mode & 0o777, 0o600)
+    }
+
+    // Re-seeding must never overwrite existing files.
+    fs.writeFileSync(path.join(res.path, '.env'), 'EDITED=keep\n')
+    const second = await seedWorktreeIncludes(dir, res.path, 'git')
+
+    assert.deepEqual(second, [])
+    assert.equal(fs.readFileSync(path.join(res.path, '.env'), 'utf8'), 'EDITED=keep\n')
+  } finally {
+    fs.rmSync(outer, { recursive: true, force: true })
+  }
+})
+
+test('seedWorktreeIncludes: custom .worktreeinclude supports globs, negation, and explicit heavy dirs', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-custom-'))
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 't@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir })
+    fs.writeFileSync(path.join(dir, '.gitignore'), '*.local.json\nsecrets/\ndist/\nnode_modules/\n')
+    fs.writeFileSync(
+      path.join(dir, '.worktreeinclude'),
+      '# custom rules\n*.local.json\nsecrets/**\n!secrets/skip.txt\ndist/.env\n'
+    )
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+
+    fs.writeFileSync(path.join(dir, 'app.local.json'), '{"a":1}\n')
+    fs.mkdirSync(path.join(dir, 'secrets'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'secrets', 'keep.txt'), 'keep\n')
+    fs.writeFileSync(path.join(dir, 'secrets', 'skip.txt'), 'skip\n')
+    fs.mkdirSync(path.join(dir, 'dist'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'dist', '.env'), 'DIST=1\n')
+    fs.mkdirSync(path.join(dir, 'node_modules'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'node_modules', '.env'), 'NM=1\n')
+
+    const res = await addWorktree(dir, { name: 'custom-inc' }, 'git')
+
+    assert.ok(res.seededFiles.includes('app.local.json'))
+    assert.ok(res.seededFiles.includes('secrets/keep.txt'))
+    assert.ok(res.seededFiles.includes('dist/.env'))
+    assert.equal(res.seededFiles.includes('secrets/skip.txt'), false)
+    assert.equal(fs.existsSync(path.join(res.path, 'secrets', 'skip.txt')), false)
+    assert.equal(fs.existsSync(path.join(res.path, 'node_modules', '.env')), false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('inspectWorktreeBeforeClose: clean, dirty, unpushed (upstream & no-upstream), and detached HEAD', async () => {
+  const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-inspect-'))
+  const remoteDir = path.join(outer, 'remote.git')
+  const repoDir = path.join(outer, 'repo')
+
+  try {
+    execFileSync('git', ['init', '--bare', '-b', 'main', remoteDir])
+    execFileSync('git', ['clone', remoteDir, repoDir])
+    execFileSync('git', ['config', 'user.email', 't@example.com'], { cwd: repoDir })
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: repoDir })
+    fs.writeFileSync(path.join(repoDir, 'file.txt'), 'v1\n')
+    execFileSync('git', ['add', '.'], { cwd: repoDir })
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repoDir })
+    execFileSync('git', ['push', '-u', 'origin', 'main'], { cwd: repoDir })
+
+    // 1. Clean worktree with no upstream
+    const wt = await addWorktree(repoDir, { name: 'inspect-wt', branch: 'feat/inspect-wt' }, 'git')
+    const clean = await inspectWorktreeBeforeClose(wt.path, 'git')
+
+    assert.equal(clean.dirtyFiles, 0)
+    assert.equal(clean.unpushedCommits, 0)
+    assert.equal(clean.branch, 'feat/inspect-wt')
+    assert.equal(clean.port, wt.port)
+
+    // 2. Dirty worktree (1 modified tracked + 1 untracked = 2 dirty files)
+    fs.writeFileSync(path.join(wt.path, 'file.txt'), 'v2\n')
+    fs.writeFileSync(path.join(wt.path, 'untracked.txt'), 'new\n')
+    const dirty = await inspectWorktreeBeforeClose(wt.path, 'git')
+
+    assert.equal(dirty.dirtyFiles, 2)
+    assert.equal(dirty.unpushedCommits, 0)
+
+    // 3. Unpushed commits without upstream (compared against baseRef)
+    execFileSync('git', ['add', '.'], { cwd: wt.path })
+    execFileSync('git', ['commit', '-m', 'commit 1'], { cwd: wt.path })
+    fs.writeFileSync(path.join(wt.path, 'file2.txt'), 'two\n')
+    execFileSync('git', ['add', '.'], { cwd: wt.path })
+    execFileSync('git', ['commit', '-m', 'commit 2'], { cwd: wt.path })
+
+    const noUpstream = await inspectWorktreeBeforeClose(wt.path, 'git')
+
+    assert.equal(noUpstream.dirtyFiles, 0)
+    assert.equal(noUpstream.unpushedCommits, 2)
+    assert.equal(noUpstream.branch, 'feat/inspect-wt')
+
+    // 4. Push branch to establish upstream -> unpushed becomes 0, then add 1 local commit -> unpushed becomes 1
+    execFileSync('git', ['push', '-u', 'origin', 'feat/inspect-wt'], { cwd: wt.path })
+    const pushed = await inspectWorktreeBeforeClose(wt.path, 'git')
+
+    assert.equal(pushed.unpushedCommits, 0)
+
+    fs.writeFileSync(path.join(wt.path, 'file3.txt'), 'three\n')
+    execFileSync('git', ['add', '.'], { cwd: wt.path })
+    execFileSync('git', ['commit', '-m', 'commit 3'], { cwd: wt.path })
+
+    const aheadOfUpstream = await inspectWorktreeBeforeClose(wt.path, 'git')
+
+    assert.equal(aheadOfUpstream.unpushedCommits, 1)
+
+    // 5. Detached HEAD still inspects dirtyFiles, unpushedCommits, and port accurately
+    execFileSync('git', ['checkout', '--detach', 'HEAD'], { cwd: wt.path })
+    fs.writeFileSync(path.join(wt.path, 'detached-dirty.txt'), 'x\n')
+    const detached = await inspectWorktreeBeforeClose(wt.path, 'git')
+
+    assert.equal(detached.branch, null)
+    assert.equal(detached.dirtyFiles, 1)
+    assert.equal(detached.unpushedCommits, 3)
+    assert.equal(detached.port, wt.port)
+  } finally {
+    fs.rmSync(outer, { recursive: true, force: true })
   }
 })

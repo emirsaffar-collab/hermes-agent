@@ -584,12 +584,13 @@ declare global {
         worktreeAdd: (
           repoPath: string,
           options?: { name?: string; branch?: string; base?: string; existingBranch?: string }
-        ) => Promise<{ path: string; branch: string; repoRoot: string }>
+        ) => Promise<{ path: string; branch: string; repoRoot: string; port?: number; seededFiles?: string[] }>
         worktreeRemove: (
           repoPath: string,
           worktreePath: string,
           options?: { force?: boolean }
         ) => Promise<{ removed: string }>
+        worktreeInspectClose?: (worktreePath: string) => Promise<HermesWorktreeCloseInspection>
         branchSwitch: (repoPath: string, branch: string) => Promise<{ branch: string }>
         // The local branches, plus the remote-tracking refs that have no local
         // branch, for the "convert a branch into a worktree" picker.
@@ -1803,6 +1804,13 @@ export interface HermesGitWorktree {
   isMain: boolean
   detached: boolean
   locked: boolean
+}
+
+export interface HermesWorktreeCloseInspection {
+  dirtyFiles: number
+  unpushedCommits: number
+  branch: null | string
+  port: null | number
 }
 
 // A branch that the "convert a branch into a worktree" picker offers: the local

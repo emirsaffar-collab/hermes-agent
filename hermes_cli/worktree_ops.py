@@ -5,18 +5,21 @@ bounded timeout). Classification helpers fail SAFE toward "preserve". ``cli`` re
 these names; ``_cprint`` is imported lazily from ``cli`` to avoid a cycle.
 """
 import concurrent.futures
+from datetime import UTC, datetime
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.git_commit_graph import (
@@ -272,6 +275,221 @@ def _ensure_worktrees_gitignored(repo_root: str) -> None:
         logger.debug("Could not update .gitignore: %s", e)
 
 
+WORKTREE_PORT_BASE = 24000
+WORKTREE_PORT_SPAN = 1000
+WORKTREE_PORT_PROBE_SLOTS = 32
+FNV1A_32_OFFSET = 0x811C9DC5
+FNV1A_32_PRIME = 0x01000193
+WORKTREE_META_FILENAME = "hermes-worktree-meta.json"
+
+WORKTREE_INCLUDE_MAX_FILE_BYTES = 10 * 1024 * 1024
+WORKTREE_INCLUDE_DEFAULT_PATTERNS = (".env*",)
+WORKTREE_INCLUDE_HEAVY_DIRS = frozenset({"node_modules", ".venv", "target", ".next", "dist"})
+
+_WIN_DRIVE_RE = re.compile(r"^([A-Za-z]):(/.*)?$")
+_GLOB_META_CHARS = frozenset("*?[")
+
+
+def fnv1a_32(text: str) -> int:
+    """Compute unsigned 32-bit FNV-1a hash of *text* encoded as UTF-8.
+
+    Matches TypeScript ``fnv1a32`` in ``apps/desktop/electron/git-worktree-ops.ts``
+    bit-for-bit across ASCII and non-ASCII UTF-8 strings.
+    """
+    h = FNV1A_32_OFFSET
+    for byte in text.encode("utf-8"):
+        h ^= byte
+        h = (h * FNV1A_32_PRIME) & 0xFFFFFFFF
+    return h
+
+
+def canonical_worktree_path(wt_path: str) -> str:
+    """Normalize *wt_path* to a canonical POSIX absolute path for deterministic hashing.
+
+    Resolves symlinks only when the target exists on disk so synthetic paths (e.g.
+    ``/tmp/...`` on macOS) hash identically across Python and Node.js.
+    """
+    raw = str(wt_path or "").strip()
+    if not raw:
+        return "/"
+    normalized = raw.replace("\\", "/")
+    win_match = _WIN_DRIVE_RE.match(normalized)
+    if win_match:
+        drive = win_match.group(1).upper()
+        rest = re.sub(r"^/+", "/", win_match.group(2) or "/")
+        norm_rest = posixpath.normpath(rest)
+        if norm_rest == ".":
+            norm_rest = "/"
+        if not norm_rest.startswith("/"):
+            norm_rest = "/" + norm_rest
+        if len(norm_rest) > 1:
+            norm_rest = norm_rest.rstrip("/")
+        return f"{drive}:{norm_rest}"
+
+    if not normalized.startswith("/"):
+        normalized = os.path.abspath(raw).replace("\\", "/")
+
+    if os.path.exists(normalized):
+        try:
+            normalized = os.path.realpath(normalized).replace("\\", "/")
+        except OSError:
+            pass
+
+    win_after = _WIN_DRIVE_RE.match(normalized)
+    if win_after:
+        drive = win_after.group(1).upper()
+        rest = re.sub(r"^/+", "/", win_after.group(2) or "/")
+        norm_rest = posixpath.normpath(rest)
+        if norm_rest == ".":
+            norm_rest = "/"
+        if not norm_rest.startswith("/"):
+            norm_rest = "/" + norm_rest
+        if len(norm_rest) > 1:
+            norm_rest = norm_rest.rstrip("/")
+        return f"{drive}:{norm_rest}"
+
+    normalized = re.sub(r"^/+", "/", normalized)
+    norm = posixpath.normpath(normalized)
+    if len(norm) > 1:
+        norm = norm.rstrip("/")
+    return norm
+
+
+def preferred_worktree_port(wt_path: str) -> int:
+    """Deterministic preferred dev-server port in ``24000..24999`` for *wt_path*."""
+    canonical = canonical_worktree_path(wt_path)
+    return WORKTREE_PORT_BASE + (fnv1a_32(canonical) % WORKTREE_PORT_SPAN)
+
+
+def _is_tcp_port_available(port: int, host: str = "127.0.0.1") -> bool:
+    """Return True when *port* can be bound on *host* without ``SO_REUSEADDR``."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def resolve_worktree_git_dir(wt_path: str | Path) -> Optional[Path]:
+    """Return the per-worktree gitdir for *wt_path*, or None if not a git checkout."""
+    tree = Path(wt_path)
+    if not tree.exists():
+        return None
+    dot_git = tree / ".git"
+    try:
+        if dot_git.is_dir():
+            return dot_git.resolve()
+        if dot_git.is_file():
+            content = dot_git.read_text(encoding="utf-8-sig", errors="replace").strip()
+            if content.startswith("gitdir:"):
+                target = content[len("gitdir:"):].strip()
+                if target:
+                    return (tree / target).resolve()
+        gd = _git_out(["rev-parse", "--git-dir"], str(tree), timeout=5,
+                      stdin=subprocess.DEVNULL, env=noninteractive_git_env())
+        if gd:
+            return (tree / gd).resolve()
+    except Exception as e:
+        logger.debug("resolve_worktree_git_dir failed for %s: %s", wt_path, e)
+    return None
+
+
+def read_worktree_meta(wt_path: str | Path) -> Optional[dict[str, Any]]:
+    """Read ``<gitdir>/hermes-worktree-meta.json`` if present and valid."""
+    git_dir = resolve_worktree_git_dir(wt_path)
+    if git_dir is None:
+        return None
+    meta_path = git_dir / WORKTREE_META_FILENAME
+    try:
+        if not meta_path.is_file():
+            return None
+        data = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        logger.debug("read_worktree_meta failed for %s: %s", meta_path, e)
+        return None
+
+
+def write_worktree_meta(wt_path: str | Path, meta: dict[str, Any]) -> Optional[Path]:
+    """Atomically persist *meta* into ``<gitdir>/hermes-worktree-meta.json`` (fail-soft)."""
+    git_dir = resolve_worktree_git_dir(wt_path)
+    if git_dir is None:
+        return None
+    meta_path = git_dir / WORKTREE_META_FILENAME
+    try:
+        atomic_json_write(meta_path, meta)
+        return meta_path
+    except Exception as e:
+        logger.debug("write_worktree_meta failed for %s: %s", meta_path, e)
+        return None
+
+
+def _is_valid_worktree_port(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and WORKTREE_PORT_BASE <= value < WORKTREE_PORT_BASE + WORKTREE_PORT_SPAN
+    )
+
+
+def allocate_worktree_port(
+    wt_path: str,
+    *,
+    probe_bind: bool = True,
+    branch: Optional[str] = None,
+    base_ref: Optional[str] = None,
+) -> int:
+    """Allocate a deterministic dev-server port in ``24000..24999`` for *wt_path*.
+
+    Reuses a previously persisted port from ``<gitdir>/hermes-worktree-meta.json`` when
+    valid and free; otherwise hashes ``canonical_worktree_path(wt_path)`` via FNV-1a and
+    probes linearly up to 32 slots on ``127.0.0.1`` when *probe_bind* is True. Persists
+    the chosen port to ``<gitdir>/hermes-worktree-meta.json`` when *wt_path* is a git checkout.
+    """
+    canonical = canonical_worktree_path(wt_path)
+    existing = read_worktree_meta(wt_path) or {}
+    saved_port = existing.get("port")
+
+    chosen: Optional[int] = None
+    if _is_valid_worktree_port(saved_port):
+        assert isinstance(saved_port, int)
+        if not probe_bind or _is_tcp_port_available(saved_port):
+            chosen = saved_port
+
+    if chosen is None:
+        base_offset = fnv1a_32(canonical) % WORKTREE_PORT_SPAN
+        preferred = WORKTREE_PORT_BASE + base_offset
+        if not probe_bind:
+            chosen = preferred
+        else:
+            for slot in range(WORKTREE_PORT_PROBE_SLOTS):
+                candidate = WORKTREE_PORT_BASE + ((base_offset + slot) % WORKTREE_PORT_SPAN)
+                if _is_tcp_port_available(candidate):
+                    chosen = candidate
+                    break
+            if chosen is None:
+                logger.debug("All %d probed worktree ports busy for %s; falling back to %d",
+                             WORKTREE_PORT_PROBE_SLOTS, canonical, preferred)
+                chosen = preferred
+
+    meta: dict[str, Any] = {
+        **existing,
+        "version": 1,
+        "port": chosen,
+        "worktreePath": canonical,
+        "updatedAt": datetime.now(UTC).isoformat(),
+    }
+    if branch is not None:
+        meta["branch"] = branch
+    if base_ref is not None:
+        meta["baseRef"] = base_ref
+    write_worktree_meta(wt_path, meta)
+    return chosen
+
+
 def _worktreeinclude_entries(repo_root) -> list:
     """Non-blank, non-comment entries of *repo_root*/``.worktreeinclude`` (``[]`` when absent).
 
@@ -289,49 +507,273 @@ def _worktreeinclude_entries(repo_root) -> list:
     return entries
 
 
-def _copy_worktree_includes(repo_root: str, wt_path: Path) -> None:
-    """Copy/symlink the entries listed in ``.worktreeinclude`` (gitignored files the agent needs)."""
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a gitignore-style glob (``*``, ``?``, ``**``, ``[abc]``) to an anchored regex."""
+    i = 0
+    n = len(pattern)
+    parts: list[str] = ["^"]
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if i + 1 < n and pattern[i + 1] == "*":
+                if i + 2 < n and pattern[i + 2] == "/":
+                    parts.append("(?:.*/)?")
+                    i += 3
+                else:
+                    parts.append(".*")
+                    i += 2
+            else:
+                parts.append("[^/]*")
+                i += 1
+        elif c == "?":
+            parts.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = i + 1
+            if j < n and pattern[j] in ("!", "^"):
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j >= n:
+                parts.append(re.escape(c))
+                i += 1
+            else:
+                inner = pattern[i + 1:j]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                parts.append(f"[{inner}]")
+                i = j + 1
+        else:
+            parts.append(re.escape(c))
+            i += 1
+    parts.append("$")
+    return re.compile("".join(parts))
+
+
+def _match_single_include_pattern(rel_posix: str, pattern: str) -> bool:
+    """Return True when relative POSIX path *rel_posix* matches positive include *pattern*."""
+    pat = pattern.strip().replace("\\", "/")
+    if not pat:
+        return False
+    anchored = pat.startswith("/")
+    dir_only = pat.endswith("/")
+    cleaned = pat.lstrip("/").rstrip("/")
+    if not cleaned:
+        return False
+
+    if dir_only:
+        if "/" in cleaned or anchored:
+            if rel_posix == cleaned or rel_posix.startswith(cleaned + "/"):
+                return True
+            return bool(_glob_to_regex(cleaned + "/**").match(rel_posix))
+        seg_re = _glob_to_regex(cleaned)
+        return any(seg_re.match(seg) for seg in rel_posix.split("/")[:-1])
+
+    if "/" not in cleaned and not anchored:
+        regex = _glob_to_regex(cleaned)
+        basename = rel_posix.rsplit("/", 1)[-1]
+        if regex.match(rel_posix) or regex.match(basename):
+            return True
+        if not any(ch in cleaned for ch in _GLOB_META_CHARS):
+            return rel_posix.startswith(cleaned + "/")
+        return False
+
+    if _glob_to_regex(cleaned).match(rel_posix):
+        return True
+    if not any(ch in cleaned for ch in _GLOB_META_CHARS):
+        return rel_posix.startswith(cleaned + "/")
+    return False
+
+
+def _pattern_explicitly_names_dir(pattern: str, dir_name: str) -> bool:
+    """True when *pattern* explicitly names heavy directory *dir_name* as a path segment."""
+    cleaned = pattern.strip().replace("\\", "/").lstrip("/").rstrip("/")
+    segments = [seg for seg in cleaned.split("/") if seg]
+    return dir_name in segments
+
+
+def _copy_seed_file(src_resolved: Path, dst: Path, wt_path_resolved: Path, rel_posix: str) -> bool:
+    """Copy one validated seed file into *dst* without overwriting, enforcing 10 MB & 0600 rules."""
     try:
-        entries = _worktreeinclude_entries(repo_root)
-        if not entries:
-            return
-        repo_root_resolved = Path(repo_root).resolve()
-        wt_path_resolved = wt_path.resolve()
-        for entry in entries:
-            src, dst = Path(repo_root) / entry, wt_path / entry
-            # Traversal/symlink-escape guard: both resolved endpoints must stay inside their roots.
+        if not src_resolved.is_file():
+            return False
+        if os.path.lexists(dst):
+            return False
+        size = src_resolved.stat().st_size
+        if size > WORKTREE_INCLUDE_MAX_FILE_BYTES:
+            logger.warning("Skipping worktree include > 10 MB (%d bytes): %s", size, rel_posix)
+            return False
+        dst_resolved = dst.resolve(strict=False)
+        if not _path_is_within_root(dst_resolved, wt_path_resolved):
+            logger.warning("Skipping worktree include escaping worktree root: %s", rel_posix)
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src_resolved), str(dst))
+        if Path(rel_posix).name.startswith(".env") and os.name != "nt":
+            os.chmod(dst, 0o600)
+        return True
+    except OSError as e:
+        logger.debug("Skipping unreadable/uncopyable worktree include %s: %s", rel_posix, e)
+        return False
+
+
+def seed_worktree_includes(main_root: str | Path, wt_path: str | Path) -> list[str]:
+    """Seed gitignored files matching ``.worktreeinclude`` (default: ``.env*``) into *wt_path*.
+
+    Guardrails:
+    - Defaults to ``.env*`` when ``.worktreeinclude`` is absent.
+    - Uses ``git ls-files -z --others --ignored --exclude-standard`` (no shell) to discover
+      ignored files cleanly, plus handles explicit non-glob literal file/dir entries listed in
+      ``.worktreeinclude`` (symlinking explicitly named directories like ``.venv``/``node_modules``).
+    - Rejects path traversals and symlinks escaping *main_root* or *wt_path*.
+    - Skips files larger than 10 MB.
+    - Skips heavy directories (``node_modules/``, ``.venv/``, ``target/``, ``.next/``, ``dist/``)
+      unless explicitly named by a ``.worktreeinclude`` pattern.
+    - Never overwrites an existing file or symlink in *wt_path*.
+    - Preserves/enforces ``0600`` permissions on ``.env*`` files on POSIX.
+    """
+    main_root_path = Path(main_root)
+    wt_root_path = Path(wt_path)
+    main_root_resolved = main_root_path.resolve()
+    wt_path_resolved = wt_root_path.resolve()
+
+    include_file = main_root_path / ".worktreeinclude"
+    has_custom = include_file.is_file()
+    patterns = _worktreeinclude_entries(main_root_path) if has_custom else list(WORKTREE_INCLUDE_DEFAULT_PATTERNS)
+    if not patterns:
+        return []
+
+    seeded: list[str] = []
+    seeded_set: set[str] = set()
+    symlinked_dirs: list[str] = []
+
+    # Pass 1: explicit non-glob literal entries in .worktreeinclude (preserves directory symlinking
+    # and explicitly named untracked files even when not listed in .gitignore).
+    if has_custom:
+        for entry in patterns:
+            if entry.startswith("!") or any(ch in entry for ch in _GLOB_META_CHARS):
+                continue
+            cleaned_entry = entry.replace("\\", "/").lstrip("/")
+            if not cleaned_entry:
+                continue
+            src = main_root_path / cleaned_entry
+            dst = wt_root_path / cleaned_entry
             try:
                 src_resolved = src.resolve(strict=False)
                 dst_resolved = dst.resolve(strict=False)
             except (OSError, ValueError):
                 logger.debug("Skipping invalid .worktreeinclude entry: %s", entry)
                 continue
-            if not _path_is_within_root(src_resolved, repo_root_resolved):
+            if not _path_is_within_root(src_resolved, main_root_resolved):
                 logger.warning("Skipping .worktreeinclude entry outside repo root: %s", entry)
                 continue
             if not _path_is_within_root(dst_resolved, wt_path_resolved):
                 logger.warning("Skipping .worktreeinclude entry that escapes worktree: %s", entry)
                 continue
-            if src.is_file():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(src), str(dst))
-            elif src.is_dir() and not dst.exists():
-                # Symlink directories (no disk). Windows needs Developer Mode for symlinks: copy there.
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    os.symlink(str(src_resolved), str(dst))
-                except (OSError, NotImplementedError) as _sym_err:
-                    if sys.platform != "win32":
-                        raise
-                    logger.info(".worktreeinclude: symlink failed (%s) — falling back to copytree on Windows.",
-                                _sym_err)
+            rel_posix = cleaned_entry.rstrip("/")
+            if src.is_dir():
+                if not os.path.lexists(dst):
+                    dst.parent.mkdir(parents=True, exist_ok=True)
                     try:
-                        shutil.copytree(str(src_resolved), str(dst), symlinks=True, dirs_exist_ok=False)
-                    except Exception as _copy_err:
-                        logger.warning(".worktreeinclude: copy fallback also failed for %s -> %s: %s",
-                                       src, dst, _copy_err)
+                        os.symlink(str(src_resolved), str(dst))
+                    except (OSError, NotImplementedError) as _sym_err:
+                        if sys.platform != "win32":
+                            raise
+                        logger.info(".worktreeinclude: symlink failed (%s) — falling back to copytree on Windows.",
+                                    _sym_err)
+                        try:
+                            shutil.copytree(str(src_resolved), str(dst), symlinks=True, dirs_exist_ok=False)
+                        except Exception as _copy_err:
+                            logger.warning(".worktreeinclude: copy fallback also failed for %s -> %s: %s",
+                                           src, dst, _copy_err)
+                            continue
+                    symlinked_dirs.append(rel_posix)
+                    if rel_posix not in seeded_set:
+                        seeded_set.add(rel_posix)
+                        seeded.append(rel_posix)
+            elif src.is_file():
+                if _copy_seed_file(src_resolved, dst, wt_path_resolved, rel_posix):
+                    if rel_posix not in seeded_set:
+                        seeded_set.add(rel_posix)
+                        seeded.append(rel_posix)
+
+    # Pass 2: ignored files discovered via git ls-files -z --others --ignored --exclude-standard.
+    try:
+        ls_result = _git(
+            ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"],
+            str(main_root_path),
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+            env=noninteractive_git_env(),
+        )
+    except Exception as e:
+        logger.debug("git ls-files for worktree seeding failed: %s", e)
+        return seeded
+
+    if ls_result.returncode != 0:
+        return seeded
+
+    for rel_raw in ls_result.stdout.split("\0"):
+        if not rel_raw:
+            continue
+        rel_posix = rel_raw.replace("\\", "/").lstrip("/")
+        if not rel_posix or rel_posix in seeded_set:
+            continue
+        parts = rel_posix.split("/")
+        if ".." in parts or parts[0] in (".git", ".worktrees"):
+            continue
+        if any(rel_posix == d or rel_posix.startswith(d + "/") for d in symlinked_dirs):
+            continue
+
+        matched_pattern: Optional[str] = None
+        for pat in patterns:
+            if pat.startswith("!"):
+                if _match_single_include_pattern(rel_posix, pat[1:]):
+                    matched_pattern = None
+            elif _match_single_include_pattern(rel_posix, pat):
+                matched_pattern = pat
+        if matched_pattern is None:
+            continue
+
+        # Heavy-directory guardrail: skip node_modules/, .venv/, target/, .next/, dist/
+        # unless a .worktreeinclude pattern explicitly names that directory.
+        parent_parts = parts[:-1]
+        blocked_heavy = False
+        for seg in parent_parts:
+            if seg in WORKTREE_INCLUDE_HEAVY_DIRS:
+                if not (has_custom and _pattern_explicitly_names_dir(matched_pattern, seg)):
+                    blocked_heavy = True
+                    break
+        if blocked_heavy:
+            continue
+
+        src = main_root_path / rel_posix
+        dst = wt_root_path / rel_posix
+        try:
+            if not src.exists():
+                continue
+            src_resolved = src.resolve(strict=True)
+        except OSError:
+            continue
+        if not _path_is_within_root(src_resolved, main_root_resolved):
+            logger.warning("Skipping worktree include symlink escaping repo root: %s", rel_posix)
+            continue
+        if _copy_seed_file(src_resolved, dst, wt_path_resolved, rel_posix):
+            seeded_set.add(rel_posix)
+            seeded.append(rel_posix)
+
+    return seeded
+
+
+def _copy_worktree_includes(repo_root: str, wt_path: Path) -> list[str]:
+    """Copy/symlink the entries listed in ``.worktreeinclude`` (or default ``.env*``)."""
+    try:
+        return seed_worktree_includes(repo_root, wt_path)
     except Exception as e:
         logger.debug("Error copying .worktreeinclude entries: %s", e)
+        return []
 
 
 def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str, base_label: str):
@@ -375,7 +817,7 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
 
 
 def _setup_worktree(repo_root: str | None = None, sync_base: bool = True,
-                    name: Optional[str] = None, retain_db=None) -> Optional[dict[str, str]]:
+                    name: Optional[str] = None, retain_db=None) -> Optional[dict[str, Any]]:
     """Create an isolated git worktree -> ``{path, branch, repo_root, base}``, or None on failure.
 
     *sync_base* branches from the fetched remote tip (``_resolve_worktree_base``), else local
@@ -417,7 +859,8 @@ def _setup_worktree(repo_root: str | None = None, sync_base: bool = True,
     if added is None:
         return None
     base_ref, base_label = added
-    _copy_worktree_includes(repo_root, wt_path)
+    seeded_files = _copy_worktree_includes(repo_root, wt_path)
+    port = allocate_worktree_port(str(wt_path), branch=branch_name, base_ref=base_ref)
 
     # Lock so other processes (and `git worktree remove`) see it is in use; fail-soft.
     try:
@@ -435,7 +878,14 @@ def _setup_worktree(repo_root: str | None = None, sync_base: bool = True,
     _cprint(f"\033[32m✓ Worktree created:\033[0m {wt_path}")
     print(f"  Branch: {branch_name}")
     print(f"  Base:   {base_label}")
-    return {"path": str(wt_path), "branch": branch_name, "repo_root": repo_root, "base": base_ref}
+    return {
+        "path": str(wt_path),
+        "branch": branch_name,
+        "repo_root": repo_root,
+        "base": base_ref,
+        "port": port,
+        "seeded_files": seeded_files,
+    }
 
 
 _REMOTE_TRUNK_CANDIDATES = ("origin/HEAD", "origin/main", "origin/master")

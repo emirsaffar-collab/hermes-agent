@@ -304,10 +304,68 @@ class SubagentWorktreeTests(unittest.TestCase):
 
     def test_context_note_names_path_and_branch(self):
         note = sw.build_worktree_context_note(
-            {"path": "/x/wt", "branch": "hermes-subagent/subagent-1"}
+            {"path": "/x/wt", "branch": "hermes-subagent/subagent-1", "port": 24478}
         )
         self.assertIn("/x/wt", note)
         self.assertIn("hermes-subagent/subagent-1", note)
+        self.assertIn("HERMES_WORKTREE_PORT=24478", note)
+
+    def test_create_seeds_env_and_allocates_worktree_port_with_guardrails(self):
+        repo = _make_repo(self.tmp)
+        (repo / ".gitignore").write_text(
+            ".env\n.env.*\nnode_modules/\n", encoding="utf-8"
+        )
+        _git(["add", ".gitignore"], repo)
+        _git(["commit", "-q", "-m", "add gitignore"], repo)
+
+        (repo / ".env").write_text("API_SECRET=xyz\n", encoding="utf-8")
+        outside = self.tmp / "outside.txt"
+        outside.write_text("NOPE=1\n", encoding="utf-8")
+        (repo / ".env.escape").symlink_to(outside)
+        (repo / "node_modules").mkdir()
+        (repo / "node_modules" / ".env").write_text("NM=1\n", encoding="utf-8")
+        huge = repo / ".env.huge"
+        with huge.open("wb") as fh:
+            fh.seek(10 * 1024 * 1024 + 1)
+            fh.write(b"x")
+
+        info = sw.create_subagent_worktree(str(repo), "seedport")
+        assert info is not None
+        wt = Path(info["path"])
+        self.assertEqual(info["seeded_files"], [".env"])
+        self.assertTrue((wt / ".env").is_file())
+        self.assertEqual((wt / ".env").read_text(encoding="utf-8"), "API_SECRET=xyz\n")
+        self.assertFalse((wt / ".env.escape").exists())
+        self.assertFalse((wt / ".env.huge").exists())
+        self.assertFalse((wt / "node_modules" / ".env").exists())
+
+        self.assertIsInstance(info["port"], int)
+        self.assertGreaterEqual(info["port"], 24000)
+        self.assertLess(info["port"], 25000)
+        self.assertEqual(
+            sw.subagent_worktree_env(info),
+            {"HERMES_WORKTREE_PORT": str(info["port"])},
+        )
+
+        from hermes_cli.worktree_ops import read_worktree_meta
+        meta = read_worktree_meta(wt)
+        assert meta is not None
+        self.assertEqual(meta["port"], info["port"])
+
+    def test_delegated_child_context_injects_hermes_worktree_port_env(self):
+        from agent.delegation_context import (
+            current_worktree_port,
+            delegated_child_context,
+            delegated_child_subprocess_env,
+        )
+
+        self.assertIsNone(current_worktree_port())
+        with delegated_child_context("child-wt", worktree_port=24321):
+            self.assertEqual(current_worktree_port(), 24321)
+            env = delegated_child_subprocess_env({"PATH": "/usr/bin"})
+            assert env is not None
+            self.assertEqual(env.get("HERMES_WORKTREE_PORT"), "24321")
+        self.assertIsNone(current_worktree_port())
 
 
 class WorktreePayloadSchemaTests(unittest.TestCase):

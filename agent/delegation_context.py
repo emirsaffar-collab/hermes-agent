@@ -16,8 +16,10 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
+_WORKTREE_PORT: ContextVar[int | None] = ContextVar("hermes_worktree_port", default=None)
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
+WORKTREE_PORT_ENV_KEY = "HERMES_WORKTREE_PORT"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
@@ -26,18 +28,34 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 
 
 @contextmanager
-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
+def delegated_child_context(
+    session_id: str | None = None,
+    *,
+    worktree_port: int | None = None,
+) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity. Even a context
     entered without an id must restore the parent's session ContextVar (child
     construction calls ``set_current_session_id``)."""
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    valid_port = (
+        worktree_port
+        if isinstance(worktree_port, int) and not isinstance(worktree_port, bool) and worktree_port > 0
+        else None
+    )
+    port_token = _WORKTREE_PORT.set(valid_port)
     try:
         from gateway.session_context import scoped_current_session_id  # lazy: it calls is_delegated_child_context()
 
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _WORKTREE_PORT.reset(port_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
+
+
+def current_worktree_port() -> int | None:
+    """Return the active delegated child's allocated worktree port, if any."""
+    return _WORKTREE_PORT.get()
 
 
 def is_delegated_child_context() -> bool:
@@ -181,7 +199,15 @@ def delegated_child_subprocess_env(
     Location and credentials are untouched; callers retain their existing secret policy.
     Dispatcher workers and supervised tool transports grant their own explicit scope.
     """
+    wt_port = _WORKTREE_PORT.get()
     if not (is_delegated_child_process_context() or os.environ.get("HERMES_KANBAN_TASK")
             or (env and (env.get("HERMES_KANBAN_TASK") or env.get(DELEGATED_CHILD_ENV_MARKER)))):
+        if wt_port is not None:
+            out = dict(os.environ if env is None else env)
+            out[WORKTREE_PORT_ENV_KEY] = str(wt_port)
+            return out
         return None if env is None else dict(env)
-    return scrub_kanban_env(os.environ if env is None else env)
+    cleaned = scrub_kanban_env(os.environ if env is None else env)
+    if wt_port is not None:
+        cleaned[WORKTREE_PORT_ENV_KEY] = str(wt_port)
+    return cleaned

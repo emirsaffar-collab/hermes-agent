@@ -1,11 +1,11 @@
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new-session-drag'
 import { Codicon } from '@/components/ui/codicon'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
-import type { HermesGitWorktree } from '@/global'
+import type { HermesGitWorktree, HermesWorktreeCloseInspection } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { displayPath } from '@/lib/display-path'
@@ -18,7 +18,7 @@ import {
 } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import type { AgentProfileRoute } from '@/store/profile'
-import { removeWorktreePath } from '@/store/projects'
+import { inspectWorktreeClose, removeWorktreePath } from '@/store/projects'
 
 import { SidebarRowStack } from '../chrome'
 
@@ -182,6 +182,58 @@ function RepoFlatSection({
   // instead of erroring (those changes are usually throwaway).
   const [removeTarget, setRemoveTarget] = useState<null | SidebarSessionGroup>(null)
   const [forceTarget, setForceTarget] = useState<null | SidebarSessionGroup>(null)
+  const [closeInspection, setCloseInspection] = useState<HermesWorktreeCloseInspection | null>(null)
+
+  useEffect(() => {
+    const inspectPath = removeTarget?.path || forceTarget?.path
+
+    if (!inspectPath) {
+      setCloseInspection(null)
+
+      return
+    }
+
+    let cancelled = false
+
+    setCloseInspection(null)
+    void inspectWorktreeClose(inspectPath, owner).then(info => {
+      if (!cancelled) {
+        setCloseInspection(info)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [forceTarget?.path, owner, removeTarget?.path])
+
+  const formatCloseDescription = (base: string): string => {
+    if (!closeInspection) {
+      return base
+    }
+
+    const details: string[] = []
+
+    if (closeInspection.dirtyFiles > 0) {
+      details.push(`${closeInspection.dirtyFiles} dirty file${closeInspection.dirtyFiles === 1 ? '' : 's'}`)
+    }
+
+    if (closeInspection.unpushedCommits > 0) {
+      details.push(
+        `${closeInspection.unpushedCommits} unpushed commit${closeInspection.unpushedCommits === 1 ? '' : 's'}`
+      )
+    }
+
+    if (closeInspection.port) {
+      details.push(`port :${closeInspection.port}`)
+    }
+
+    if (details.length === 0) {
+      return base
+    }
+
+    return `${base} (${details.join(' · ')})`
+  }
 
   const removeViaGit = async (group: SidebarSessionGroup, force = false) => {
     if (!repo.path || !group.path) {
@@ -256,14 +308,14 @@ function RepoFlatSection({
       {worktreeDialog(
         removeTarget,
         setRemoveTarget,
-        s.projects.removeWorktreeConfirm,
+        formatCloseDescription(s.projects.removeWorktreeConfirm),
         s.projects.removeWorktree,
         group => void removeViaGit(group)
       )}
       {worktreeDialog(
         forceTarget,
         setForceTarget,
-        s.projects.removeWorktreeDirty,
+        formatCloseDescription(s.projects.removeWorktreeDirty),
         s.projects.forceRemove,
         group => void removeViaGit(group, true)
       )}
