@@ -6,7 +6,8 @@ import type {
   HermesRepoPullRequests,
   HermesRepoStatus,
   HermesReviewList,
-  HermesReviewShipInfo
+  HermesReviewShipInfo,
+  HermesWorktreeCloseInspection
 } from '@/global'
 import { hermesApi } from '@/hermes'
 
@@ -66,6 +67,14 @@ function remoteGitVia(api: GitApi): GitBridge {
 
     worktreeRemove: (repoPath, worktreePath, options) =>
       gitPost('worktree/remove', { force: options?.force ?? false, path: repoPath, worktreePath }),
+
+    worktreeInspectClose: async worktreePath => {
+      try {
+        return await gitGet<HermesWorktreeCloseInspection>('worktree/inspect-close', { path: worktreePath })
+      } catch {
+        return { branch: null, dirtyFiles: 0, port: null, unpushedCommits: 0 }
+      }
+    },
 
     branchSwitch: (repoPath, branch) => gitPost('branch/switch', { branch, path: repoPath }),
 

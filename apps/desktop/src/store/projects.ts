@@ -1629,6 +1629,23 @@ export function requestStartWorkSession(
   })
 }
 
+export async function inspectWorktreeClose(
+  worktreePath: string,
+  owner?: GitOwnerRoute
+): Promise<null | { branch: null | string; dirtyFiles: number; port: null | number; unpushedCommits: number }> {
+  const git = gitFor(owner)
+
+  if (!git?.worktreeInspectClose) {
+    return null
+  }
+
+  try {
+    return await git.worktreeInspectClose(worktreePath)
+  } catch {
+    return null
+  }
+}
+
 export async function removeWorktreePath(
   repoPath: string,
   worktreePath: string,
