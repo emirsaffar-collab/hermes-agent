@@ -310,6 +310,140 @@ method("projects.project_sessions", params=ProjectsProjectSessionsParams, result
        doc="Fully hydrated lanes for one project, from the same grouping as projects.tree.")
 
 
+# ── projects: persistent services ─────────────────────────────────────────────────────────────
+
+
+class ProjectServiceRunInfo(Result):
+    run_id: str
+    service_id: str
+    worktree_path: str
+    pid: int
+    pgid: int | None = None
+    port: int | None = None
+    log_path: str
+    status: Literal["running", "stopped", "exited"]
+    started_at: int
+    stopped_at: int | None = None
+
+
+class ProjectServiceInfo(Result):
+    id: str
+    project_key: str
+    name: str
+    command: str
+    cwd_rel: str = ""
+    port_mode: Literal["auto", "fixed", "none"] = "auto"
+    fixed_port: int | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    created_at: int
+    updated_at: int
+    status: Literal["running", "stopped", "exited"] = "stopped"
+    port: int | None = None
+    pid: int | None = None
+    run: ProjectServiceRunInfo | None = None
+
+
+class ProjectRunningServiceSummary(Result):
+    id: str
+    name: str
+    project_key: str
+    run_id: str
+    pid: int
+    port: int | None = None
+
+
+class ProjectServicesListParams(ProfileParams):
+    project_key: str | None = None
+    worktree_path: str | None = None
+
+
+class ProjectServicesListResult(Result):
+    services: list[ProjectServiceInfo] = Field(default_factory=list)
+    running_for_worktree: list[ProjectRunningServiceSummary] = Field(default_factory=list)
+
+
+method("projects.services.list", params=ProjectServicesListParams, result=ProjectServicesListResult,
+       doc="List configured persistent services for a project (and/or active services bound to a worktree).")
+
+
+class ProjectServicesSaveParams(ProfileParams):
+    project_key: str
+    id: str | None = None
+    name: str
+    command: str
+    cwd_rel: str = ""
+    port_mode: Literal["auto", "fixed", "none"] = "auto"
+    fixed_port: int | None = None
+    env: dict[str, str] | None = None
+    worktree_path: str | None = None
+
+
+class ProjectServiceResult(Result):
+    service: ProjectServiceInfo
+
+
+method("projects.services.save", params=ProjectServicesSaveParams, result=ProjectServiceResult,
+       doc="Create or update a persistent project service definition.")
+
+
+class ProjectServicesDeleteParams(ProfileParams):
+    service_id: str
+
+
+class ProjectServicesDeleteResult(Result):
+    deleted: str
+    project_key: str
+    stopped: int = 0
+
+
+method("projects.services.delete", params=ProjectServicesDeleteParams, result=ProjectServicesDeleteResult,
+       doc="Stop active runs and delete a persistent project service.")
+
+
+class ProjectServicesControlParams(ProfileParams):
+    service_id: str
+    worktree_path: str
+
+
+method("projects.services.start", params=ProjectServicesControlParams, result=ProjectServiceResult,
+       doc="Start a persistent project service in a worktree (survives /stop and worker rollover).")
+method("projects.services.restart", params=ProjectServicesControlParams, result=ProjectServiceResult,
+       doc="Restart a persistent project service in a worktree.")
+
+
+class ProjectServicesStopParams(ProfileParams):
+    service_id: str | None = None
+    worktree_path: str | None = None
+
+
+class ProjectServicesStopResult(Result):
+    stopped: int = 0
+    service: ProjectServiceInfo | None = None
+
+
+method("projects.services.stop", params=ProjectServicesStopParams, result=ProjectServicesStopResult,
+       doc="Stop a running service (or all running services bound to worktree_path).")
+
+
+class ProjectServicesLogsParams(ProfileParams):
+    service_id: str
+    worktree_path: str | None = None
+    tail_bytes: int = 16384
+
+
+class ProjectServicesLogsResult(Result):
+    service_id: str
+    run_id: str | None = None
+    status: Literal["running", "stopped", "exited"] = "stopped"
+    content: str = ""
+    truncated: bool = False
+    byte_size: int = 0
+
+
+method("projects.services.logs", params=ProjectServicesLogsParams, result=ProjectServicesLogsResult,
+       doc="Read a bounded UTF-8 tail (<= 64 KiB) from a persistent service's latest run log.")
+
+
 # ── pet: active mascot ────────────────────────────────────────────────────────────────────────
 
 

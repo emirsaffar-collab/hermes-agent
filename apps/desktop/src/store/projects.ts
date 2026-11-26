@@ -9,7 +9,7 @@ import {
   projectOwnerBySessionId,
   type SidebarProjectTree
 } from '@/app/chat/sidebar/projects/workspace-groups'
-import type { HermesGitBaseBranch, HermesGitBranch } from '@/global'
+import type { HermesGitBaseBranch, HermesGitBranch, HermesWorktreeCloseInspection } from '@/global'
 import { getHermesConfig, hermesApi, type HermesGateway, type SessionInfo } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd, isDesktopFsRemoteMode, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
@@ -18,6 +18,7 @@ import { isMissingRestEndpoint, isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { isUnderPath } from '@/lib/path-compare'
 import { stampRowsWithOwningConnection } from '@/lib/session-owner-stamp'
 import { revealFile } from '@/store/file-actions'
+import { listRunningServicesForWorktree } from '@/store/project-services'
 import {
   $gateway,
   activeGateway,
@@ -1632,17 +1633,48 @@ export function requestStartWorkSession(
 export async function inspectWorktreeClose(
   worktreePath: string,
   owner?: GitOwnerRoute
-): Promise<null | { branch: null | string; dirtyFiles: number; port: null | number; unpushedCommits: number }> {
+): Promise<null | HermesWorktreeCloseInspection> {
   const git = gitFor(owner)
+  const servicesPromise = listRunningServicesForWorktree(worktreePath, owner).catch(() => [])
 
   if (!git?.worktreeInspectClose) {
-    return null
+    const runningServices = await servicesPromise
+
+    return runningServices.length > 0
+      ? {
+          branch: null,
+          dirtyFiles: 0,
+          port: null,
+          runningServices: runningServices.map(s => ({ id: s.id, name: s.name, port: s.port })),
+          unpushedCommits: 0
+        }
+      : null
   }
 
   try {
-    return await git.worktreeInspectClose(worktreePath)
-  } catch {
-    return null
+    const [gitInfo, runningServices] = await Promise.all([git.worktreeInspectClose(worktreePath), servicesPromise])
+
+    return runningServices.length > 0
+      ? {
+          ...gitInfo,
+          runningServices: runningServices.map(s => ({ id: s.id, name: s.name, port: s.port }))
+        }
+      : gitInfo
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err || 'inspection unavailable')
+    const runningServices = await servicesPromise
+
+    return {
+      branch: null,
+      dirtyFiles: 0,
+      inspectionError: detail.trim() || 'inspection unavailable',
+      port: null,
+      runningServices:
+        runningServices.length > 0
+          ? runningServices.map(s => ({ id: s.id, name: s.name, port: s.port }))
+          : undefined,
+      unpushedCommits: 0
+    }
   }
 }
 

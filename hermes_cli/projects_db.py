@@ -64,6 +64,43 @@ CREATE TABLE IF NOT EXISTS discovered_repos (
     label         TEXT,
     last_seen     INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS project_services (
+    id          TEXT PRIMARY KEY,
+    project_key TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    command     TEXT NOT NULL,
+    cwd_rel     TEXT NOT NULL DEFAULT '',
+    port_mode   TEXT NOT NULL DEFAULT 'auto' CHECK (port_mode IN ('auto', 'fixed', 'none')),
+    fixed_port  INTEGER,
+    env_json    TEXT NOT NULL DEFAULT '{}',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_services_key
+    ON project_services(project_key);
+
+CREATE TABLE IF NOT EXISTS project_service_runs (
+    run_id        TEXT PRIMARY KEY,
+    service_id    TEXT NOT NULL REFERENCES project_services(id) ON DELETE CASCADE,
+    worktree_path TEXT NOT NULL,
+    pid           INTEGER NOT NULL,
+    pgid          INTEGER,
+    create_time   REAL,
+    boot_start    REAL,
+    port          INTEGER,
+    log_path      TEXT NOT NULL,
+    status        TEXT NOT NULL CHECK (status IN ('running', 'stopped', 'exited')),
+    started_at    INTEGER NOT NULL,
+    stopped_at    INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_runs_active
+    ON project_service_runs(service_id, worktree_path, status);
+
+CREATE INDEX IF NOT EXISTS idx_service_runs_wt
+    ON project_service_runs(worktree_path, status);
 """
 
 # Lowercase alphanumerics, hyphens, underscores; 1-64 chars; no leading separator. Strict enough to

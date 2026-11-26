@@ -416,3 +416,94 @@ def _build_project_tree(
 def register(server) -> None:
     """Publish this module's helpers + handlers onto ``server``, rebound to its globals."""
     bind_module(globals(), server, skip=("_",))
+
+
+# ── persistent project services ───────────────────────────────────────────────────────────────
+
+
+@_projects_method("projects.services.list")
+def _(rid, params, pdb, conn) -> dict:
+    from hermes_cli import project_services as psvc
+
+    project_key = str(params.get("project_key") or "").strip()
+    worktree_path = str(params.get("worktree_path") or "").strip() or None
+    services = psvc.list_services(conn, project_key, worktree_path=worktree_path) if project_key else []
+    running = psvc.list_running_services_for_worktree(conn, worktree_path) if worktree_path else []
+    return _ok(rid, {"services": services, "running_for_worktree": running})
+
+
+@_projects_method("projects.services.save")
+def _(rid, params, pdb, conn) -> dict:
+    from hermes_cli import project_services as psvc
+
+    svc = psvc.save_service(
+        conn,
+        project_key=str(params.get("project_key") or ""),
+        service_id=params.get("id"),
+        name=str(params.get("name") or ""),
+        command=str(params.get("command") or ""),
+        cwd_rel=str(params.get("cwd_rel") or ""),
+        port_mode=str(params.get("port_mode") or "auto"),
+        fixed_port=params.get("fixed_port"),
+        env=params.get("env"),
+        worktree_path=str(params.get("worktree_path") or "").strip() or None,
+    )
+    return _ok(rid, {"service": svc})
+
+
+@_projects_method("projects.services.delete")
+def _(rid, params, pdb, conn) -> dict:
+    from hermes_cli import project_services as psvc
+
+    service_id = str(params.get("service_id") or "").strip()
+    if not service_id:
+        raise ValueError("service_id is required")
+    return _ok(rid, psvc.delete_service(conn, service_id))
+
+
+@_projects_method("projects.services.start")
+def _(rid, params, pdb, conn) -> dict:
+    from hermes_cli import project_services as psvc
+
+    service_id = str(params.get("service_id") or "").strip()
+    worktree_path = str(params.get("worktree_path") or "").strip()
+    if not service_id or not worktree_path:
+        raise ValueError("service_id and worktree_path are required")
+    return _ok(rid, {"service": psvc.start_service(conn, service_id, worktree_path)})
+
+
+@_projects_method("projects.services.stop")
+def _(rid, params, pdb, conn) -> dict:
+    from hermes_cli import project_services as psvc
+
+    service_id = str(params.get("service_id") or "").strip()
+    worktree_path = str(params.get("worktree_path") or "").strip() or None
+    if service_id:
+        return _ok(rid, psvc.stop_service(conn, service_id, worktree_path=worktree_path))
+    if worktree_path:
+        stopped = psvc.stop_services_for_worktree(conn, worktree_path)
+        return _ok(rid, {"stopped": stopped, "service": None})
+    raise ValueError("service_id or worktree_path is required")
+
+
+@_projects_method("projects.services.restart")
+def _(rid, params, pdb, conn) -> dict:
+    from hermes_cli import project_services as psvc
+
+    service_id = str(params.get("service_id") or "").strip()
+    worktree_path = str(params.get("worktree_path") or "").strip()
+    if not service_id or not worktree_path:
+        raise ValueError("service_id and worktree_path are required")
+    return _ok(rid, {"service": psvc.restart_service(conn, service_id, worktree_path)})
+
+
+@_projects_method("projects.services.logs")
+def _(rid, params, pdb, conn) -> dict:
+    from hermes_cli import project_services as psvc
+
+    service_id = str(params.get("service_id") or "").strip()
+    if not service_id:
+        raise ValueError("service_id is required")
+    worktree_path = str(params.get("worktree_path") or "").strip() or None
+    tail_bytes = int(params.get("tail_bytes") or psvc.SERVICE_LOG_TAIL_DEFAULT)
+    return _ok(rid, psvc.read_service_logs(conn, service_id, worktree_path=worktree_path, tail_bytes=tail_bytes))

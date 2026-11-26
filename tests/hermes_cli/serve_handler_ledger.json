@@ -2,12 +2,12 @@
  "counts": {
   "http": {
    "keep-host-wide": 1,
-   "undecided": 353
+   "undecided": 355
   },
   "rpc": {
    "authority": 113,
    "keep-host-wide": 1,
-   "undecided": 181
+   "undecided": 188
   },
   "websocket": {
    "undecided": 10
@@ -108,6 +108,7 @@
   {"current_path": "hermes_cli.web_routers.git:git_rev_parse_route", "decision": "undecided", "handler": "GET /api/git/review/rev-parse", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.git:git_ship_info_route", "decision": "undecided", "handler": "GET /api/git/review/ship-info", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.git:git_status_route", "decision": "undecided", "handler": "GET /api/git/status", "kind": "http", "ref": ""},
+  {"current_path": "hermes_cli.web_routers.git:git_worktree_inspect_close_route", "decision": "undecided", "handler": "GET /api/git/worktree/inspect-close", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.git:git_worktrees_route", "decision": "undecided", "handler": "GET /api/git/worktrees", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.status:get_health", "decision": "undecided", "handler": "GET /api/health", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.status:get_health_idle", "decision": "undecided", "handler": "GET /api/health/idle", "kind": "http", "ref": ""},
@@ -263,6 +264,7 @@
   {"current_path": "hermes_cli.web_routers.git:git_pr_list_route", "decision": "undecided", "handler": "POST /api/git/review/pr-list", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.git:git_push_route", "decision": "undecided", "handler": "POST /api/git/review/push", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.git:git_revert_route", "decision": "undecided", "handler": "POST /api/git/review/revert", "kind": "http", "ref": ""},
+  {"current_path": "hermes_cli.web_routers.git:git_revert_patch_route", "decision": "undecided", "handler": "POST /api/git/review/revert-patch", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.git:git_stage_route", "decision": "undecided", "handler": "POST /api/git/review/stage", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.git:git_unstage_route", "decision": "undecided", "handler": "POST /api/git/review/unstage", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.git:git_worktree_add_route", "decision": "undecided", "handler": "POST /api/git/worktree/add", "kind": "http", "ref": ""},
@@ -561,6 +563,13 @@
   {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.project_sessions", "kind": "rpc", "ref": "D3"},
   {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.record_repos", "kind": "rpc", "ref": "D3"},
   {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.remove_folder", "kind": "rpc", "ref": "D3"},
+  {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.services.delete", "kind": "rpc", "ref": "D3"},
+  {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.services.list", "kind": "rpc", "ref": "D3"},
+  {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.services.logs", "kind": "rpc", "ref": "D3"},
+  {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.services.restart", "kind": "rpc", "ref": "D3"},
+  {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.services.save", "kind": "rpc", "ref": "D3"},
+  {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.services.start", "kind": "rpc", "ref": "D3"},
+  {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.services.stop", "kind": "rpc", "ref": "D3"},
   {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.set_active", "kind": "rpc", "ref": "D3"},
   {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.set_primary", "kind": "rpc", "ref": "D3"},
   {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.tree", "kind": "rpc", "ref": "D3"},

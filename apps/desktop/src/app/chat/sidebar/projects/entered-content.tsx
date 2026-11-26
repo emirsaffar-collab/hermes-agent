@@ -19,11 +19,13 @@ import {
 import { notifyError } from '@/store/notifications'
 import type { AgentProfileRoute } from '@/store/profile'
 import { inspectWorktreeClose, removeWorktreePath } from '@/store/projects'
+import { stopServicesForWorktree } from '@/store/project-services'
 
 import { SidebarRowStack } from '../chrome'
 
 import { ownedNewSessionHandlers, projectOwnerRoute } from './gateway-project-rows'
 import { PROJECT_SESSION_PAGE, useRevealedRows, useWorkspaceNodeOpen } from './model'
+import { ProjectServicesSection } from './services-section'
 import { SidebarWorkspaceGroup } from './workspace-group'
 import {
   mergeRepoWorktreeGroups,
@@ -68,6 +70,8 @@ export function EnteredProjectContent({
 
   const single = project.repos.length === 1
   const owned = ownedNewSessionHandlers(project, onNewSession, onNewSessionSplit)
+  const owner = projectOwnerRoute(project)
+  const primaryWorktreePath = project.path || project.repos[0]?.path || null
 
   return (
     <>
@@ -78,13 +82,14 @@ export function EnteredProjectContent({
           liveSessions={liveSessions}
           onNewSession={owned.onNewSession}
           onNewSessionSplit={owned.onNewSessionSplit}
-          owner={projectOwnerRoute(project)}
+          owner={owner}
           removedSessionIds={removedSessionIds}
           renderRows={renderRows}
           repo={repo}
           showHeader={!single}
         />
       ))}
+      <ProjectServicesSection owner={owner} projectKey={project.id} worktreePath={primaryWorktreePath} />
     </>
   )
 }
@@ -212,6 +217,10 @@ function RepoFlatSection({
       return base
     }
 
+    if (closeInspection.inspectionError) {
+      return `${base} (⚠ Could not verify dirty files or unpushed commits: ${closeInspection.inspectionError})`
+    }
+
     const details: string[] = []
 
     if (closeInspection.dirtyFiles > 0) {
@@ -228,6 +237,14 @@ function RepoFlatSection({
       details.push(`port :${closeInspection.port}`)
     }
 
+    if (closeInspection.runningServices && closeInspection.runningServices.length > 0) {
+      const names = closeInspection.runningServices
+        .map(svc => (svc.port ? `${svc.name} (:${svc.port})` : svc.name))
+        .join(', ')
+
+      details.push(`running service${closeInspection.runningServices.length === 1 ? '' : 's'}: ${names}`)
+    }
+
     if (details.length === 0) {
       return base
     }
@@ -241,6 +258,7 @@ function RepoFlatSection({
     }
 
     try {
+      await stopServicesForWorktree(group.path, owner).catch(() => 0)
       await removeWorktreePath(repo.path, group.path, { force }, owner)
       dismissWorktree(laneKey(group), { removed: true })
     } catch (err) {
