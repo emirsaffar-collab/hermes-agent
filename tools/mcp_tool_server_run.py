@@ -8,6 +8,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse
 from tools.mcp_tool_common import _core, _get_lifecycle_seconds, _jittered, _resolve_tool_timeout
 from tools import mcp_tool_errors as _errors
 from tools import mcp_tool_registration as _registration
@@ -254,14 +255,37 @@ class MCPServerRunMixin:
         except Exception:
             return True
 
+    def _is_loopback_http(self) -> bool:
+        """True when this task targets a loopback HTTP endpoint (127.0.0.1 / localhost / ::1)."""
+        if not self._is_http():
+            return False
+        url = str((self._config or {}).get("url") or "").strip()
+        if not url:
+            return False
+        try:
+            host = (urlparse(url).hostname or "").lower().strip("[]")
+        except Exception:
+            return False
+        return host in ("127.0.0.1", "localhost", "::1")
+
+    def _park_backoff_bounds(self) -> tuple[float, float]:
+        """Return ``(base_interval, max_backoff)`` in seconds; loopback HTTP uses tighter bounds."""
+        if self._is_loopback_http():
+            return (
+                min(_core._PARKED_RETRY_INTERVAL, _core._LOOPBACK_PARKED_RETRY_INTERVAL),
+                min(_core._PARKED_PROBE_BACKOFF_MAX, _core._LOOPBACK_PARKED_PROBE_BACKOFF_MAX),
+            )
+        return (_core._PARKED_RETRY_INTERVAL, _core._PARKED_PROBE_BACKOFF_MAX)
+
     def _next_park_probe_timeout(self) -> float:
-        """Self-probe wait for the current park: ``_PARKED_RETRY_INTERVAL``, doubling per
-        consecutive still-failed probe, capped at ``_PARKED_PROBE_BACKOFF_MAX``. Resets once a
+        """Self-probe wait for the current park: ``_PARKED_RETRY_INTERVAL`` (or the tighter
+        loopback interval for localhost HTTP servers), doubling per consecutive still-failed
+        probe, capped at ``_PARKED_PROBE_BACKOFF_MAX`` (or loopback max). Resets once a
         session proves healthy (``_mark_session_proven``)."""
-        base = _core._PARKED_RETRY_INTERVAL
+        base, cap = self._park_backoff_bounds()
         if self._parked_probe_failures <= 0:
             return base
-        return min(base * (2 ** self._parked_probe_failures), _core._PARKED_PROBE_BACKOFF_MAX)
+        return min(base * (2 ** self._parked_probe_failures), cap)
 
     async def _prepare_run(self, config: dict) -> bool:
         """Bind config, build sampling/elicitation handlers, validate HTTP. False when the server
@@ -419,10 +443,12 @@ class MCPServerRunMixin:
         else:
             self._reconnect_retries += 1
             if self._reconnect_retries > _core._MAX_RECONNECT_RETRIES:
+                _base_s, _cap_s = self._park_backoff_bounds()
+                _cap_label = f"{int(_cap_s)}s" if _cap_s < 3600 else "1h"
                 self._log_park(
                     "MCP server '%s': %d consecutive reconnects without a healthy session (rapid-drop budget "
-                    "exhausted), parking; will self-probe after %ds, backing off to 1h, until it recovers (state: degraded → parked)",
-                    self.name, _core._MAX_RECONNECT_RETRIES, _core._PARKED_RETRY_INTERVAL)
+                    "exhausted), parking; will self-probe after %ds, backing off to %s, until it recovers (state: degraded → parked)",
+                    self.name, _core._MAX_RECONNECT_RETRIES, int(_base_s), _cap_label)
                 if not await self._park_and_rearm("from parked state", budget):
                     return False
         # Clear readiness too: a stale _ready lets handler recovery mistake old for fresh.
@@ -485,10 +511,12 @@ class MCPServerRunMixin:
             return await self._on_permanent_error(root, budget)
         self._reconnect_retries += 1
         if self._reconnect_retries > _core._MAX_RECONNECT_RETRIES:
+            _base_s, _cap_s = self._park_backoff_bounds()
+            _cap_label = f"{int(_cap_s)}s" if _cap_s < 3600 else "1h"
             self._log_park(
-                "MCP server '%s' failed after %d reconnection attempts, parking; will self-probe after %ds, backing off to 1h, "
+                "MCP server '%s' failed after %d reconnection attempts, parking; will self-probe after %ds, backing off to %s, "
                 "until it recovers (state: degraded → parked): %s: %s",
-                self.name, _core._MAX_RECONNECT_RETRIES, _core._PARKED_RETRY_INTERVAL, type(root).__name__, root)
+                self.name, _core._MAX_RECONNECT_RETRIES, int(_base_s), _cap_label, type(root).__name__, root)
             return await self._park_and_rearm("from parked state", budget)
         logger.debug("MCP server '%s' connection lost (attempt %d/%d), reconnecting in %.0fs: %s: %s",
                      self.name, self._reconnect_retries, _core._MAX_RECONNECT_RETRIES, budget.backoff,
@@ -551,9 +579,11 @@ class MCPServerRunMixin:
             await asyncio.sleep(_jittered(1.0))
             return not self._shutdown_event.is_set()
         # Deterministic failure on a working server: park now.
+        _base_s, _cap_s = self._park_backoff_bounds()
+        _cap_label = f"{int(_cap_s)}s" if _cap_s < 3600 else "1h"
         self._log_park(
-            "MCP server '%s' hit a permanent error, parking without retries; will self-probe after %ds, backing off to 1h "
-            "(state: connected → parked): %s: %s", self.name, _core._PARKED_RETRY_INTERVAL, type(root).__name__, root)
+            "MCP server '%s' hit a permanent error, parking without retries; will self-probe after %ds, backing off to %s "
+            "(state: connected → parked): %s: %s", self.name, int(_base_s), _cap_label, type(root).__name__, root)
         self._arm_auth_park(root)
         return await self._park_and_rearm("from parked state (permanent error)", budget)
 

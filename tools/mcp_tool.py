@@ -327,6 +327,10 @@ _PARKED_RETRY_INTERVAL = 300
 # _PARKED_RETRY_INTERVAL up to this ceiling, so a server whose failure is provably persistent (a
 # duplicate stdio instance holding a single-writer lock) stops re-spawning a doomed child forever.
 _PARKED_PROBE_BACKOFF_MAX = 3600
+# Tighter parked self-probe bounds for loopback HTTP MCP servers (127.0.0.1 / localhost / ::1):
+# local daemons restart in seconds, so parking them for 5m..60m drops tools unnecessarily.
+_LOOPBACK_PARKED_RETRY_INTERVAL = 5
+_LOOPBACK_PARKED_PROBE_BACKOFF_MAX = 60
 # Bounded wait for a respawned stdio child when a call finds it dead (gateway restarts kill
 # every MCP child); bounded so a broken server still parks via run()'s rapid-drop budget.
 _STDIO_RESPAWN_WAIT_SEC = 15.0
