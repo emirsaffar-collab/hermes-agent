@@ -679,5 +679,153 @@ def test_build_chromium_launch_kwargs_disables_audio_output_for_receive_only_rtc
     assert "--disable-audio-output" not in kw_no_rtc["args"]
 
 
+def test_brief_rtc_hook_defines_update_frame_before_get_display_media():
+    from plugins.google_meet.meet_bot import _RTC_HOOK_JS
+
+    # RC-1 regression guard: __hermesUpdateBriefFrame must be defined before makeBriefDisplayTrack
+    update_pos = _RTC_HOOK_JS.index("window.__hermesUpdateBriefFrame =")
+    display_pos = _RTC_HOOK_JS.index("const makeBriefDisplayTrack =")
+    assert update_pos < display_pos
+    # RC-3 regression guards: CSP-safe createImageBitmap decode, periodic pump, prototype override
+    assert "createImageBitmap(" in _RTC_HOOK_JS
+    assert "setInterval(repaintBriefCanvas" in _RTC_HOOK_JS
+    assert "MediaDevices.prototype" in _RTC_HOOK_JS
+
+
+def test_start_brief_presentation_never_fakes_brief_sharing_without_gdm(tmp_path):
+    import json
+    from plugins.google_meet.meet_bot import _BotConfig, _BotState, _start_brief_presentation
+
+    class _FakeMouse:
+        def move(self, *_a, **_kw): pass
+        def click(self, *_a, **_kw): pass
+
+    class _FakeKeyboard:
+        def press(self, *_a, **_kw): pass
+
+    class _FakeLocator:
+        @property
+        def first(self):
+            return self
+        def click(self, **_kw):
+            return None
+
+    class _FakeBriefPage:
+        def is_closed(self): return False
+        def set_viewport_size(self, *_a, **_kw): pass
+        def set_extra_http_headers(self, *_a, **_kw): pass
+        def goto(self, *_a, **_kw): pass
+        def evaluate(self, *_a, **_kw): return {"fits": True}
+        def wait_for_timeout(self, *_a, **_kw): pass
+        def screenshot(self, **_kw): return b"\xff\xd8\xff\xd9"
+
+    class _FakeContext:
+        def new_page(self): return _FakeBriefPage()
+
+    class _FakePage:
+        def __init__(self, btn_present: bool):
+            self.context = _FakeContext()
+            self.mouse = _FakeMouse()
+            self.keyboard = _FakeKeyboard()
+            self._btn_present = btn_present
+            self.brought_to_front = 0
+        def bring_to_front(self): self.brought_to_front += 1
+        def wait_for_timeout(self, *_a, **_kw): pass
+        def on(self, *_a, **_kw): pass
+        def remove_listener(self, *_a, **_kw): pass
+        def locator(self, *_a, **_kw): return _FakeLocator()
+        def screenshot(self, **_kw): pass
+        def evaluate(self, expr, *args):
+            if "__hermesUpdateBriefFrame" in expr:
+                return {"ok": True, "w": 1600, "h": 900, "centerRgba": [243, 247, 250, 255]}
+            if "data-hermes-present-btn" in expr:
+                return {"label": "Dela skärm", "x": 572, "y": 756, "w": 56, "h": 48} if self._btn_present else None
+            if "__hermesBriefDebug" in expr:
+                return {"getDisplayMediaCalls": 0, "framesDecoded": 1}
+            return []
+
+    cfg = _BotConfig(out_dir=tmp_path, brief_url="http://100.117.81.127:8096/brief?title=Test&screenshare=1")
+
+    # Case A: Present button missing -> must return False and keep briefSharing False (RC-2)
+    dir_a = tmp_path / "case_a"
+    state_a = _BotState(out_dir=dir_a, meeting_id="abc-defg-hij", url="https://meet.google.com/abc-defg-hij")
+    page_a = _FakePage(btn_present=False)
+    assert _start_brief_presentation(page_a, {}, cfg, state_a) is False
+    assert json.loads((dir_a / "status.json").read_text(encoding="utf-8"))["briefSharing"] is False
+    assert page_a.brought_to_front >= 1
+
+    # Case B: Present button clicked, but getDisplayMediaCalls remained 0 -> must still return False
+    dir_b = tmp_path / "case_b"
+    state_b = _BotState(out_dir=dir_b, meeting_id="abc-defg-hij", url="https://meet.google.com/abc-defg-hij")
+    page_b = _FakePage(btn_present=True)
+    assert _start_brief_presentation(page_b, {}, cfg, state_b) is False
+    assert json.loads((dir_b / "status.json").read_text(encoding="utf-8"))["briefSharing"] is False
+
+
+def test_brief_canvas_fit_and_human_presenting_probe_playwright():
+    import base64
+    from playwright.sync_api import sync_playwright
+    from plugins.google_meet.meet_bot import (
+        _BRIEF_FIT_TO_FRAME_JS,
+        _HUMAN_PRESENTING_PROBE_JS,
+        _RTC_HOOK_JS,
+    )
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        try:
+            # 1. Verify _BRIEF_FIT_TO_FRAME_JS fits a tall 1300px brief cleanly inside 1600x900
+            b_page = browser.new_page(viewport={"width": 1600, "height": 900})
+            b_page.set_content(
+                "<html><body style='background:#eef4ff;margin:0'>"
+                "<div class='topbar' style='height:80px'>Toolbar</div>"
+                "<main class='shell' style='width:1200px;height:1260px;background:#dfe8ff'>Tall Brief</main>"
+                "</body></html>"
+            )
+            fit = b_page.evaluate(_BRIEF_FIT_TO_FRAME_JS)
+            assert fit["fits"] is True, f"Expected tall brief to fit 1600x900, got {fit}"
+            assert fit["visualBottom"] <= 900
+            jpeg_b64 = base64.b64encode(b_page.screenshot(type="jpeg", quality=85)).decode("ascii")
+            b_page.close()
+
+            # 2. Verify _RTC_HOOK_JS decodes brief via createImageBitmap & feeds getDisplayMedia
+            ctx = browser.new_context()
+            ctx.add_init_script(_RTC_HOOK_JS)
+            page = ctx.new_page()
+            page.goto("about:blank")
+            upd = page.evaluate("async b64 => await window.__hermesUpdateBriefFrame(b64)", jpeg_b64)
+            assert upd["ok"] is True
+            assert upd["centerRgba"][0] > 150 and upd["centerRgba"][1] > 150  # non-black pixel
+            gdm = page.evaluate("""async () => {
+              const s = await navigator.mediaDevices.getDisplayMedia({ video: true });
+              const t = s.getVideoTracks()[0];
+              return { readyState: t.readyState, settings: t.getSettings(), dbg: window.__hermesBriefDebug };
+            }""")
+            assert gdm["readyState"] == "live"
+            assert gdm["settings"]["displaySurface"] == "monitor"
+            assert gdm["dbg"]["getDisplayMediaCalls"] == 1
+            assert gdm["dbg"]["attached"] is True
+
+            # 3. Two-way polarity on _HUMAN_PRESENTING_PROBE_JS (RC-4 regression guard)
+            for self_txt in (
+                "Ur&Penn Mötesanteckningar (Du, presenterar) Avsluta presentationen",
+                "Du presenterar för alla",
+                "You're presenting to everyone Stop presenting",
+            ):
+                page.set_content(f"<html><body>{self_txt}</body></html>")
+                assert page.evaluate(_HUMAN_PRESENTING_PROBE_JS) is False, self_txt
+
+            for other_txt in (
+                "Evelina Björninen presenterar",
+                "Emir Saffar is presenting",
+            ):
+                page.set_content(f"<html><body>{other_txt}</body></html>")
+                assert page.evaluate(_HUMAN_PRESENTING_PROBE_JS) is True, other_txt
+            ctx.close()
+        finally:
+            browser.close()
+
+
+
 
 

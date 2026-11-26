@@ -386,40 +386,116 @@ _RTC_HOOK_JS = r"""
       return dst.stream.getAudioTracks()[0];
     };
     const makeVideoTrack = () => {
-      const c = document.createElement("canvas");
-      c.width = 640; c.height = 360;
-      const g = c.getContext("2d");
-      g.fillStyle = "#111"; g.fillRect(0, 0, 640, 360);
-      return c.captureStream(1).getVideoTracks()[0];
+      const c = ensureBriefCanvas();
+      repaintBriefCanvas();
+      const stream = c.captureStream(4);
+      const track = stream.getVideoTracks()[0];
+      window.__hermesBriefVideoTrack = track;
+      if (!window.__hermesBriefPumpId) {
+        window.__hermesBriefPumpId = setInterval(repaintBriefCanvas, 250);
+      }
+      setTimeout(repaintBriefCanvas, 150);
+      setTimeout(repaintBriefCanvas, 600);
+      return track;
     };
-    const makeBriefDisplayTrack = () => {
+    window.__hermesBriefDebug = {
+      getDisplayMediaCalls: 0,
+      framesDecoded: 0,
+      pumpTicks: 0,
+      lastError: null,
+      centerRgba: null,
+      attached: false,
+    };
+    const ensureBriefCanvas = () => {
       let c = window.__hermesBriefCanvas;
       if (!c) {
         c = document.createElement("canvas");
-        c.width = 1920; c.height = 1080;
-        const g = c.getContext("2d");
-        g.fillStyle = "#EBF1FF"; g.fillRect(0, 0, 1920, 1080);
+        c.width = 1600; c.height = 900;
+        c.style.cssText = "position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none;z-index:-9999;";
+        const g = c.getContext("2d", { alpha: false, willReadFrequently: true });
+        g.fillStyle = "#EBF1FF"; g.fillRect(0, 0, 1600, 900);
         window.__hermesBriefCanvas = c;
       }
-      window.__hermesUpdateBriefFrame = (dataUrl) => {
+      if (!c.isConnected && (document.body || document.documentElement)) {
         try {
-          const img = window.__hermesBriefImg || new Image();
-          window.__hermesBriefImg = img;
-          img.onload = () => {
-            try {
-              const ctx2d = c.getContext("2d");
-              ctx2d.drawImage(img, 0, 0, 1920, 1080);
-            } catch (e) {}
-          };
-          img.src = dataUrl;
+          (document.body || document.documentElement).appendChild(c);
+          window.__hermesBriefDebug.attached = true;
+        } catch (e) {}
+      }
+      return c;
+    };
+    const repaintBriefCanvas = () => {
+      try {
+        const c = ensureBriefCanvas();
+        const g = c.getContext("2d", { alpha: false, willReadFrequently: true });
+        const bmp = window.__hermesBriefBitmap;
+        if (bmp) {
+          g.drawImage(bmp, 0, 0, c.width, c.height);
+          // 1px corner toggle guarantees Chromium marks the canvas dirty and feeds WebRTC frames
+          window.__hermesBriefDebug.pumpTicks += 1;
+          g.fillStyle = (window.__hermesBriefDebug.pumpTicks & 1) ? "#f8faff" : "#f7f9fe";
+          g.fillRect(c.width - 1, c.height - 1, 1, 1);
+          for (const tr of [window.__hermesBriefDisplayTrack, window.__hermesBriefVideoTrack]) {
+            if (tr && typeof tr.requestFrame === "function") {
+              try { tr.requestFrame(); } catch (e) {}
+            }
+          }
           return true;
-        } catch (e) { return false; }
-      };
+        }
+      } catch (e) {
+        window.__hermesBriefDebug.lastError = "repaint:" + String(e);
+      }
+      return false;
+    };
+    window.__hermesUpdateBriefFrame = async (b64OrDataUrl) => {
+      try {
+        const c = ensureBriefCanvas();
+        const b64 = b64OrDataUrl.indexOf(",") >= 0 ? b64OrDataUrl.split(",", 2)[1] : b64OrDataUrl;
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const blob = new Blob([bytes], { type: "image/jpeg" });
+        const bmp = await createImageBitmap(blob);
+        if (window.__hermesBriefBitmap && typeof window.__hermesBriefBitmap.close === "function") {
+          try { window.__hermesBriefBitmap.close(); } catch (e) {}
+        }
+        window.__hermesBriefBitmap = bmp;
+        window.__hermesBriefDebug.framesDecoded += 1;
+        repaintBriefCanvas();
+        const g = c.getContext("2d", { alpha: false, willReadFrequently: true });
+        const px = g.getImageData(Math.floor(c.width / 2), Math.floor(c.height / 2), 1, 1).data;
+        window.__hermesBriefDebug.centerRgba = [px[0], px[1], px[2], px[3]];
+        if (!window.__hermesBriefPumpId) {
+          window.__hermesBriefPumpId = setInterval(repaintBriefCanvas, 250);
+        }
+        return { ok: true, w: bmp.width, h: bmp.height, centerRgba: window.__hermesBriefDebug.centerRgba };
+      } catch (e) {
+        window.__hermesBriefDebug.lastError = "decode:" + String(e);
+        return { ok: false, error: String(e) };
+      }
+    };
+    const makeBriefDisplayTrack = () => {
+      window.__hermesBriefDebug.getDisplayMediaCalls += 1;
+      const c = ensureBriefCanvas();
+      repaintBriefCanvas();
       const stream = c.captureStream(4);
       const track = stream.getVideoTracks()[0];
+      try {
+        const origSettings = track.getSettings ? track.getSettings.bind(track) : () => ({});
+        track.getSettings = () => Object.assign({ width: 1600, height: 900, frameRate: 4, displaySurface: "monitor" }, origSettings());
+      } catch (e) {}
       window.__hermesBriefDisplayTrack = track;
+      if (!window.__hermesBriefPumpId) {
+        window.__hermesBriefPumpId = setInterval(repaintBriefCanvas, 250);
+      }
+      setTimeout(repaintBriefCanvas, 100);
+      setTimeout(repaintBriefCanvas, 500);
       window.__hermesStopBriefDisplay = () => {
         try {
+          if (window.__hermesBriefPumpId) {
+            clearInterval(window.__hermesBriefPumpId);
+            window.__hermesBriefPumpId = null;
+          }
           if (window.__hermesBriefDisplayTrack) {
             window.__hermesBriefDisplayTrack.stop();
             window.__hermesBriefDisplayTrack = null;
@@ -440,9 +516,25 @@ _RTC_HOOK_JS = r"""
       if (constraints && constraints.video) tracks.push(makeVideoTrack());
       return new MediaStream(tracks);
     };
-    navigator.mediaDevices.getDisplayMedia = async (constraints) => {
+    const synthGetDisplayMedia = async (constraints) => {
       return new MediaStream([makeBriefDisplayTrack()]);
     };
+    try {
+      Object.defineProperty(navigator.mediaDevices, "getDisplayMedia", {
+        value: synthGetDisplayMedia, configurable: true, writable: true,
+      });
+    } catch (e) {
+      try { navigator.mediaDevices.getDisplayMedia = synthGetDisplayMedia; } catch (e2) {}
+    }
+    if (typeof MediaDevices !== "undefined" && MediaDevices.prototype) {
+      try {
+        Object.defineProperty(MediaDevices.prototype, "getDisplayMedia", {
+          value: synthGetDisplayMedia, configurable: true, writable: true,
+        });
+      } catch (e) {
+        try { MediaDevices.prototype.getDisplayMedia = synthGetDisplayMedia; } catch (e2) {}
+      }
+    }
   }
   window.__hermesRtcStreams = new Map();
   window.__hermesPeerConns = new Set();
@@ -1915,15 +2007,67 @@ def _ensure_mic_muted(page) -> str:
 
 _HUMAN_PRESENTING_PROBE_JS = """() => {
   const txt = (document.body && document.body.innerText) || "";
-  if (/(?:presenterar|is presenting)/i.test(txt) && !/(?:du presenterar|you are presenting)/i.test(txt)) {
-    return true;
+  // Never mistake our own active presentation for a human presenting
+  if (/(?:du presenterar|you(?:'re| are) presenting|sluta presentera|avsluta presentationen|stop presenting|sluta dela|stop sharing)/i.test(txt)) {
+    return false;
+  }
+  if (/(?:presenterar|is presenting)/i.test(txt)) {
+    // Ignore toolbar tooltip / self tile labels
+    const lines = txt.split(/\\n+/).filter(l => /(?:presenterar|is presenting)/i.test(l));
+    const foreign = lines.filter(l => !/(?:presentera nu|present now|u&p m[öo]tes|m[öo]tesassistent|m[öo]tesanteckningar|moten@)/i.test(l));
+    if (foreign.length > 0) return true;
   }
   return false;
 }"""
 
 
+_BRIEF_FIT_TO_FRAME_JS = """() => {
+  if (document.body) document.body.classList.add('screenshare');
+  if (!document.getElementById('hermes-brief-fit-style')) {
+    const style = document.createElement('style');
+    style.id = 'hermes-brief-fit-style';
+    style.textContent = [
+      '.topbar, .toolbar, .hud-controls, .search-bar, .filter-bar, .controls, .controls-bar, .action-bar { display: none !important; }',
+      'html, body { overflow: hidden !important; margin: 0 !important; min-height: 0 !important; height: auto !important; }',
+      'body { padding: 12px 18px !important; }',
+      '.shell, .card, .board, .wrap, .container, main { max-width: 1540px !important; margin: 0 auto !important; }'
+    ].join('\\n');
+    document.head && document.head.appendChild(style);
+  }
+  const vw = window.innerWidth || 1600;
+  const vh = window.innerHeight || 900;
+  const measureBounds = () => {
+    let maxBottom = 0;
+    let maxRight = 0;
+    const children = document.body ? Array.from(document.body.children) : [];
+    for (const el of children) {
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.position === 'fixed') continue;
+      const r = el.getBoundingClientRect();
+      if (r.height > 0 && r.bottom > maxBottom) maxBottom = r.bottom;
+      if (r.width > 0 && r.right > maxRight) maxRight = r.right;
+    }
+    return { bottom: Math.ceil(maxBottom), right: Math.ceil(maxRight) };
+  };
+  document.documentElement.style.zoom = '1';
+  let b = measureBounds();
+  let z = 1.0;
+  if (b.bottom > vh - 12 || b.right > vw - 12) {
+    z = Math.max(0.55, Math.min((vh - 16) / Math.max(b.bottom, 1), (vw - 16) / Math.max(b.right, 1)));
+    document.documentElement.style.zoom = z.toFixed(4);
+    b = measureBounds();
+    if (b.bottom > vh - 4) {
+      z = Math.max(0.55, z * ((vh - 12) / Math.max(b.bottom, 1)));
+      document.documentElement.style.zoom = z.toFixed(4);
+      b = measureBounds();
+    }
+  }
+  return { zoom: Number(z.toFixed(4)), vw, vh, visualBottom: b.bottom, visualRight: b.right, fits: b.bottom <= vh && b.right <= vw };
+}"""
+
+
 def _refresh_brief_canvas(page, brief_state: dict, cfg: _BotConfig, state: _BotState) -> bool:
-    """Render the brief URL in a 1920x1080 background tab and push its frame to Meet's display canvas."""
+    """Render the brief URL in a 1600x900 fit-to-frame tab and push its frame to Meet's display canvas."""
     b_url = getattr(cfg, "brief_url", "") or getattr(state, "brief_url", "") or ""
     if not b_url or not _is_safe_brief_url(b_url):
         return False
@@ -1931,20 +2075,38 @@ def _refresh_brief_canvas(page, brief_state: dict, cfg: _BotConfig, state: _BotS
         b_page = brief_state.get("page")
         if b_page is None or b_page.is_closed():
             b_page = page.context.new_page()
-            b_page.set_viewport_size({"width": 1920, "height": 1080})
+            b_page.set_viewport_size({"width": 1600, "height": 900})
             b_api_key = os.environ.get("UOP_MEETINGS_API_KEY", "").strip() or "uop-meetings-local-dev-key"
             b_actor = os.environ.get("HERMES_MEET_BRIEF_ACTOR", "").strip() or "moten@uropenn.se"  # health: allow HX002 -- optional actor override for meetings brief screenshare
             _quiet(b_page.set_extra_http_headers, {"X-Api-Key": b_api_key, "X-Actor-Email": b_actor})
-            b_page.goto(b_url, wait_until="domcontentloaded", timeout=15_000)
-            b_page.evaluate("document.body && document.body.classList.add('screenshare')")
+            b_page.goto(b_url, wait_until="load", timeout=15_000)
+            fit_info = _quiet(b_page.evaluate, _BRIEF_FIT_TO_FRAME_JS)
+            _quiet(b_page.wait_for_timeout, 350)
+            sys.stderr.write(f"[meet_bot] brief_fit={fit_info!r}\n")
+            sys.stderr.flush()
             brief_state["page"] = b_page
-        jpeg_bytes = b_page.screenshot(type="jpeg", quality=84)
-        data_url = "data:image/jpeg;base64," + base64.b64encode(jpeg_bytes).decode("ascii")
-        ok = _quiet(page.evaluate, "u => window.__hermesUpdateBriefFrame && window.__hermesUpdateBriefFrame(u)", data_url)
+        jpeg_bytes = b_page.screenshot(type="jpeg", quality=88)
+        # CRITICAL: bring the Google Meet tab back to the foreground immediately so
+        # Chromium never throttles/suspends the Meet compositor or captureStream encoder!
+        _quiet(page.bring_to_front)
+        try:
+            out_dir = Path(cfg.out_dir) if getattr(cfg, "out_dir", None) else None
+            if out_dir and out_dir.exists() and not brief_state.get("saved_brief_shot"):
+                (out_dir / "brief_rendered.jpg").write_bytes(jpeg_bytes)
+                brief_state["saved_brief_shot"] = True
+        except Exception:
+            pass
+        b64_str = base64.b64encode(jpeg_bytes).decode("ascii")
+        res = _quiet(page.evaluate, "async b64 => window.__hermesUpdateBriefFrame ? await window.__hermesUpdateBriefFrame(b64) : {ok:false, error:'no_fn'}", b64_str)
         brief_state["last_frame_at"] = time.time()
-        return bool(ok)
+        ok = bool(isinstance(res, dict) and res.get("ok"))
+        sys.stderr.write(f"[meet_bot] brief_canvas_frame ok={ok} bytes={len(jpeg_bytes)} res={res!r}\n")
+        sys.stderr.flush()
+        return ok
     except Exception as exc:  # health: allow BLE001 -- best effort background canvas refresh
-        print(f"[meet_bot] brief_canvas_refresh failed: {exc}", flush=True)
+        _quiet(page.bring_to_front)
+        sys.stderr.write(f"[meet_bot] brief_canvas_refresh failed: {exc}\n")
+        sys.stderr.flush()
         return False
 
 
@@ -1952,41 +2114,101 @@ def _start_brief_presentation(page, brief_state: dict, cfg: _BotConfig, state: _
     """Start sharing the 1920x1080 pre-meeting brief canvas inside Google Meet."""
     if not _refresh_brief_canvas(page, brief_state, cfg, state):
         return False
-    for sel in (
-        'button[aria-label*="Present now" i]',
-        'button[aria-label*="Presentera nu" i]',
-        'button[aria-label*="Share screen" i]',
-        'button[aria-label*="Dela skärm" i]',
-    ):
-        btn = _visible(page.locator(sel))
-        if btn is not None and _quiet(_click_nowait, btn, 2_000):
-            _quiet(page.wait_for_timeout, 800)
-            for item_sel in (
-                '[role="menuitem"]:has-text("entire screen")',
-                '[role="menuitem"]:has-text("hela skärmen")',
-                '[role="menuitem"]:has-text("fönster")',
-                '[role="menuitem"]:has-text("window")',
-                '[role="menuitem"]:has-text("flik")',
-                '[role="menuitem"]:has-text("tab")',
-            ):
-                m_item = _visible(page.locator(item_sel))
-                if m_item is not None:
-                    _quiet(_click_nowait, m_item, 2_000)
-                    break
+    _quiet(page.bring_to_front)
+    # Turn off the bot's black virtual camera if on, and dismiss any "Kameran kan vara blockerad" popup
+    _quiet(lambda: page.locator('button[aria-label*="Stäng av kameran" i], button[aria-label*="Turn off camera" i]').first.click(timeout=1_500))
+    _quiet(page.keyboard.press, "Escape")
+    _quiet(page.wait_for_timeout, 300)
+    # Wake Meet's auto-hiding bottom control bar with a mouse move
+    _quiet(page.mouse.move, 640, 660)
+    _quiet(page.wait_for_timeout, 400)
+    console_errs: list[str] = []
+    def _on_console(msg):
+        if msg.type in ("error", "warning"):
+            console_errs.append(f"{msg.type}:{msg.text[:160]}")
+    page.on("console", _on_console)
+    try:
+        gdm_check = _quiet(page.evaluate, "() => ({ fn: String(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia).slice(0, 80), secure: window.isSecureContext, vis: document.visibilityState, focus: document.hasFocus() })")
+        sys.stderr.write(f"[meet_bot] brief_pre_click gdm={gdm_check!r}\n")
+        sys.stderr.flush()
+        btn_info = _quiet(page.evaluate, """() => {
+          const re = /(?:present now|presentera nu|share screen|dela sk[äa]rm|dela din sk[äa]rm)/i;
+          const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+          for (let i = 0; i < btns.length; i++) {
+            const b = btns[i];
+            const lbl = [b.getAttribute('aria-label') || '', b.getAttribute('data-tooltip') || '', b.innerText || ''].join(' ').trim();
+            if (!re.test(lbl)) continue;
+            const r = b.getBoundingClientRect();
+            if (r.width > 4 && r.height > 4) {
+              b.setAttribute('data-hermes-present-btn', '1');
+              return { label: lbl, x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height, disabled: !!b.disabled, ariaDisabled: b.getAttribute('aria-disabled'), jsaction: (b.getAttribute('jsaction') || '').slice(0, 80) };
+            }
+          }
+          return null;
+        }""")
+        if btn_info:
+            sys.stderr.write(f"[meet_bot] brief_click_present info={btn_info!r}\n")
+            sys.stderr.flush()
+            # Use Playwright locator.click() for full trusted focus + pointer + click event sequence
+            loc = page.locator('[data-hermes-present-btn="1"]').first
+            click_ok = _quiet(lambda: (loc.click(timeout=3_000), True))
+            if not click_ok:
+                _quiet(page.mouse.click, btn_info["x"], btn_info["y"])
+            _quiet(page.wait_for_timeout, 1500)
+            dbg_mid = _quiet(page.evaluate, "() => window.__hermesBriefDebug || null")
+            if not (isinstance(dbg_mid, dict) and (dbg_mid.get("getDisplayMediaCalls") or 0) > 0):
+                # Check if a dialog/menu popped up after clicking Present
+                pop = _quiet(page.evaluate, """() => {
+                  const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="dialog"] button, [role="menu"] li, [role="menu"] button'));
+                  return items.map(el => ({
+                    role: el.getAttribute('role') || el.tagName,
+                    txt: (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 80),
+                    w: Math.round(el.getBoundingClientRect().width),
+                    x: Math.round(el.getBoundingClientRect().left + el.getBoundingClientRect().width/2),
+                    y: Math.round(el.getBoundingClientRect().top + el.getBoundingClientRect().height/2),
+                  })).filter(x => x.w > 4 && x.txt).slice(0, 20);
+                }""")
+                sys.stderr.write(f"[meet_bot] brief_post_click_popups items={pop!r} console={console_errs[-5:]!r}\n")
+                sys.stderr.flush()
+                if isinstance(pop, list):
+                    for item in pop:
+                        if re.search(r"(?:entire screen|hela sk[äa]rmen|f[öo]nster|window|flik|tab|forts[äa]tt|continue|dela|share|presentera|present)", item.get("txt", ""), re.IGNORECASE):
+                            sys.stderr.write(f"[meet_bot] brief_click_popup item={item!r}\n")
+                            sys.stderr.flush()
+                            _quiet(page.mouse.click, item["x"], item["y"])
+                            _quiet(page.wait_for_timeout, 1500)
+                            break
             brief_state["started_at"] = time.time()
-            state.set(brief_sharing=True, brief_url=getattr(cfg, "brief_url", None))
-            print(f"[meet_bot] brief_presentation=started url={getattr(cfg, 'brief_url', '')!r}", flush=True)
-            return True
-    # Even if toolbar button is hidden, warm the display track so manual/API trigger works
-    brief_state["started_at"] = time.time()
-    state.set(brief_sharing=True, brief_url=getattr(cfg, "brief_url", None))
-    return True
+            _quiet(page.wait_for_timeout, 1500)
+            _refresh_brief_canvas(page, brief_state, cfg, state)
+            dbg = _quiet(page.evaluate, "() => window.__hermesBriefDebug || null")
+            sys.stderr.write(f"[meet_bot] brief_presentation=post_click btn={btn_info.get('label')!r} debug={dbg!r} console={console_errs[-8:]!r}\n")
+            sys.stderr.flush()
+            try:
+                out_dir = Path(cfg.out_dir) if getattr(cfg, "out_dir", None) else None
+                if out_dir and out_dir.exists():
+                    page.screenshot(path=str(out_dir / "meet_presenting.jpg"), type="jpeg", quality=82)
+            except Exception:
+                pass
+            if isinstance(dbg, dict) and (dbg.get("getDisplayMediaCalls") or 0) > 0:
+                state.set(brief_sharing=True, brief_url=getattr(cfg, "brief_url", None))
+                return True
+            sys.stderr.write(f"[meet_bot] brief_presentation=CLICKED_BUT_NO_GDM debug={dbg!r}\n")
+            sys.stderr.flush()
+            return False
+        btn_labels = _quiet(page.evaluate, "() => Array.from(document.querySelectorAll('button')).map(b => ({l: b.getAttribute('aria-label') || b.innerText, r: b.getBoundingClientRect().width})).filter(x => x.l).slice(0, 40)")
+        sys.stderr.write(f"[meet_bot] brief_presentation=NO_PRESENT_BTN buttons={btn_labels!r}\n")
+        sys.stderr.flush()
+        return False
+    finally:
+        _quiet(page.remove_listener, "console", _on_console)
 
 
 def _stop_brief_presentation(page, brief_state: dict, state: _BotState, reason: str = "stopped") -> None:
     """Stop sharing the pre-meeting brief canvas and close the helper tab."""
     _quiet(page.evaluate, "window.__hermesStopBriefDisplay && window.__hermesStopBriefDisplay()")
     for stop_sel in (
+        'button:has-text("Avsluta presentationen")',
         'button:has-text("Stop presenting")',
         'button:has-text("Sluta presentera")',
         'button:has-text("Stop sharing")',
