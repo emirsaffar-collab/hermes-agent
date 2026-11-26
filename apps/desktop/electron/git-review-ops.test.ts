@@ -13,6 +13,7 @@ import {
   REVIEW_FILE_CAP,
   reviewCreatePr,
   reviewList,
+  reviewRevertPatch,
   simpleGitHostEnv
 } from './git-review-ops'
 import type * as NoConsoleGit from './no-console-git'
@@ -329,4 +330,52 @@ test('reviewCreatePr falls back to the generic message when gh reports no stderr
   failGh('')
 
   await assert.rejects(reviewCreatePr(dir, 'git', 'gh'), /is gh installed and authenticated\?/)
+})
+
+test('reviewRevertPatch pipes patch over stdin with --reverse (and --cached when staged)', async () => {
+  const dir = makeRepo()
+  const patch = '--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-tracked\n+changed\n'
+  const stdinChunks: string[] = []
+
+  const calls: Array<{ args: string[]; bin: string; cwd?: string }> = []
+
+  ;(
+    mockExecFile as unknown as {
+      mockImplementation: (
+        impl: (
+          bin: string,
+          args: string[],
+          opts: { cwd?: string },
+          callback: ExecFileCallback
+        ) => { stdin: { end: (chunk: string) => void } }
+      ) => unknown
+    }
+  ).mockImplementation((bin, args, opts, callback) => {
+    calls.push({ args, bin, cwd: opts.cwd })
+
+    return {
+      stdin: {
+        end(chunk: string) {
+          stdinChunks.push(chunk)
+          callback(null, '', '')
+        }
+      }
+    }
+  })
+
+  await reviewRevertPatch(dir, 'tracked.txt', patch, false, '/usr/bin/git')
+  await reviewRevertPatch(dir, 'tracked.txt', patch, true, '/usr/bin/git')
+
+  assert.equal(calls.length, 2)
+  assert.deepEqual(calls[0].args, ['apply', '--reverse', '--unidiff-zero', '--whitespace=nowarn', '-'])
+  assert.deepEqual(calls[1].args, ['apply', '--reverse', '--cached', '--unidiff-zero', '--whitespace=nowarn', '-'])
+  assert.equal(stdinChunks[0], patch)
+  assert.equal(stdinChunks[1], patch)
+})
+
+test('reviewRevertPatch rejects empty patches and invalid file paths', async () => {
+  const dir = makeRepo()
+
+  await assert.rejects(reviewRevertPatch(dir, 'tracked.txt', '   ', false, 'git'), /empty patch/i)
+  await assert.rejects(reviewRevertPatch(dir, 'bad\0path', '--- a/x\n', false, 'git'), /invalid file path/i)
 })

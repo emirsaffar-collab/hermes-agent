@@ -368,7 +368,22 @@ export const zhHantChat = {
       branchOffFrom: base => `從 ${base} 建立新分支`,
       switchTo: branch => `切換到 ${branch}`,
       switchFailed: branch => `無法切換到 ${branch}`,
-      worktrees: '工作樹'
+      worktrees: '工作樹',
+      addComment: '新增評論',
+      commentPlaceholder: shortcut => `新增審查評論（${shortcut} 儲存）`,
+      saveComment: '儲存',
+      cancelComment: '取消',
+      editComment: '編輯',
+      deleteComment: '刪除',
+      commentStale: '已過時',
+      revertHunk: '還原此區塊',
+      revertSelectedLines: count => `還原 ${count} 行`,
+      revertPatchFailed: '無法還原修補檔',
+      commentsBatchSummary: (comments, files) => `${files} 個檔案中共 ${comments} 則評論`,
+      clearComments: '清除',
+      sendCommentsToChat: '傳送到對話',
+      commentSelectedLines: '評論選取行',
+      clearSelection: '清除選取'
     }
   },
 

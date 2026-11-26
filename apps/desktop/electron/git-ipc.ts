@@ -17,6 +17,7 @@ import {
   reviewPrList,
   reviewPush,
   reviewRevert,
+  reviewRevertPatch,
   reviewRevParse,
   reviewShipInfo,
   reviewStage,
@@ -85,6 +86,9 @@ export function registerGitIpc({ resolveGitBinary, resolveGhBinary }: GitIpcDeps
   )
   ipcMain.handle('hermes:git:review:revert', async (_event, repoPath, filePath) =>
     reviewRevert(repoPath, filePath ?? null, resolveGitBinary())
+  )
+  ipcMain.handle('hermes:git:review:revertPatch', async (_event, repoPath, filePath, patchText, staged) =>
+    reviewRevertPatch(repoPath, filePath ?? null, patchText, Boolean(staged), resolveGitBinary())
   )
   ipcMain.handle('hermes:git:review:revParse', async (_event, repoPath, ref) =>
     reviewRevParse(repoPath, ref, resolveGitBinary())

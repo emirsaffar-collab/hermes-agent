@@ -44,6 +44,7 @@ import {
   stageReviewFile,
   unstageReviewFile
 } from '@/store/review'
+import { $reviewComments, normalizeRepoKey } from '@/store/review-comments'
 import { $currentCwd } from '@/store/session'
 
 import { pickRevealLabel } from '../file-actions'
@@ -313,6 +314,7 @@ function ReviewFileRow({ node, depth }: { node: ReviewTreeNode; depth: number })
   const { t } = useI18n()
   const c = t.statusStack.coding
   const selectedPath = useStore($reviewSelectedPath)
+  const allComments = useStore($reviewComments)
   const file = node.file!
   const selected = file.path === selectedPath
   const glyph = STATUS_GLYPH[file.status] ?? STATUS_GLYPH.M
@@ -322,6 +324,11 @@ function ReviewFileRow({ node, depth }: { node: ReviewTreeNode; depth: number })
   const scopeCwd = useStore($reviewScopeCwd)
   const activeCwd = useStore($currentCwd)
   const cwd = scopeCwd?.trim() || activeCwd
+  const repoKey = normalizeRepoKey(cwd)
+
+  const fileCommentCount = repoKey
+    ? (allComments[repoKey] ?? []).filter(item => item.filePath === file.path).length
+    : 0
 
   // Single-click shows the inline diff; double-click opens the file in the main
   // preview pane (matching the file browser). They're mutually exclusive: defer
@@ -451,6 +458,15 @@ function ReviewFileRow({ node, depth }: { node: ReviewTreeNode; depth: number })
           </Tip>
         </span>
 
+        {fileCommentCount > 0 && (
+          <span
+            className="inline-flex shrink-0 items-center gap-0.5 rounded bg-(--ui-surface-hover) px-1 text-[0.6rem] tabular-nums text-(--ui-text-secondary) group-hover/review-row:hidden"
+            data-testid="review-file-comment-count"
+          >
+            <Codicon name="comment" size="0.62rem" />
+            <span>{fileCommentCount}</span>
+          </span>
+        )}
         <DiffCount
           added={node.added}
           className="text-[0.64rem] leading-4 group-hover/review-row:hidden"

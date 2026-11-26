@@ -2691,7 +2691,22 @@ export const jaOverrides = {
       branchOffFrom: base => `${base} から新しいブランチ`,
       switchTo: branch => `${branch} に切り替え`,
       switchFailed: branch => `${branch} に切り替えできませんでした`,
-      worktrees: 'ワークツリー'
+      worktrees: 'ワークツリー',
+      addComment: 'コメントを追加',
+      commentPlaceholder: shortcut => `レビューコメントを入力（${shortcut} で保存）`,
+      saveComment: '保存',
+      cancelComment: 'キャンセル',
+      editComment: '編集',
+      deleteComment: '削除',
+      commentStale: '古い参照',
+      revertHunk: 'ハンクを元に戻す',
+      revertSelectedLines: count => `${count} 行を元に戻す`,
+      revertPatchFailed: 'パッチを元に戻せませんでした',
+      commentsBatchSummary: (comments, files) => `${files} ファイルに ${comments} 件のコメント`,
+      clearComments: 'クリア',
+      sendCommentsToChat: 'チャットに送信',
+      commentSelectedLines: '選択範囲にコメント',
+      clearSelection: '選択を解除'
     }
   },
 

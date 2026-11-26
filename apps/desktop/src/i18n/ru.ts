@@ -2947,7 +2947,22 @@ export const ruOverrides = {
       branchOffFrom: base => `Новая ветка от ${base}`,
       switchTo: branch => `Переключиться на ${branch}`,
       switchFailed: branch => `Не удалось переключиться на ${branch}`,
-      worktrees: 'Worktrees'
+      worktrees: 'Worktrees',
+      addComment: 'Добавить комментарий',
+      commentPlaceholder: shortcut => `Добавить комментарий к ревью (${shortcut} — сохранить)`,
+      saveComment: 'Сохранить',
+      cancelComment: 'Отмена',
+      editComment: 'Изменить',
+      deleteComment: 'Удалить',
+      commentStale: 'Устарел',
+      revertHunk: 'Откатить блок',
+      revertSelectedLines: count => `Откатить строки (${count})`,
+      revertPatchFailed: 'Не удалось откатить патч',
+      commentsBatchSummary: (comments, files) => `Комментариев: ${comments}, файлов: ${files}`,
+      clearComments: 'Очистить',
+      sendCommentsToChat: 'Отправить в чат',
+      commentSelectedLines: 'Комментировать выделение',
+      clearSelection: 'Снять выделение'
     }
   },
   updates: {

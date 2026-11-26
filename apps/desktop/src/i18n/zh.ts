@@ -3617,7 +3617,22 @@ export const zhOverrides = {
       branchOffFrom: base => `从 ${base} 新建分支`,
       switchTo: branch => `切换到 ${branch}`,
       switchFailed: branch => `无法切换到 ${branch}`,
-      worktrees: '工作树'
+      worktrees: '工作树',
+      addComment: '添加评论',
+      commentPlaceholder: shortcut => `添加审查评论（${shortcut} 保存）`,
+      saveComment: '保存',
+      cancelComment: '取消',
+      editComment: '编辑',
+      deleteComment: '删除',
+      commentStale: '已过期',
+      revertHunk: '撤销此区块',
+      revertSelectedLines: count => `撤销 ${count} 行`,
+      revertPatchFailed: '无法撤销补丁',
+      commentsBatchSummary: (comments, files) => `${files} 个文件中共有 ${comments} 条评论`,
+      clearComments: '清空',
+      sendCommentsToChat: '发送到对话',
+      commentSelectedLines: '评论选中行',
+      clearSelection: '清除选择'
     }
   },
 

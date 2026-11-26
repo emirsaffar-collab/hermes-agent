@@ -21,6 +21,7 @@ import {
   $reviewLoading,
   $reviewRevertTarget,
   $reviewScope,
+  $reviewScopeCwd,
   $reviewSelectedPath,
   $reviewTreeMode,
   cancelRevert,
@@ -29,15 +30,28 @@ import {
   confirmRevert,
   refreshReview,
   requestRevert,
+  revertReviewPatch,
   stageReviewFile,
   toggleReviewTreeMode,
   unstageReviewFile
 } from '@/store/review'
+import {
+  $activeDraftAnchor,
+  $reviewComments,
+  addReviewComment,
+  closeDraftAnchor,
+  deleteReviewComment,
+  normalizeRepoKey,
+  openDraftAnchor,
+  updateReviewComment
+} from '@/store/review-comments'
+import { $currentCwd } from '@/store/session'
 
 import { SidebarPanelLabel } from '../../shell/sidebar-label'
 import { PaneEmptyState, RightSidebarSectionHeader } from '../index'
 
 import { ReviewFileTree } from './file-tree'
+import { ReviewCommentBatchBar } from './review-comment-batch-bar'
 import { ReviewScopeRow } from './scope-row'
 import { ReviewShipBar } from './ship-bar'
 
@@ -58,11 +72,21 @@ export function ReviewPane() {
   const revertTarget = useStore($reviewRevertTarget)
   const treeMode = useStore($reviewTreeMode)
   const scope = useStore($reviewScope)
+  const scopeCwd = useStore($reviewScopeCwd)
+  const currentCwd = useStore($currentCwd)
+  const allComments = useStore($reviewComments)
+  const draftAnchor = useStore($activeDraftAnchor)
   // Stage / unstage / revert and the ship bar act on the working tree, so they
   // only apply to the uncommitted scope; branch / last-turn are read-only.
   const isUncommitted = scope === 'uncommitted'
 
+  const repoCwd = scopeCwd || currentCwd
+  const repoKey = normalizeRepoKey(repoCwd)
   const selectedFile = files.find(file => file.path === selectedPath)
+
+  const selectedFileComments =
+    selectedFile && repoKey ? (allComments[repoKey] ?? []).filter(item => item.filePath === selectedFile.path) : []
+
   const hasFiles = files.length > 0
   // A repo (or a load that may reveal one) gets the header + scope chrome.
   const showChrome = loading || isRepo
@@ -204,13 +228,43 @@ export function ReviewPane() {
                 <DiffSkeleton />
               ) : null
             ) : diff ? (
-              <FileDiffPanel className="mx-0 mb-0 h-full max-h-none" diff={diff} path={selectedFile.path} virtualized />
+              <FileDiffPanel
+                className="mx-0 mb-0 h-full max-h-none"
+                diff={diff}
+                path={selectedFile.path}
+                review={{
+                  canRevert: isUncommitted,
+                  comments: selectedFileComments,
+                  draftAnchor,
+                  filePath: selectedFile.path,
+                  onAddComment: comment => {
+                    addReviewComment(comment)
+                  },
+                  onCancelDraft: closeDraftAnchor,
+                  onDeleteComment: id => deleteReviewComment(repoCwd ?? '', id),
+                  onRevertPatch: async (patchText, staged) => {
+                    try {
+                      await revertReviewPatch(selectedFile.path, patchText, staged)
+                    } catch (err) {
+                      notifyError(err, c.revertPatchFailed)
+                    }
+                  },
+                  onStartDraft: openDraftAnchor,
+                  onUpdateComment: (id, body) => updateReviewComment(repoCwd ?? '', id, body),
+                  repoCwd: repoCwd ?? '',
+                  scope,
+                  staged: selectedFile.staged
+                }}
+                virtualized
+              />
             ) : (
               <div className="py-6 text-center text-[0.66rem] text-muted-foreground/60">{c.noDiff}</div>
             )}
           </div>
         </div>
       )}
+
+      <ReviewCommentBatchBar />
 
       <ReviewShipBar />
 

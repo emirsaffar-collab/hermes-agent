@@ -3213,6 +3213,21 @@ export interface Translations extends NoticeTranslations {
       switchTo: (branch: string) => string
       switchFailed: (branch: string) => string
       worktrees: string
+      addComment: string
+      commentPlaceholder: (shortcut: string) => string
+      saveComment: string
+      cancelComment: string
+      editComment: string
+      deleteComment: string
+      commentStale: string
+      revertHunk: string
+      revertSelectedLines: (count: number) => string
+      revertPatchFailed: string
+      commentsBatchSummary: (comments: number, files: number) => string
+      clearComments: string
+      sendCommentsToChat: string
+      commentSelectedLines: string
+      clearSelection: string
     }
   }
 

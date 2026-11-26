@@ -34,11 +34,13 @@ import {
   requestRevert,
   revealReview,
   revertReviewFile,
+  revertReviewPatch,
   selectReviewFile,
   stageReviewFile,
   toggleReview,
   unstageReviewFile
 } from './review'
+import { $activeDraftAnchor, $reviewComments, addReviewComment } from './review-comments'
 import { $busy, $currentCwd } from './session'
 import { $sessionStates } from './session-states'
 
@@ -80,6 +82,7 @@ function stubReview(over: ReviewStub = {}) {
     stage: vi.fn(async () => undefined),
     unstage: vi.fn(async () => undefined),
     revert: vi.fn(async () => undefined),
+    revertPatch: vi.fn(async () => ({ ok: true })),
     revParse: vi.fn(async () => null),
     commit: vi.fn(async () => undefined),
     commitContext: vi.fn(async () => ({ diff: 'd', recent: 'r' })),
@@ -119,6 +122,8 @@ beforeEach(() => {
   $currentCwd.set('/repo')
   $busy.set(false)
   $sessionStates.set({})
+  $reviewComments.set({})
+  $activeDraftAnchor.set(null)
 })
 
 afterEach(() => {
@@ -706,10 +711,12 @@ describe('mutation gating', () => {
     await stageReviewFile('a.ts')
     await unstageReviewFile('a.ts')
     await revertReviewFile('a.ts')
+    await revertReviewPatch('a.ts', '--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-a\n+b\n', false)
 
     expect(review.stage).not.toHaveBeenCalled()
     expect(review.unstage).not.toHaveBeenCalled()
     expect(review.revert).not.toHaveBeenCalled()
+    expect(review.revertPatch).not.toHaveBeenCalled()
   })
 
   it('still mutates under the default uncommitted scope', async () => {
@@ -718,5 +725,34 @@ describe('mutation gating', () => {
     await stageReviewFile('a.ts')
 
     expect(review.stage).toHaveBeenCalledWith('/repo', 'a.ts')
+  })
+
+  it('forwards revertReviewPatch with repo cwd, filePath, patchText, and staged flag', async () => {
+    const review = stubReview()
+    const patch = '--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-a\n+b\n'
+
+    await revertReviewPatch('a.ts', patch, true)
+
+    expect(review.revertPatch).toHaveBeenCalledWith('/repo', 'a.ts', patch, true)
+  })
+
+  it('marks comments stale when their file disappears from refreshReview', async () => {
+    stubReview({ list: vi.fn(async () => ({ files: [file('b.ts')] })) })
+    $reviewOpen.set(true)
+    addReviewComment({
+      body: 'check this',
+      endLine: 3,
+      filePath: 'a.ts',
+      hunkHeader: '@@ -1,1 +1,1 @@',
+      repoCwd: '/repo',
+      scope: 'uncommitted',
+      side: 'new',
+      snippet: ['+x'],
+      startLine: 3
+    })
+
+    await refreshReview()
+
+    expect($reviewComments.get()['/repo']?.[0]?.stale).toBe(true)
   })
 })

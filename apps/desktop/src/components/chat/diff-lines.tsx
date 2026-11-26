@@ -4,6 +4,7 @@ import * as React from 'react'
 import type { BundledLanguage, ShikiTransformer, ThemedToken } from 'shiki'
 
 import { chunkLines, type LineChunk, useFixedRowWindow } from '@/components/chat/fixed-row-window'
+import { type FileDiffReviewOptions, InteractiveReviewDiff } from '@/components/chat/interactive-diff-review'
 import { exceedsHighlightBudget, SHIKI_THEME } from '@/components/chat/shiki-highlighter'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { useSeenOnce } from '@/hooks/use-seen-once'
@@ -563,6 +564,8 @@ function DiffOverviewRuler({ lines }: { lines: DiffLine[] }) {
   )
 }
 
+export type { FileDiffReviewOptions }
+
 interface FileDiffPanelProps {
   /** Override the default (tool-card) box styling — the full-height preview
    *  cancels the bleed/clamp so the diff fills its pane. */
@@ -572,6 +575,9 @@ interface FileDiffPanelProps {
    *  full-file view so unchanged lines are preserved between hunks. */
   fullText?: string
   path?: string
+  /** When supplied, renders the hunk-aware interactive review view with inline
+   *  comments, Shift+Click range selection, and hunk/line revert actions. */
+  review?: FileDiffReviewOptions
   /** Render an old/new line-number gutter (the full preview diff). The compact
    *  tool-card + inline review diff leave this off. */
   showLineNumbers?: boolean
@@ -586,9 +592,34 @@ export function FileDiffPanel({
   diff,
   fullText,
   path,
+  review,
   showLineNumbers = false,
   virtualized = false
 }: FileDiffPanelProps) {
+  if (review) {
+    return <InteractiveReviewDiff className={className} diff={diff} path={path} review={review} />
+  }
+
+  return (
+    <StaticFileDiffPanel
+      className={className}
+      diff={diff}
+      fullText={fullText}
+      path={path}
+      showLineNumbers={showLineNumbers}
+      virtualized={virtualized}
+    />
+  )
+}
+
+function StaticFileDiffPanel({
+  className,
+  diff,
+  fullText,
+  path,
+  showLineNumbers = false,
+  virtualized = false
+}: Omit<FileDiffPanelProps, 'review'>) {
   const lines = React.useMemo(
     () => (fullText != null ? parseFullFileDiff(diff, fullText) : parseDiff(diff)),
     [diff, fullText]

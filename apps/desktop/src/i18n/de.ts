@@ -4167,7 +4167,23 @@ export const deOverrides = {
       branchOffFrom: base => `Neuer Branch von ${base}`,
       switchTo: branch => `Zu ${branch} wechseln`,
       switchFailed: branch => `Zu ${branch} konnte nicht gewechselt werden`,
-      worktrees: 'Worktrees'
+      worktrees: 'Worktrees',
+      addComment: 'Kommentar hinzufügen',
+      commentPlaceholder: shortcut => `Review-Kommentar hinzufügen (${shortcut} zum Speichern)`,
+      saveComment: 'Speichern',
+      cancelComment: 'Abbrechen',
+      editComment: 'Bearbeiten',
+      deleteComment: 'Löschen',
+      commentStale: 'Veraltet',
+      revertHunk: 'Hunk zurücksetzen',
+      revertSelectedLines: count => (count === 1 ? '1 Zeile zurücksetzen' : `${count} Zeilen zurücksetzen`),
+      revertPatchFailed: 'Patch konnte nicht zurückgesetzt werden',
+      commentsBatchSummary: (comments, files) =>
+        `${comments} ${comments === 1 ? 'Kommentar' : 'Kommentare'} in ${files} ${files === 1 ? 'Datei' : 'Dateien'}`,
+      clearComments: 'Leeren',
+      sendCommentsToChat: 'An Chat senden',
+      commentSelectedLines: 'Auswahl kommentieren',
+      clearSelection: 'Auswahl aufheben'
     }
   },
   updates: {
