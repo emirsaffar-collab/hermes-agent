@@ -233,6 +233,40 @@ _FAKE_WORKER_SCRIPT = textwrap.dedent(
                     }))
                     continue
 
+                if method == "session.active_list":
+                    current_sid = str(params.get("current_session_id") or "")
+                    rows = []
+                    for rt_sid, stored in STATE["live_sessions"].items():
+                        rows.append({
+                            "id": rt_sid,
+                            "session_key": stored,
+                            "current": rt_sid == current_sid,
+                            "status": "working" if rt_sid in STATE["active_turns"] else "idle",
+                            "gen": args.gen,
+                        })
+                    await ws.send_text(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "result": {"sessions": rows},
+                    }))
+                    continue
+
+                if method == "process.list":
+                    sid = str(params.get("session_id") or "")
+                    if sid not in STATE["live_sessions"]:
+                        await ws.send_text(json.dumps({
+                            "jsonrpc": "2.0",
+                            "id": rid,
+                            "error": {"code": 5010, "message": f"session {sid} not in memory"},
+                        }))
+                        continue
+                    await ws.send_text(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "result": {"processes": [], "gen": args.gen, "session_id": sid},
+                    }))
+                    continue
+
                 if method in ("prompt.submit", "prompt.send"):
                     sid = params.get("session_id", "")
                     if params.get("strict_session") and sid not in STATE["live_sessions"]:
@@ -244,6 +278,7 @@ _FAKE_WORKER_SCRIPT = textwrap.dedent(
                         continue
                     need_approval = bool(params.get("require_approval"))
                     cancel_srq = bool(params.get("cancel_srq"))
+                    hold_s = float(params.get("hold_s") or 0.0)
                     STATE["active_turns"].add(sid)
                     await ws.send_text(json.dumps({
                         "jsonrpc": "2.0",
@@ -257,8 +292,10 @@ _FAKE_WORKER_SCRIPT = textwrap.dedent(
                         "params": {"type": "message.start", "session_id": sid, "gen": args.gen},
                     }))
 
-                    async def _run_turn(session_id: str, require_srq: bool, do_cancel: bool):
+                    async def _run_turn(session_id: str, require_srq: bool, do_cancel: bool, hold_for: float):
                         try:
+                            if hold_for > 0:
+                                await asyncio.sleep(hold_for)
                             await ws.send_text(json.dumps({
                                 "jsonrpc": "2.0",
                                 "method": "event",
@@ -317,7 +354,7 @@ _FAKE_WORKER_SCRIPT = textwrap.dedent(
                         finally:
                             STATE["active_turns"].discard(session_id)
 
-                    asyncio.create_task(_run_turn(sid, need_approval, cancel_srq))
+                    asyncio.create_task(_run_turn(sid, need_approval, cancel_srq, hold_s))
                     continue
 
                 await ws.send_text(json.dumps({
@@ -1009,8 +1046,27 @@ def test_tui_gateway_wire_contract_drift_guard():
     assert _extract_request_cancel_id("request.cancel", {"id": "srq-42"}) == "srq-42"
     assert _strip_single_use_ticket_qs("ticket=secret123&profile=work") == "profile=work"
 
-    # Every real tui_gateway prompt/subagent method must be session-scoped
-    for m in ("prompt.submit", "prompt.background", "prompt.btw", "prompt.enqueue", "prompt.cancel", "subagent.steer", "subagent.kill"):
+    # Every real tui_gateway prompt/subagent/process/tool session-scoped method must be session-scoped
+    for m in (
+        "prompt.submit",
+        "prompt.background",
+        "prompt.btw",
+        "prompt.enqueue",
+        "prompt.cancel",
+        "subagent.steer",
+        "subagent.kill",
+        "process.list",
+        "process.stop",
+        "process.kill",
+        "shell.exec",
+        "cli.exec",
+        "command.dispatch",
+        "slash.exec",
+        "rollback.list",
+        "handoff.request",
+        "terminal.resize",
+        "agents.list",
+    ):
         assert _is_session_scoped_method(m), f"{m} must be session-scoped"
 
     # Cross-check against real tui_gateway source files so upstream renames fail CI immediately
@@ -1021,3 +1077,213 @@ def test_tui_gateway_wire_contract_drift_guard():
     assert '"request.cancel"' in srq_src
     voice_src = (root / "tui_gateway" / "methods_voice.py").read_text(encoding="utf-8")
     assert '"client.capabilities"' in voice_src
+
+
+def test_active_list_merges_draining_and_rehydrated_sessions_and_routes_process_list(tmp_path: Path):
+    """Regression: Desktop's 45s silent-turn probe calls ``session.active_list``.
+
+    1. A live turn pinned on draining gen-1 MUST still appear with status='working'
+       after rollover to gen-2 (prevents false "Hermes ended this turn without a reply.").
+    2. An idle session transparently rehydrated onto gen-2 (with a different worker_sid)
+       MUST have its row ``id`` translated back to client_sid and ``current`` recomputed.
+    3. ``process.list`` MUST route to the pinned draining worker for active turns AND
+       rehydrate cleanly on gen-2 for idle sessions instead of failing "not in memory".
+    """
+    worker_py = tmp_path / "fake_worker.py"
+    worker_py.write_text(_FAKE_WORKER_SCRIPT, encoding="utf-8")
+
+    async def _scenario():
+        sup = ServeSupervisor(
+            host="127.0.0.1",
+            port=0,
+            session_token="tok-active-list",
+            worker_cmd_builder=lambda gen, fd: [
+                sys.executable, str(worker_py), "--gen", str(gen), "--token-fd", str(fd)
+            ],
+            drain_poll_s=0.1,
+            drain_settle_s=0.2,
+        )
+        srv, task, port = await _start_supervisor_server(sup)
+        try:
+            ws_url = f"ws://127.0.0.1:{port}/api/ws"
+            headers = {"X-Hermes-Session-Token": "tok-active-list"}
+            async with websockets.connect(ws_url, additional_headers=headers) as ws:
+                # Create two sessions on gen-1: sid1 will hold an active turn across rollover;
+                # sid2 stays idle and hands off to gen-2 after rollover.
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": "c1", "method": "session.create", "params": {"stored_session_id": "stored-a"}}))
+                r1 = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                sid1 = r1["result"]["session_id"]
+
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": "c2", "method": "session.create", "params": {"stored_session_id": "stored-b"}}))
+                r2 = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                sid2 = r2["result"]["session_id"]
+
+                # Enable approval capability so sid1's turn pauses cleanly on gen-1
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "cap",
+                    "method": "client.capabilities",
+                    "params": {"server_requests": ["approval"]},
+                }))
+                json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+
+                # Start a turn on sid1 that waits for approval on gen-1
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "p1",
+                    "method": "prompt.submit",
+                    "params": {"session_id": sid1, "require_approval": True, "strict_session": True},
+                }))
+                srq_id = None
+                for _ in range(10):
+                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                    if ev.get("method") == "approval.request":
+                        srq_id = ev["id"]
+                        break
+                assert srq_id is not None
+
+                # Roll over to gen-2 while sid1 is mid-turn on draining gen-1
+                rec = await sup.rollover(reason="test-active-list")
+                assert rec["new_gen"] == 2
+                w1 = sup.get_worker(1)
+                assert w1 is not None and w1.draining
+
+                # Send process.list for pinned sid1 -> MUST hit draining gen-1, NOT gen-2!
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "pl1",
+                    "method": "process.list",
+                    "params": {"session_id": sid1},
+                }))
+                pl1 = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                assert "result" in pl1, f"process.list on draining sid1 failed: {pl1}"
+                assert pl1["result"]["gen"] == 1
+                assert pl1["result"]["session_id"] == sid1
+
+                # Send process.list for idle sid2 -> MUST rehydrate onto gen-2 and rewrite sid back!
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "pl2",
+                    "method": "process.list",
+                    "params": {"session_id": sid2},
+                }))
+                pl2 = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                assert "result" in pl2, f"process.list on rehydrated sid2 failed: {pl2}"
+                assert pl2["result"]["gen"] == 2
+                assert pl2["result"]["session_id"] == sid2
+
+                # Start a held turn on rehydrated sid2 (gen-2 assigns a DIFFERENT worker_sid!)
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "p2",
+                    "method": "prompt.submit",
+                    "params": {"session_id": sid2, "hold_s": 0.6, "strict_session": True},
+                }))
+                got_start2 = False
+                for _ in range(6):
+                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                    if ev.get("method") == "event" and ev.get("params", {}).get("type") == "message.start":
+                        got_start2 = True
+                        break
+                assert got_start2
+
+                # Now call session.active_list! Must include BOTH:
+                # - sid1 (working on draining gen-1)
+                # - sid2 (working on active gen-2, aliased BACK from gen-2's worker_sid -> client sid2!)
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "al1",
+                    "method": "session.active_list",
+                    "params": {"current_session_id": sid2},
+                }))
+                al_resp = None
+                for _ in range(10):
+                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                    if ev.get("id") == "al1":
+                        al_resp = ev
+                        break
+                assert al_resp is not None and "result" in al_resp
+                by_id = {row["id"]: row for row in al_resp["result"]["sessions"]}
+                assert sid1 in by_id, f"Draining gen-1 live session {sid1} missing from active_list: {by_id}"
+                assert by_id[sid1]["status"] == "working"
+                assert by_id[sid1]["current"] is False
+                assert sid2 in by_id, f"Rehydrated gen-2 session {sid2} missing/unaliased in active_list: {by_id}"
+                assert by_id[sid2]["status"] == "working"
+                assert by_id[sid2]["current"] is True
+
+                # Complete sid1 cleanly so gen-1 drains
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": srq_id, "result": {"approved": True}}))
+                done_sids = set()
+                deadline = time.monotonic() + 5.0
+                while len(done_sids) < 2 and time.monotonic() < deadline:
+                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                    if ev.get("method") == "event" and ev.get("params", {}).get("type") == "message.complete":
+                        done_sids.add(ev["params"]["session_id"])
+                assert done_sids == {sid1, sid2}
+        finally:
+            await _stop_supervisor_server(sup, srv, task)
+
+    asyncio.run(_scenario())
+
+
+def test_forced_drain_timeout_emits_terminal_error_for_pinned_turns(tmp_path: Path):
+    """When drain_max_s forcibly retires a draining worker with an active turn, the
+    supervisor MUST emit a terminal ``event`` (type='error') for each pinned session
+    instead of leaving Desktop silent until the 45s no-reply watchdog fires."""
+    worker_py = tmp_path / "fake_worker.py"
+    worker_py.write_text(_FAKE_WORKER_SCRIPT, encoding="utf-8")
+
+    async def _scenario():
+        sup = ServeSupervisor(
+            host="127.0.0.1",
+            port=0,
+            session_token="tok-drain-err",
+            worker_cmd_builder=lambda gen, fd: [
+                sys.executable, str(worker_py), "--gen", str(gen), "--token-fd", str(fd)
+            ],
+            drain_poll_s=0.1,
+            drain_settle_s=0.1,
+            drain_max_s=0.4,
+        )
+        srv, task, port = await _start_supervisor_server(sup)
+        try:
+            ws_url = f"ws://127.0.0.1:{port}/api/ws"
+            headers = {"X-Hermes-Session-Token": "tok-drain-err"}
+            async with websockets.connect(ws_url, additional_headers=headers) as ws:
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": "c1", "method": "session.create", "params": {"stored_session_id": "stored-kill"}}))
+                sid = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))["result"]["session_id"]
+
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "p1",
+                    "method": "prompt.submit",
+                    "params": {"session_id": sid, "hold_s": 30.0},
+                }))
+                got_start = False
+                for _ in range(5):
+                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                    if ev.get("method") == "event" and ev.get("params", {}).get("type") == "message.start":
+                        got_start = True
+                        break
+                assert got_start
+
+                await sup.rollover(reason="test-forced-retire")
+
+                # Wait for drain_max_s to fire -> client must receive an explicit error event
+                err_ev = None
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
+                    if (
+                        ev.get("method") == "event"
+                        and ev.get("params", {}).get("type") == "error"
+                        and ev.get("params", {}).get("session_id") == sid
+                    ):
+                        err_ev = ev
+                        break
+                assert err_ev is not None, "Expected explicit error event on forced worker retirement"
+                assert "retired" in err_ev["params"]["payload"]["message"].lower()
+        finally:
+            await _stop_supervisor_server(sup, srv, task)
+
+    asyncio.run(_scenario())

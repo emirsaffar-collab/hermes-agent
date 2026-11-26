@@ -107,7 +107,26 @@ _SESSION_SCOPED_PREFIXES = (
     "permissions.",
     "subagent.",
     "subagents.",
+    "process.",
+    "shell.",
+    "cli.",
+    "command.",
+    "slash.",
+    "rollback.",
+    "handoff.",
+    "terminal.",
+    "agents.",
 )
+
+# Priority when merging ``session.active_list`` rows across active + draining workers
+# (higher wins so an active in-flight turn on a draining worker is never shadowed by an
+# idle row on the newest worker).
+_ACTIVE_LIST_STATUS_RANK: dict[str, int] = {
+    "working": 4,
+    "waiting": 3,
+    "starting": 2,
+    "idle": 1,
+}
 
 _GLOBAL_SESSION_METHODS = frozenset({
     "session.list",
@@ -385,6 +404,7 @@ class ClientWsMux:
         self._sid_to_worker: dict[tuple[str, int], str] = {}
         self._sid_from_worker: dict[tuple[str, int], str] = {}
         self._rehydrate_locks: dict[tuple[str, int], asyncio.Lock] = {}
+        self._bg_tasks: set[asyncio.Task] = set()
 
     def active_sessions_for_gen(self, gen: int) -> set[str]:
         return {sid for sid, g in self.active_turn_pins.items() if g == gen}
@@ -568,7 +588,8 @@ class ClientWsMux:
             except Exception:
                 pass
         # Clean up any leftover pins and aliases referencing this departed worker
-        for sid in [s for s, g in self.active_turn_pins.items() if g == gen]:
+        interrupted_sids = [s for s, g in self.active_turn_pins.items() if g == gen]
+        for sid in interrupted_sids:
             self.active_turn_pins.pop(sid, None)
         for rid in [r for r, g in self.pending_srq.items() if g == gen]:
             self.pending_srq.pop(rid, None)
@@ -581,6 +602,29 @@ class ClientWsMux:
             self._sid_from_worker.pop(k, None)
         for meta in self._session_meta.values():
             meta["known_gens"].discard(gen)
+        # If a draining worker was forcibly retired (e.g. drain_max_s exceeded) while turns
+        # were still pinned on it, emit an explicit terminal error event so Desktop settles
+        # cleanly instead of waiting 45s and painting "Hermes ended this turn without a reply."
+        if interrupted_sids and not self._closed:
+            for sid in interrupted_sids:
+                err_frame = {
+                    "jsonrpc": "2.0",
+                    "method": "event",
+                    "params": {
+                        "type": "error",
+                        "session_id": sid,
+                        "payload": {
+                            "message": (
+                                f"Backend worker generation {gen} retired while this turn was running; "
+                                "send or retry to continue on the active worker."
+                            ),
+                        },
+                    },
+                }
+                try:
+                    await self.send_to_client(json.dumps(err_frame))
+                except Exception:
+                    break
 
     async def _pump_upstream(self, worker: WorkerInstance, ws: Any) -> None:
         try:
@@ -839,6 +883,19 @@ class ClientWsMux:
                 await up.send(raw)
             return
 
+        method = msg.get("method", "") if isinstance(msg.get("method"), str) else ""
+        params = msg.get("params")
+
+        # Fan out ``session.active_list`` across the active worker AND any connected live
+        # draining workers, rewriting worker_sid -> client_sid on every row so Desktop's
+        # 45s silent-turn check never misclassifies a live draining or rehydrated turn as
+        # "Hermes ended this turn without a reply."
+        if method == "session.active_list" and "id" in msg and msg["id"] is not None:
+            bg = asyncio.create_task(self._handle_active_list_rpc(msg))
+            self._bg_tasks.add(bg)
+            bg.add_done_callback(self._bg_tasks.discard)
+            return
+
         target = self._choose_worker_for_client_frame(msg)
         if target is None or not target.is_alive():
             if "id" in msg and msg["id"] is not None:
@@ -850,8 +907,6 @@ class ClientWsMux:
                 await self.send_to_client(json.dumps(err))
             return
 
-        method = msg.get("method", "") if isinstance(msg.get("method"), str) else ""
-        params = msg.get("params")
         client_sid = _extract_session_id(params) if _is_session_scoped_method(method) else None
 
         if "method" in msg and "id" in msg and msg["id"] is not None:
@@ -883,9 +938,120 @@ class ClientWsMux:
                 }
                 await self.send_to_client(json.dumps(err))
 
+    async def _handle_active_list_rpc(self, msg: dict[str, Any]) -> None:
+        """Fan out ``session.active_list`` across active + connected draining workers,
+        rewriting aliased worker runtime IDs back to client-visible IDs and merging by
+        highest live-status priority."""
+        req_id = msg["id"]
+        raw_params = msg.get("params")
+        params: dict[str, Any] = dict(raw_params) if isinstance(raw_params, dict) else {}
+        client_current = str(params.get("current_session_id") or "")
+
+        active = self.supervisor.active_worker
+        workers: list[WorkerInstance] = []
+        seen_gens: set[int] = set()
+        if active is not None and active.is_alive():
+            workers.append(active)
+            seen_gens.add(active.gen)
+        # Include every other live, non-retired worker (draining generations) that this
+        # client is already connected to or has pinned turns on.
+        for gen, w in sorted(self.supervisor._workers.items(), reverse=True):
+            if gen in seen_gens or w.retired or not w.is_alive():
+                continue
+            if gen in self._upstreams or any(g == gen for g in self.active_turn_pins.values()):
+                workers.append(w)
+                seen_gens.add(gen)
+
+        if not workers:
+            err = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32002, "message": "No active Hermes worker available"},
+            }
+            await self.send_to_client(json.dumps(err))
+            return
+
+        async def _query_one(w: WorkerInstance) -> tuple[WorkerInstance, Optional[dict[str, Any]]]:
+            try:
+                up = await self.ensure_upstream(w)
+            except Exception as exc:
+                _log.debug("session.active_list upstream connect to gen=%s failed: %s", w.gen, exc)
+                return w, None
+            w_params = dict(params)
+            if client_current:
+                w_params["current_session_id"] = self._to_worker_sid(client_current, w.gen)
+            resp = await self._send_synthetic_rpc(w, up, "session.active_list", w_params, timeout_s=10.0)
+            return w, resp
+
+        results = await asyncio.gather(*(_query_one(w) for w in workers), return_exceptions=True)
+
+        merged: dict[str, tuple[tuple[int, int, int], dict[str, Any]]] = {}
+        order: list[str] = []
+        any_ok = False
+        first_error: Optional[dict[str, Any]] = None
+
+        for item in results:
+            if isinstance(item, BaseException):
+                continue
+            w, resp = item
+            if not isinstance(resp, dict):
+                continue
+            if "error" in resp:
+                if first_error is None:
+                    first_error = resp["error"]
+                continue
+            res = resp.get("result")
+            if not isinstance(res, dict) or not isinstance(res.get("sessions"), list):
+                continue
+            any_ok = True
+            for raw_row in res["sessions"]:
+                if not isinstance(raw_row, dict):
+                    continue
+                row = dict(raw_row)
+                raw_id = row.get("id")
+                if isinstance(raw_id, str) and raw_id.strip():
+                    client_sid = self._to_client_sid(raw_id.strip(), w.gen) or raw_id.strip()
+                    row["id"] = client_sid
+                else:
+                    client_sid = str(raw_id or "")
+                if client_current:
+                    row["current"] = client_sid == client_current
+                status_rank = _ACTIVE_LIST_STATUS_RANK.get(str(row.get("status") or "").lower(), 0)
+                pin_rank = 1 if (client_sid and self.active_turn_pins.get(client_sid) == w.gen) else 0
+                active_rank = 1 if (active is not None and w.gen == active.gen) else 0
+                score = (status_rank, pin_rank, active_rank)
+                dedup_key = client_sid or f"__anon_{w.gen}_{len(order)}"
+                prev = merged.get(dedup_key)
+                if prev is None:
+                    order.append(dedup_key)
+                    merged[dedup_key] = (score, row)
+                elif score > prev[0]:
+                    merged[dedup_key] = (score, row)
+
+        if self._closed:
+            return
+        if not any_ok:
+            err_body = first_error if isinstance(first_error, dict) else {
+                "code": -32003,
+                "message": "session.active_list failed on all workers",
+            }
+            await self.send_to_client(json.dumps({"jsonrpc": "2.0", "id": req_id, "error": err_body}))
+            return
+
+        sessions_out = [merged[k][1] for k in order]
+        await self.send_to_client(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"sessions": sessions_out},
+        }))
+
     async def close(self) -> None:
         self._closed = True
         self._accepted.set()
+        for t in list(self._bg_tasks):
+            if not t.done():
+                t.cancel()
+        self._bg_tasks.clear()
         for gen in list(self._upstreams.keys()):
             await self.detach_worker(gen)
 
