@@ -4201,6 +4201,7 @@ export const en: Translations = {
       toggleCommandCenter: 'Command Center',
       toggleContextUsage: 'Context meter',
       toggleRunningTimer: 'Turn timer',
+      toggleSessionCost: 'Session cost',
       toggleSessionTimer: 'Session timer',
       toggleTerminal: 'Terminal',
       toggleTokensPerSecond: 'Tokens per second',
@@ -4208,6 +4209,7 @@ export const en: Translations = {
       toggleFreeTier: 'Free tier',
       toggleWorkspace: 'Workspace',
       cacheHitRateTitle: 'Prompt cache hit rate this session — cached tokens cost less, so higher is cheaper',
+      sessionCostTitle: 'Estimated session spend (USD) across API calls in this conversation',
       tokensPerSecondTitle: 'Output tokens per second, averaged over the last 10 model calls',
       togglePlanUsage: 'Plan usage',
       planUsageTitle: (used, resetsIn) =>

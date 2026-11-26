@@ -3037,6 +3037,8 @@ export const jaOverrides = {
       showTerminal: 'ターミナルを表示',
       hideTerminal: 'ターミナルを非表示',
       gateway: 'ゲートウェイ',
+      toggleSessionCost: 'セッション費用',
+      sessionCostTitle: 'この会話のモデル呼び出しにおける推定セッション費用（USD）',
       backend: 'バックエンド',
       messagingStopped: 'メッセージング停止',
       messagingDegraded: name => `${name} 停止`,

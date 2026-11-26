@@ -27,6 +27,7 @@ import {
   AlertCircle,
   Clock,
   Command,
+  DollarSign,
   FolderOpen,
   Globe,
   Hash,
@@ -37,7 +38,14 @@ import {
 } from '@/lib/icons'
 import { type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { resolveSessionTimerSince } from '@/lib/session-timer-since'
-import { cacheHitLabel, contextBarLabel, LiveDuration, tokensPerSecondLabel, usageContextLabel } from '@/lib/statusbar'
+import {
+  cacheHitLabel,
+  contextBarLabel,
+  LiveDuration,
+  sessionCostLabel,
+  tokensPerSecondLabel,
+  usageContextLabel
+} from '@/lib/statusbar'
 import { rollbackSentence } from '@/lib/update-copy'
 import { formatPercentUsed, formatResetsIn } from '@/lib/usage-percent'
 import { useStoreSelector } from '@/lib/use-session-slice'
@@ -261,8 +269,11 @@ export function useStatusbarItems({
 
   const turnStartedAt = primaryFocused ? primaryTurnStartedAt : focusedTurnStartedAt
 
-  // A tile's stored row: cold/fallback start and cwd, and which backend it runs on.
-  const { focusedRowConnectionId, focusedRowCwd, focusedRowStartedAt } = useFocusedSessionRow(focusedStoredSessionId)
+  // A tile's stored row: cold/fallback start, cwd, persisted cost, and which backend it runs on.
+  const { focusedRowConnectionId, focusedRowCostUsd, focusedRowCwd, focusedRowStartedAt } = useFocusedSessionRow(
+    focusedStoredSessionId,
+    primaryFocused ? selectedStoredSessionId : null
+  )
 
   const offerLocalReveal = shouldOfferLocalReveal(focusedRowConnectionId, connection?.mode === 'remote')
 
@@ -371,6 +382,7 @@ export function useStatusbarItems({
   // Both ride the same usage payload the context meter does (session.usage
   // ticks mid-turn, message.complete after) — no extra RPC, no polling.
   const cacheHit = cacheHitLabel(currentUsage)
+  const sessionCost = sessionCostLabel(currentUsage, focusedRowCostUsd)
   const planGauge = currentUsage.plan_gauge
   const planUsed = planGauge ? Math.min(1, Math.max(0, planGauge.used_bp / 10_000)) : 0
   const tokensPerSecond = tokensPerSecondLabel(currentUsage)
@@ -749,6 +761,16 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
+        icon: <DollarSign className="size-3" />,
+        id: 'session-cost',
+        // Same never-self-hide rule as context/cache: shows a placeholder until
+        // live usage or the persisted session row reports nonzero USD spend.
+        label: sessionCost || '—',
+        title: copy.sessionCostTitle,
+        toggleLabel: copy.toggleSessionCost,
+        variant: 'text'
+      },
+      {
         icon: <Zap className="size-3" />,
         id: 'tokens-per-second',
         label: tokensPerSecond || '—',
@@ -822,6 +844,7 @@ export function useStatusbarItems({
       copy,
       currentUsage.compressions,
       gaugeUsage,
+      sessionCost,
       sessionStartedAt,
       gatewayState,
       planGauge,

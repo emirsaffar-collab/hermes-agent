@@ -4647,6 +4647,7 @@ export const frOverrides = {
       toggleCommandCenter: 'Centre de commandes',
       toggleContextUsage: 'Jauge de contexte',
       toggleRunningTimer: 'Minuteur de tour',
+      toggleSessionCost: 'Coût de la session',
       toggleSessionTimer: 'Minuteur de session',
       toggleTerminal: 'Terminal',
       toggleTokensPerSecond: 'Tokens par seconde',
@@ -4655,6 +4656,7 @@ export const frOverrides = {
       toggleWorkspace: 'Espace de travail',
       cacheHitRateTitle:
         'Taux de cache des prompts pour cette session — les tokens en cache coûtent moins cher, un taux élevé est donc plus économique',
+      sessionCostTitle: 'Coût estimé de la session (USD) sur les appels au modèle de cette conversation',
       tokensPerSecondTitle: 'Tokens de sortie par seconde, moyenne calculée sur les 10 derniers appels au modèle',
       agents: 'Agents',
       closeAgents: 'Fermer les agents',

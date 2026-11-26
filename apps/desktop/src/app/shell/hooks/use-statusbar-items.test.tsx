@@ -542,3 +542,34 @@ describe('context meter beside an agentless breakdown', () => {
     expect(item?.label).not.toBe(usageContextLabel(measured))
   })
 })
+
+describe('session-cost statusbar item', () => {
+  afterEach(() => {
+    setActiveSessionId(null)
+    $selectedStoredSessionId.set(null)
+    $sessions.set([])
+    $currentUsage.set({ calls: 0, input: 0, output: 0, total: 0 })
+    $sessionStates.set({})
+    focusPane(null)
+  })
+
+  it('renders live usage cost_usd and falls back to stored session row cost', () => {
+    $selectedStoredSessionId.set('s-cost')
+    $sessions.set([{ estimated_cost_usd: 0.42, id: 's-cost', started_at: 1_700_000_000 }] as never)
+    $currentUsage.set({ calls: 1, input: 100, output: 20, total: 120 })
+
+    const fallback = renderStatusbarItems().statusbarItems.find(item => item.id === 'session-cost')
+    expect(fallback?.label).toBe('$0.42')
+    expect(fallback?.hidden).toBeFalsy()
+
+    $currentUsage.set({ calls: 2, cost_usd: 1.25, input: 300, output: 80, total: 380 })
+    const live = renderStatusbarItems().statusbarItems.find(item => item.id === 'session-cost')
+    expect(live?.label).toBe('$1.25')
+  })
+
+  it('shows a placeholder when no spend has been recorded yet', () => {
+    $currentUsage.set({ calls: 0, input: 0, output: 0, total: 0 })
+    const item = renderStatusbarItems().statusbarItems.find(entry => entry.id === 'session-cost')
+    expect(item?.label).toBe('—')
+  })
+})
