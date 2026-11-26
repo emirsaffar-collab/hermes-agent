@@ -504,6 +504,59 @@ async function reviewRevert(repoPath, filePath, gitBin) {
   return { ok: true }
 }
 
+// Apply a synthesized minimal unified patch in reverse via stdin (no shell).
+// Used for hunk-level and partial line-range revert in the Review pane.
+async function reviewRevertPatch(repoPath, filePath, patchText, staged, gitBin) {
+  const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review revert patch' })
+  const text = typeof patchText === 'string' ? patchText : ''
+
+  if (!text.trim()) {
+    throw new Error('Cannot revert an empty patch')
+  }
+
+  if (filePath != null && (typeof filePath !== 'string' || filePath.includes('\0'))) {
+    throw new Error('Invalid file path for patch revert')
+  }
+
+  const args = [
+    'apply',
+    '--reverse',
+    ...(staged ? ['--cached'] : []),
+    '--unidiff-zero',
+    '--whitespace=nowarn',
+    '-'
+  ]
+
+  await new Promise<void>((resolve, reject) => {
+    const child = execFile(
+      gitBin || 'git',
+      args,
+      {
+        cwd,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: 30_000,
+        windowsHide: true
+      },
+      (err, _stdout, stderr) => {
+        if (err) {
+          const detail = String(stderr || err.message || 'git apply failed').trim()
+
+          reject(new Error(detail))
+
+          return
+        }
+
+        resolve()
+      }
+    )
+
+    child.stdin?.end(text, 'utf8')
+  })
+
+  return { ok: true }
+}
+
 // Resolve a ref to a commit sha (captures the turn baseline for "Last turn").
 async function reviewRevParse(repoPath, ref, gitBin) {
   let cwd
@@ -892,6 +945,7 @@ export {
   reviewPrList,
   reviewPush,
   reviewRevert,
+  reviewRevertPatch,
   reviewRevParse,
   reviewShipInfo,
   reviewStage,

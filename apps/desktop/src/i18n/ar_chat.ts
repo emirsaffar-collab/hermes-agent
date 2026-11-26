@@ -345,7 +345,22 @@ export const arChat = {
       branchOffFrom: base => `فرع جديد من ${base}`,
       switchTo: branch => `التبديل إلى ${branch}`,
       switchFailed: branch => `تعذّر التبديل إلى ${branch}`,
-      worktrees: 'أشجار العمل'
+      worktrees: 'أشجار العمل',
+      addComment: 'إضافة تعليق',
+      commentPlaceholder: shortcut => `أضف تعليق مراجعة (${shortcut} للحفظ)`,
+      saveComment: 'حفظ',
+      cancelComment: 'إلغاء',
+      editComment: 'تعديل',
+      deleteComment: 'حذف',
+      commentStale: 'قديم',
+      revertHunk: 'التراجع عن الكتلة',
+      revertSelectedLines: count => `التراجع عن ${count} سطر`,
+      revertPatchFailed: 'تعذّر التراجع عن التصحيح',
+      commentsBatchSummary: (comments, files) => `${comments} تعليق في ${files} ملف`,
+      clearComments: 'مسح',
+      sendCommentsToChat: 'إرسال إلى المحادثة',
+      commentSelectedLines: 'تعليق على التحديد',
+      clearSelection: 'مسح التحديد'
     }
   },
   prompts: {

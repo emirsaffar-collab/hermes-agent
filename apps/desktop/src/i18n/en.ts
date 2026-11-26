@@ -3729,7 +3729,23 @@ export const en: Translations = {
       branchOffFrom: base => `New branch from ${base}`,
       switchTo: branch => `Switch to ${branch}`,
       switchFailed: branch => `Could not switch to ${branch}`,
-      worktrees: 'Worktrees'
+      worktrees: 'Worktrees',
+      addComment: 'Add comment',
+      commentPlaceholder: shortcut => `Add a review comment (${shortcut} to save)`,
+      saveComment: 'Save',
+      cancelComment: 'Cancel',
+      editComment: 'Edit',
+      deleteComment: 'Delete',
+      commentStale: 'Stale',
+      revertHunk: 'Revert hunk',
+      revertSelectedLines: count => (count === 1 ? 'Revert 1 line' : `Revert ${count} lines`),
+      revertPatchFailed: 'Could not revert patch',
+      commentsBatchSummary: (comments, files) =>
+        `${comments} ${comments === 1 ? 'comment' : 'comments'} across ${files} ${files === 1 ? 'file' : 'files'}`,
+      clearComments: 'Clear',
+      sendCommentsToChat: 'Send to chat',
+      commentSelectedLines: 'Comment on selection',
+      clearSelection: 'Clear selection'
     }
   },
 

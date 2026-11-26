@@ -4177,7 +4177,23 @@ export const frOverrides = {
       branchOffFrom: base => `Nouvelle branche à partir de ${base}`,
       switchTo: branch => `Basculer vers ${branch}`,
       switchFailed: branch => `Impossible de basculer vers ${branch}`,
-      worktrees: 'Worktrees'
+      worktrees: 'Worktrees',
+      addComment: 'Ajouter un commentaire',
+      commentPlaceholder: shortcut => `Ajouter un commentaire de revue (${shortcut} pour enregistrer)`,
+      saveComment: 'Enregistrer',
+      cancelComment: 'Annuler',
+      editComment: 'Modifier',
+      deleteComment: 'Supprimer',
+      commentStale: 'Obsolète',
+      revertHunk: 'Annuler ce bloc',
+      revertSelectedLines: count => (count === 1 ? 'Annuler 1 ligne' : `Annuler ${count} lignes`),
+      revertPatchFailed: 'Impossible d’annuler le patch',
+      commentsBatchSummary: (comments, files) =>
+        `${comments} ${comments === 1 ? 'commentaire' : 'commentaires'} sur ${files} ${files === 1 ? 'fichier' : 'fichiers'}`,
+      clearComments: 'Effacer',
+      sendCommentsToChat: 'Envoyer au chat',
+      commentSelectedLines: 'Commenter la sélection',
+      clearSelection: 'Effacer la sélection'
     }
   },
   updates: {

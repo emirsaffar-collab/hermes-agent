@@ -4156,7 +4156,23 @@ export const esOverrides = {
       branchOffFrom: base => `Nueva rama desde ${base}`,
       switchTo: branch => `Cambiar a ${branch}`,
       switchFailed: branch => `No se pudo cambiar a ${branch}`,
-      worktrees: 'Worktrees'
+      worktrees: 'Worktrees',
+      addComment: 'Añadir comentario',
+      commentPlaceholder: shortcut => `Añadir comentario de revisión (${shortcut} para guardar)`,
+      saveComment: 'Guardar',
+      cancelComment: 'Cancelar',
+      editComment: 'Editar',
+      deleteComment: 'Eliminar',
+      commentStale: 'Obsoleto',
+      revertHunk: 'Revertir bloque',
+      revertSelectedLines: count => (count === 1 ? 'Revertir 1 línea' : `Revertir ${count} líneas`),
+      revertPatchFailed: 'No se pudo revertir el parche',
+      commentsBatchSummary: (comments, files) =>
+        `${comments} ${comments === 1 ? 'comentario' : 'comentarios'} en ${files} ${files === 1 ? 'archivo' : 'archivos'}`,
+      clearComments: 'Limpiar',
+      sendCommentsToChat: 'Enviar al chat',
+      commentSelectedLines: 'Comentar selección',
+      clearSelection: 'Limpiar selección'
     }
   },
   updates: {

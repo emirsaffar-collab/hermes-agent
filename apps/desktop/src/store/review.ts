@@ -14,6 +14,7 @@ import { modeBound } from '@/store/interface-mode'
 import { refreshRepoStatus, repoStatusForCwd } from './coding-status'
 import { noteAreaClosed, recordFeatureUse } from './desktop-metrics'
 import { stampSessionPrBranch } from './pull-requests'
+import { markStaleComments } from './review-comments'
 import { $busy, $currentCwd, $selectedStoredSessionId, $sessions } from './session'
 import { $sessionStates } from './session-states'
 import { $workspaceChangeTick } from './workspace-events'
@@ -242,6 +243,7 @@ export async function refreshReview(): Promise<boolean> {
     const files = result.files.filter(file => !isExcludedPath(file.path))
 
     $reviewFiles.set(files)
+    markStaleComments(cwd, files)
 
     // Drop the selection if the file is gone (staged away, reverted) so the diff
     // pane doesn't strand on a ghost; otherwise lazily fetch its diff so a
@@ -532,6 +534,21 @@ export async function revertReviewFile(path: null | string): Promise<void> {
   }
 
   await desktopGit()?.review?.revert(repoCwd() ?? '', path)
+  await afterMutation()
+}
+
+export async function revertReviewPatch(filePath: string, patchText: string, staged = false): Promise<void> {
+  if ($reviewScope.get() !== 'uncommitted') {
+    return
+  }
+
+  const ctx = reviewCtx()
+
+  if (!ctx) {
+    return
+  }
+
+  await ctx.review.revertPatch(ctx.cwd, filePath, patchText, staged)
   await afterMutation()
 }
 
