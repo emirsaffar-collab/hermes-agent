@@ -1123,6 +1123,8 @@ class _PreToolCallDirective:
     message: Optional[str] = None
     rule_key: Optional[str] = None
     modified_args: Optional[dict[str, Any]] = None
+    force_prompt: bool = False
+    one_shot: bool = False
 
 
 def set_thread_tool_whitelist(
@@ -1160,6 +1162,8 @@ def _get_pre_tool_call_directive_details(
     )
     modified_args: Optional[dict[str, Any]] = None
     first_approve: Optional[tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)
+    approve_force_prompt = False
+    approve_one_shot = False
     for result in hook_results:
         if not isinstance(result, dict):
             continue
@@ -1183,12 +1187,23 @@ def _get_pre_tool_call_directive_details(
         if action == "block":
             return _PreToolCallDirective(action="block", message=message, modified_args=modified_args)
         # approve is held back until the whole list has been scanned for a veto.
+        # Optional "args" on approve shallow-merges into modified_args (e.g. TOCTOU hash pinning).
+        partial = result.get("args")
+        if isinstance(partial, dict) and partial:
+            modified_args = {**(modified_args if modified_args is not None else
+                                (args if isinstance(args, dict) else {})), **partial}
+        if isinstance(result.get("force_prompt"), bool) and result["force_prompt"]:
+            approve_force_prompt = True
+        if isinstance(result.get("one_shot"), bool) and result["one_shot"]:
+            approve_one_shot = True
         if first_approve is None:
             rule_key = result.get("rule_key")
             first_approve = (message, (rule_key.strip() or None) if isinstance(rule_key, str) else None)
     if first_approve is not None:
-        return _PreToolCallDirective(action="approve", message=first_approve[0], rule_key=first_approve[1],
-                                     modified_args=modified_args)
+        return _PreToolCallDirective(
+            action="approve", message=first_approve[0], rule_key=first_approve[1],
+            modified_args=modified_args, force_prompt=approve_force_prompt, one_shot=approve_one_shot,
+        )
     return _PreToolCallDirective(modified_args=modified_args)
 
 
@@ -1235,7 +1250,14 @@ def _resolve_block_from_details(
             approval_tokens = set_current_observability_context(
                 turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id)
         try:
-            result = request_tool_approval(tool_name, details.message or "", rule_key=details.rule_key or tool_name)
+            extra_kwargs: dict[str, Any] = {}
+            if details.force_prompt:
+                extra_kwargs["force_prompt"] = True
+            if details.one_shot:
+                extra_kwargs["one_shot"] = True
+            result = request_tool_approval(
+                tool_name, details.message or "", rule_key=details.rule_key or tool_name, **extra_kwargs,
+            )
         finally:
             if approval_tokens is not None:
                 with suppress(Exception):

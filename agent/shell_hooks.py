@@ -823,6 +823,11 @@ def _parse_pre_tool_call(data: dict[str, Any]) -> Optional[dict[str, Any]]:
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 directive[key] = value.strip()
+        for flag in ("force_prompt", "one_shot"):
+            if isinstance(data.get(flag), bool):
+                directive[flag] = data[flag]
+        if isinstance(data.get("args"), dict) and data["args"]:
+            directive["args"] = data["args"]
         return directive
     return None
 

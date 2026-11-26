@@ -1013,7 +1013,8 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
-                    is_ask: bool, smart: bool = False, pending_body=None) -> dict:
+                    is_ask: bool, smart: bool = False, pending_body=None,
+                    force_one_shot: bool = False) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``pattern_keys`` are what :func:`_persist_choice` stores on session/always; a smart-DENY
@@ -1037,7 +1038,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     # A command the scanners could not read to the end is approved one run at a time: a session or
     # always grant on its key would wave through every later command that trips the scan budget.
     # A manual-only class (an osascript program that can discard unsaved work) is one run too.
-    one_shot = smart_denied or manual_only or _SCAN_INCOMPLETE_DESCRIPTION in pattern_keys
+    one_shot = force_one_shot or smart_denied or manual_only or _SCAN_INCOMPLETE_DESCRIPTION in pattern_keys
     allow_permanent = not one_shot
 
     def deny(template: str, outcome: str, **fmt) -> dict:
@@ -1103,7 +1104,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             }
             if smart_denied:
                 data["smart_denied"] = True
-            decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway", identity=command)
+            gw_identity = f"{command}#oneshot:{os.urandom(6).hex()}" if force_one_shot else command
+            decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway", identity=gw_identity)
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
                                description=description, outcome="notify_failed", noun=spec.noun)
@@ -1211,6 +1213,7 @@ def _run_approval_gate(
     cron_deny_message: str = "", single_query_deny_message: str = "", unattended_deny_message: str = "",
     autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False, no_human_block_message: str = "",
     pattern_keys: list[str] | None = None,
+    force_prompt: bool = False, one_shot: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (tool call or write): decision core for
     :func:`request_tool_approval` and the file-tool write gates.
@@ -1219,7 +1222,10 @@ def _run_approval_gate(
     prompt → persistence. Input-shape checks (hardline, allowlist, pattern detection) are the
     caller's job. ``fail_closed_when_no_human``: a non-interactive, non-gateway, non-cron
     context without an ask bridge BLOCKS instead of auto-approving, so a plugin-flagged action
-    never runs ungated.
+    never runs ungated. ``force_prompt``: operator-grade floor that refuses yolo,
+    ``approvals.mode: off``, session/permanent cache short-circuits, and unattended auto-approve —
+    an explicit human decision is always required, failing closed when no human surface is present.
+    ``one_shot``: offers only once/deny (never session/always) and persists nothing.
     Unattended deny text is ``ctx.block_message(subject, noun, advice)`` unless the caller passes
     an explicit ``*_deny_message`` (the file-tool write gates word their own). ``pattern_keys``
     (default ``[pattern_key]``) are what a session/always answer persists.
@@ -1228,15 +1234,24 @@ def _run_approval_gate(
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
     # guards honour it, so every action routed through this gate (computer_use, plugin rules, SSH-config writes,
     # dangerous-pattern prompts) must too, or "off" still prompts on those surfaces.
-    if _yolo_active() or approval_context._get_approval_mode() == "off":
+    # ``force_prompt`` overrides both (e.g. outbound email send floor) so ``approvals.mode: off`` can stay on for
+    # local dev commands without ever auto-approving outbound human-only side effects.
+    if not force_prompt and (_yolo_active() or approval_context._get_approval_mode() == "off"):
         return _approved()
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not force_prompt and not one_shot and is_approved(session_key, pattern_key):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     if not is_cli and not is_gateway and not is_ask:
         log_args = (autoapprove_log_prefix, pattern_key, description)
+        if force_prompt:
+            logger.warning("%s (pattern: %s): %s — force_prompt set with no interactive user/gateway; "
+                           "BLOCKED (fail-closed).", *log_args)
+            return _blocked(no_human_block_message or (
+                f"BLOCKED: explicit human approval required ({description}) but no "
+                "interactive user or gateway is present to approve it."),
+                pattern_key=pattern_key, description=description)
         # Every unattended context resolves instantly — never a pending approval nobody can answer.
         deny_messages = {
             "single_query": single_query_deny_message, "cron": cron_deny_message,
@@ -1276,6 +1291,7 @@ def _run_approval_gate(
         _ACTION_GATE, command=display_target, description=description, pattern_key=pattern_key,
         pattern_keys=pattern_keys or [pattern_key], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        force_one_shot=one_shot,
     )
 
 
@@ -1369,7 +1385,10 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
-def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None) -> dict:
+def request_tool_approval(
+    tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None,
+    force_prompt: bool = False, one_shot: bool = False,
+) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
     Entry point for a plugin ``pre_tool_call`` hook returning ``{"action": "approve", ...}``:
@@ -1378,7 +1397,10 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
     the LLM cannot skip it. Cron honors ``approvals.cron_mode``; any OTHER non-interactive
     context without an approval bridge fails CLOSED. ``rule_key`` controls the ``[a]lways``
     allowlist grain; when empty it is ``tool_name`` + a hash of ``reason`` so DISTINCT reasons
-    on the same tool persist independently. Returns the ``check_dangerous_command`` result shape.
+    on the same tool persist independently. ``force_prompt`` ignores ``approvals.mode: off``,
+    ``yolo``, cache hits, and unattended auto-approve (always fails closed if no human surface);
+    ``one_shot`` limits the UI to once/deny and persists nothing. Returns the
+    ``check_dangerous_command`` result shape.
     """
     description = reason or f"Plugin requires approval for {tool_name}"
     if not rule_key:
@@ -1394,6 +1416,7 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
         fail_closed_when_no_human=True,
         no_human_block_message=(f"BLOCKED: {subject} but no interactive user or gateway is present "
                                 "to approve it. A plugin flagged this action for human confirmation."),
+        force_prompt=force_prompt, one_shot=one_shot,
     )
 
 
