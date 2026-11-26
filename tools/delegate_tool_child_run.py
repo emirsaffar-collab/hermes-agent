@@ -580,7 +580,13 @@ def _validate_child_output_schema(
         # unmarked turn is misread as the dispatcher-owned worker by every HERMES_KANBAN_* gate.
         from agent.delegation_context import delegated_child_context
         from tools.delegate_tool_routes import child_profile_scope
-        with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+        with (
+            child_profile_scope(child),
+            delegated_child_context(
+                str(getattr(child, "session_id", "") or ""),
+                worktree_port=getattr(child, "_worktree_port", None),
+            ),
+        ):
             _retry_result = child.run_conversation(
                 user_message=append_output_contract(build_retry_message(_schema_errors), _output_schema),
                 task_id=child_task_id,
@@ -845,7 +851,7 @@ class _ChildRun:
     child_progress_cb: Any
     heartbeat: Any = None
     child_start: float = field(default_factory=time.monotonic)
-    worktree_info: Optional[dict[str, str]] = None
+    worktree_info: Optional[dict[str, Any]] = None
     child_task_id: str = ""
     parent_task_id: Optional[str] = None
     wall_start: float = 0.0
@@ -915,6 +921,8 @@ class _ChildRun:
             self.worktree_info = resumed.get("worktree")
         else:
             self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)
+        if isinstance(self.worktree_info, dict) and isinstance(self.worktree_info.get("port"), int):
+            self.child._worktree_port = self.worktree_info["port"]
         if self.worktree_info is not None and resumed is None:
             with _quiet("worktree cwd seed failed: %s"), child_profile_scope(self.child):
                 from tools.terminal_tool import record_session_cwd as _rsc
@@ -1029,7 +1037,13 @@ class _ChildRun:
             from agent.delegation_context import delegated_child_context
             from tools.delegate_tool_routes import child_profile_scope
             # A profile-routed child converses as that profile (config, secrets, skills, terminal policy).
-            with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with (
+                child_profile_scope(child),
+                delegated_child_context(
+                    str(getattr(child, "session_id", "") or ""),
+                    worktree_port=getattr(child, "_worktree_port", None),
+                ),
+            ):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text, **resume,
                 )

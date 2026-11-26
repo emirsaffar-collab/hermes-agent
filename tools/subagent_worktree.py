@@ -74,7 +74,7 @@ def _ensure_gitignore_entry(repo_root: str) -> None:
         logger.debug("subagent worktree: could not update .gitignore: %s", exc)
 
 
-def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[str] = None) -> Optional[dict[str, str]]:
+def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Create an isolated worktree for one child; None (silent downgrade) outside git/on failure."""
     repo_root = resolve_repo_root(parent_cwd)
     if not repo_root:
@@ -101,13 +101,40 @@ def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[st
         # Common on repos with zero commits (unborn HEAD) — degrade silently.
         logger.warning("subagent worktree: git worktree add failed: %s", result.stderr.strip())
         return None
-    logger.info("subagent worktree created: %s (branch %s)", wt_path, branch)
+
+    from hermes_cli.worktree_ops import allocate_worktree_port, seed_worktree_includes
+
+    seeded_files: list[str] = []
+    try:
+        seeded_files = seed_worktree_includes(repo_root, wt_path)
+    except Exception as exc:
+        logger.debug("subagent worktree: seeding includes failed: %s", exc)
+
+    port = allocate_worktree_port(str(wt_path), branch=branch, base_ref=base_commit or None)
+    logger.info("subagent worktree created: %s (branch %s, port %d)", wt_path, branch, port)
     from hermes_cli.worktree_registry import record_worktree_repo
     record_worktree_repo(repo_root)
-    return {"path": str(wt_path), "branch": branch, "repo_root": repo_root, "base_commit": base_commit}
+    return {
+        "path": str(wt_path),
+        "branch": branch,
+        "repo_root": repo_root,
+        "base_commit": base_commit,
+        "port": port,
+        "seeded_files": seeded_files,
+    }
 
 
-def _base_payload(info: dict[str, str]) -> dict[str, Any]:
+def subagent_worktree_env(info: Optional[dict[str, Any]]) -> dict[str, str]:
+    """Environment overrides to inject into a worktree-isolated subagent's subprocesses."""
+    if not isinstance(info, dict):
+        return {}
+    port = info.get("port")
+    if isinstance(port, int) and not isinstance(port, bool) and port > 0:
+        return {"HERMES_WORKTREE_PORT": str(port)}
+    return {}
+
+
+def _base_payload(info: dict[str, Any]) -> dict[str, Any]:
     """Result-entry schema the parent expects (no creation-side internals)."""
     return {"path": info.get("path", ""), "branch": info.get("branch", ""),
             "commits": 0, "dirty": False, "pruned": False}
@@ -133,12 +160,12 @@ def mark_worktree_payload_unproven(payload: dict[str, Any], reason: str, *,
     return payload
 
 
-def unproven_worktree_payload(info: dict[str, str], reason: str) -> dict[str, Any]:
+def unproven_worktree_payload(info: dict[str, Any], reason: str) -> dict[str, Any]:
     """Complete un-inspected payload for ``delegate_tool`` when finalize raises."""
     return mark_worktree_payload_unproven(_base_payload(info), reason)
 
 
-def finalize_subagent_worktree(info: dict[str, str], *, prune: bool = True) -> dict[str, Any]:
+def finalize_subagent_worktree(info: dict[str, Any], *, prune: bool = True) -> dict[str, Any]:
     """Inspect (and possibly prune) a child worktree after the child finishes.
 
     Prunes only when *prune*, commits==0, clean tree AND both git probes succeeded; otherwise
@@ -211,7 +238,7 @@ def finalize_subagent_worktree(info: dict[str, str], *, prune: bool = True) -> d
     return payload
 
 
-def _archive_finished_worktree(info: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+def _archive_finished_worktree(info: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     """A finished child left commits or edits: snapshot them, then remove the tree.
 
     The branch is kept (the parent reviews and merges it); the archive also covers uncommitted
@@ -247,12 +274,19 @@ def _archive_finished_worktree(info: dict[str, str], payload: dict[str, Any]) ->
     return payload
 
 
-def build_worktree_context_note(info: dict[str, str]) -> str:
+def build_worktree_context_note(info: dict[str, Any]) -> str:
     """Context block telling the child to work inside its isolated worktree."""
+    port = info.get("port")
+    port_line = (
+        f"Your deterministic dev-server port is: HERMES_WORKTREE_PORT={port}\n"
+        if isinstance(port, int) and not isinstance(port, bool) and port > 0
+        else ""
+    )
     return (
         "\n\n[WORKTREE ISOLATION] You are working in an isolated git worktree "
         f"at: {info.get('path')}\n"
         f"Your dedicated branch is: {info.get('branch')}\n"
+        f"{port_line}"
         "All file edits and shell commands must happen inside this worktree directory (your "
         "terminal already starts there). Do NOT cd to the main repository checkout. Commit your "
         "changes to your branch when done; the parent agent will review and merge your branch. If "
