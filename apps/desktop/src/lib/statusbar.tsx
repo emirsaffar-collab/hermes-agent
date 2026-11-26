@@ -75,6 +75,22 @@ export function tokensPerSecondLabel(usage: UsageStats): string {
   return typeof tps === 'number' && Number.isFinite(tps) && tps > 0 ? `${Math.round(tps)} t/s` : ''
 }
 
+export function sessionCostLabel(usage: UsageStats, fallbackCostUsd?: null | number): string {
+  const live =
+    typeof usage.cost_usd === 'number' && Number.isFinite(usage.cost_usd) && usage.cost_usd > 0 ? usage.cost_usd : 0
+
+  const stored =
+    typeof fallbackCostUsd === 'number' && Number.isFinite(fallbackCostUsd) && fallbackCostUsd > 0 ? fallbackCostUsd : 0
+
+  const cost = Math.max(live, stored)
+
+  if (cost <= 0) {
+    return ''
+  }
+
+  return cost < 0.01 ? '<$0.01' : `$${cost.toFixed(2)}`
+}
+
 export function LiveDuration({ since }: { since: number | null | undefined }) {
   const [now, setNow] = useState(() => Date.now())
 

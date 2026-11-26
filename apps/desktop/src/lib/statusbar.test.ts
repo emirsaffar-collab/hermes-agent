@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { cacheHitLabel, tokensPerSecondLabel } from '@/lib/statusbar'
+import { cacheHitLabel, sessionCostLabel, tokensPerSecondLabel } from '@/lib/statusbar'
 
 const base = { calls: 0, input: 0, output: 0, total: 0 }
 
@@ -13,5 +13,15 @@ describe('statusbar usage readouts', () => {
 
     expect(cacheHitLabel({ ...base, cache_hit_pct: 87 })).toBe('87%')
     expect(tokensPerSecondLabel({ ...base, avg_tps: 41.6 })).toBe('42 t/s')
+  })
+
+  it('formats live and stored session USD cost cleanly without fabricating zeros', () => {
+    expect(sessionCostLabel(base)).toBe('')
+    expect(sessionCostLabel(base, 0)).toBe('')
+    expect(sessionCostLabel({ ...base, cost_usd: 0.004 })).toBe('<$0.01')
+    expect(sessionCostLabel({ ...base, cost_usd: 1.456 })).toBe('$1.46')
+    expect(sessionCostLabel(base, 0.32)).toBe('$0.32')
+    expect(sessionCostLabel({ ...base, cost_usd: 0.5 }, 0.32)).toBe('$0.50')
+    expect(sessionCostLabel({ ...base, cost_usd: 0.1 }, 0.85)).toBe('$0.85')
   })
 })

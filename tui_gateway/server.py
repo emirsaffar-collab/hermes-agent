@@ -1304,6 +1304,14 @@ def _get_usage(agent) -> dict:
             for _key, _val in (("avg_latency_s", _total_lat / _n), ("avg_tps", _avg_vel)):
                 if _val is not None and _val == _val and 0 < _val < 1e6:  # guard NaN/negative/absurd provider timings
                     usage[_key] = round(float(_val), 1)
+    # Live session spend (USD), omitted when zero/absent rather than fabricated.
+    with contextlib.suppress(Exception):
+        _cost = getattr(agent, "session_estimated_cost_usd", None)
+        if isinstance(_cost, (int, float)) and not isinstance(_cost, bool) and _cost == _cost and 0 < _cost < 1e6:
+            usage["cost_usd"] = round(float(_cost), 6)
+            _cost_status = getattr(agent, "session_cost_status", None)
+            if isinstance(_cost_status, str) and _cost_status and _cost_status != "unknown":
+                usage["cost_status"] = _cost_status
     # Window plans only: the desktop status bar's allowance (the canonical feed carries the same one).
     from gateway.session_usage import plan_gauge
     if (gauge := plan_gauge(agent)) is not None:

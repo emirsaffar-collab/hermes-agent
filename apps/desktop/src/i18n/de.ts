@@ -4638,6 +4638,7 @@ export const deOverrides = {
       toggleCommandCenter: 'Command Center',
       toggleContextUsage: 'Kontext-Anzeige',
       toggleRunningTimer: 'Runden-Timer',
+      toggleSessionCost: 'Session-Kosten',
       toggleSessionTimer: 'Session-Timer',
       toggleTerminal: 'Terminal',
       toggleTokensPerSecond: 'Tokens pro Sekunde',
@@ -4646,6 +4647,7 @@ export const deOverrides = {
       toggleWorkspace: 'Workspace',
       cacheHitRateTitle:
         'Prompt-Cache-Trefferquote dieser Session — gecachte Tokens kosten weniger, also ist höher günstiger',
+      sessionCostTitle: 'Geschätzte Session-Kosten (USD) über alle Modell-Aufrufe in diesem Gespräch',
       tokensPerSecondTitle: 'Ausgabe-Tokens pro Sekunde, gemittelt über die letzten 10 Modell-Aufrufe',
       agents: 'Agents',
       closeAgents: 'Agents schließen',

@@ -2,12 +2,14 @@ import { Codecs, persistentAtom } from '@/lib/persisted'
 import { readKey } from '@/lib/storage'
 import { modeBound } from '@/store/interface-mode'
 
-// v1 (`hermes.desktop.statusbarHidden`) was seeded with the approval pill
-// hidden, so every existing store carries an `approval-mode` the user never
-// chose. v2 seeds from v1 minus that id: other customizations survive, the
-// pill appears once on update, and hiding it again persists here.
-const STATUSBAR_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden.v2'
+// v1 (`hermes.desktop.statusbarHidden`) hid `approval-mode`, and v2 hid
+// `context-usage` and `cache-hit-rate`. v3 seeds from v2 (falling back to v1)
+// minus those promoted ids so other customizations survive, the promoted
+// telemetry chips appear once on update, and hiding them again persists here.
+const STATUSBAR_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden.v3'
+const PREVIOUS_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden.v2'
 const LEGACY_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden'
+const PROMOTED_FROM_DEFAULT_HIDDEN = new Set(['approval-mode', 'cache-hit-rate', 'context-usage'])
 // v1 (`hermes.desktop.statusbarVisible`) shipped a stretch where the bar was
 // opt-in, so many stores hold a `false` the user never chose. v2 is read fresh
 // and the v1 key is deliberately NOT seeded from: every existing install comes
@@ -32,15 +34,11 @@ export function toggleStatusbarVisible() {
 // bar's job is to answer "is the backend healthy, where am I, what's it doing" —
 // route shortcuts (cron/webhooks/agents) and the terminal toggle are
 // navigation, not status, so they start out of the way. The approval pill
-// (the yolo zap) stays: whether dangerous commands run unasked is state the
-// user should see at a glance. The per-turn
-// session readouts (running/session timers, context meter, cache hit rate,
-// tokens/sec) are diagnostics most users don't watch, so they start hidden too
-// and the bar stays quiet mid-turn.
+// (the yolo zap), context meter, prompt cache hit rate, and session cost stay
+// visible by default so guardrails and live spend/efficiency are observable at
+// a glance; timers, tokens/sec, and system resources remain opt-in.
 export const STATUSBAR_HIDDEN_BY_DEFAULT: readonly string[] = [
   'agents',
-  'cache-hit-rate',
-  'context-usage',
   'cron',
   'running-timer',
   'session-timer',
@@ -59,14 +57,14 @@ const sanitizeHiddenIds = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string' && id.length > 0) : []
 
 function legacyHiddenSeed(): string[] {
-  const raw = readKey(LEGACY_HIDDEN_STORAGE_KEY)
+  const raw = readKey(PREVIOUS_HIDDEN_STORAGE_KEY) ?? readKey(LEGACY_HIDDEN_STORAGE_KEY)
 
   if (raw === null) {
     return [...STATUSBAR_HIDDEN_BY_DEFAULT]
   }
 
   try {
-    return sanitizeHiddenIds(JSON.parse(raw)).filter(id => id !== 'approval-mode')
+    return sanitizeHiddenIds(JSON.parse(raw)).filter(id => !PROMOTED_FROM_DEFAULT_HIDDEN.has(id))
   } catch {
     return [...STATUSBAR_HIDDEN_BY_DEFAULT]
   }

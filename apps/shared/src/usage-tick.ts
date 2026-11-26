@@ -17,6 +17,8 @@ export interface TickUsage {
   context_percent?: number
   context_source?: string
   context_used?: number
+  cost_status?: string
+  cost_usd?: number
   input: number
   model?: string
   output: number
@@ -99,6 +101,21 @@ function rateFields(p: UsageTickPayload): Partial<TickUsage> {
 
   if (subagents !== undefined) {
     fields.active_subagents = subagents
+  }
+
+  const rawCost = (p as { cost_usd?: null | number; estimated_cost_usd?: null | number }).estimated_cost_usd ??
+    (p as { cost_usd?: null | number }).cost_usd
+
+  const cost = num(rawCost)
+
+  if (cost !== undefined && cost > 0) {
+    fields.cost_usd = cost
+  }
+
+  const costStatus = (p as { cost_status?: null | string }).cost_status
+
+  if (typeof costStatus === 'string' && costStatus && costStatus !== 'unknown') {
+    fields.cost_status = costStatus
   }
 
   return fields

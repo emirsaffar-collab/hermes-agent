@@ -448,6 +448,8 @@ export const arChrome = {
       messagingStopped: 'الرسائل متوقفة',
       messagingDegraded: name => `${name} متوقف`,
       gatewayReady: 'جاهز',
+      toggleSessionCost: 'تكلفة الجلسة',
+      sessionCostTitle: 'التكلفة التقديرية للجلسة (بالدولار) عبر استدعاءات النموذج في هذه المحادثة',
       gatewayNeedsSetup: 'البوابة تحتاج إعدادا',
       gatewayUnavailable: 'الاستدلال غير متاح',
       gatewayChecking: 'جار فحص البوابة',

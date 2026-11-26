@@ -272,3 +272,23 @@ def test_resume_snapshot_carries_the_resident_agents_own_readouts():
         stored = snapshot_usage(authority, ref, agent)
         assert stored['cache_hit_pct'] == 80 and stored['calls'] == 3 and 'avg_tps' not in stored
     assert snapshot_usage(authority, SimpleNamespace(session_id='gone'), None) is None
+
+
+def test_session_cost_usd_parity_between_gateway_and_embedded_ticker():
+    """Live session_estimated_cost_usd rides both the gateway frame and the embedded ticker without fabricating zero."""
+    from gateway.session_usage import usage_frame, usage_stats
+    from tui_gateway.server import _get_usage
+
+    zero_agent = _agent()
+    assert 'cost_usd' not in _get_usage(zero_agent)
+    assert 'cost_usd' not in usage_frame(usage_stats(zero_agent))['usage']
+
+    billed = _agent()
+    billed.session_estimated_cost_usd = 1.2345678
+    billed.session_cost_status = 'estimated'
+    embedded = _get_usage(billed)
+    gateway_view = usage_frame(usage_stats(billed))['usage']
+    assert embedded['cost_usd'] == 1.234568
+    assert embedded['cost_status'] == 'estimated'
+    assert gateway_view['cost_usd'] == embedded['cost_usd']
+    assert gateway_view['cost_status'] == embedded['cost_status']

@@ -2182,8 +2182,8 @@ export function applyStoredSessionPreviewRuntimeInfo(
   storedSessionId: null | string,
   options: { sameSession?: boolean } = {}
 ) {
-  // Compressions, cache-hit rate, t/s: live runtime state — a switch drops them (#146430), a re-resume keeps them.
-  const staleRates = options.sameSession ? {} : { avg_tps: undefined, cache_hit_pct: undefined }
+  // Compressions, cache-hit rate, t/s, cost: live runtime state — a switch drops them (#146430), a re-resume keeps them.
+  const staleRates = options.sameSession ? {} : { avg_tps: undefined, cache_hit_pct: undefined, cost_usd: undefined }
   setCurrentUsage(current => ({ ...current, ...staleRates, compressions: undefined }))
   // Transient: this is a PREVIEW painted while `session.resume` is still in
   // flight. If the resume is abandoned (user starts a new chat before it

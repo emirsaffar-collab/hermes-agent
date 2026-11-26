@@ -360,6 +360,8 @@ export const zhHantChrome = {
       showTerminal: '顯示終端機',
       hideTerminal: '隱藏終端機',
       gateway: '閘道',
+      toggleSessionCost: '工作階段費用',
+      sessionCostTitle: '本對話所有模型呼叫的預估工作階段費用（USD）',
       backend: '後端',
       messagingStopped: '訊息閘道已停止',
       messagingDegraded: name => `${name} 異常`,

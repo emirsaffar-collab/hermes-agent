@@ -100,6 +100,13 @@ def usage_stats(agent) -> dict:
                  if getattr(agent, "_fallback_activated", False) is True else None)
     if (gauge := plan_gauge(agent)) is not None:  # absent off a window plan, as on the embedded path
         stats["plan_gauge"] = gauge
+    with contextlib.suppress(Exception):
+        cost = getattr(agent, "session_estimated_cost_usd", None)
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost == cost and 0 < cost < 1e6:
+            stats["estimated_cost_usd"] = round(float(cost), 6)
+            cost_status = getattr(agent, "session_cost_status", None)
+            if isinstance(cost_status, str) and cost_status and cost_status != "unknown":
+                stats["cost_status"] = cost_status
     return stats
 
 
@@ -156,6 +163,12 @@ def tui_usage(stats: dict) -> dict:
         usage["active_subagents"] = stats["active_subagents"]
     if isinstance(stats.get("plan_gauge"), dict):
         usage["plan_gauge"] = stats["plan_gauge"]
+    cost = stats.get("estimated_cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost == cost and 0 < cost < 1e6:
+        usage["cost_usd"] = round(float(cost), 6)
+        cost_status = stats.get("cost_status")
+        if isinstance(cost_status, str) and cost_status and cost_status != "unknown":
+            usage["cost_status"] = cost_status
     return usage
 
 
