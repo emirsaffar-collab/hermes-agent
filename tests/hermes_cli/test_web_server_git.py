@@ -424,3 +424,109 @@ def test_worktree_add_base_refreshes_valid_branch_names_the_sanitizer_would_rewr
     added = worktree_add(str(clone), {"base": "origin/fix+1", "name": "x"})
 
     assert _out(added["path"], "rev-parse", "HEAD") == _out(seed, "rev-parse", "HEAD")
+
+
+def test_worktree_add_seeds_worktreeinclude_and_allocates_port(client, repo):
+    """Remote /api/git/worktree/add seeds .env* (0600) and allocates a deterministic port."""
+    (repo / ".gitignore").write_text(".env.local\n", encoding="utf-8")
+    (repo / ".env.local").write_text("SECRET=1\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore env")
+
+    resp = client.post("/api/git/worktree/add", json={"path": str(repo), "name": "seeded"})
+    assert resp.status_code == 200
+    body = resp.json()
+    wt = Path(body["path"])
+    assert (wt / ".env.local").read_text(encoding="utf-8") == "SECRET=1\n"
+    if os.name != "nt":
+        assert (wt / ".env.local").stat().st_mode & 0o777 == 0o600
+    assert isinstance(body["port"], int) and 24000 <= body["port"] < 25000
+    assert ".env.local" in body["seededFiles"]
+
+
+def test_worktree_inspect_close_reports_dirty_unpushed_and_port(client, repo, tmp_path):
+    """GET /api/git/worktree/inspect-close returns dirtyFiles, unpushedCommits, branch, port; 400 on non-repo."""
+    added = client.post("/api/git/worktree/add", json={"path": str(repo), "name": "inspect-me"}).json()
+    wt = Path(added["path"])
+    # Make one unpushed commit + 2 dirty files (1 modified, 1 untracked)
+    (wt / "committed.txt").write_text("hi\n", encoding="utf-8")
+    _git(wt, "add", "committed.txt")
+    _git(wt, "commit", "-qm", "local work")
+    (wt / "committed.txt").write_text("hi modified\n", encoding="utf-8")
+    (wt / "untracked.txt").write_text("new\n", encoding="utf-8")
+
+    resp = client.get("/api/git/worktree/inspect-close", params={"path": str(wt)})
+    assert resp.status_code == 200
+    info = resp.json()
+    assert info["dirtyFiles"] == 2
+    assert info["unpushedCommits"] == 1
+    assert info["branch"] == added["branch"]
+    assert info["port"] == added["port"]
+
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+    bad = client.get("/api/git/worktree/inspect-close", params={"path": str(non_repo)})
+    assert bad.status_code == 400
+
+
+def test_review_revert_patch_reverts_unstaged_and_staged_hunks(client, repo):
+    """POST /api/git/review/revert-patch reverses a targeted hunk for both unstaged and staged diffs."""
+    (repo / "multi.txt").write_text("L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\n", encoding="utf-8")
+    _git(repo, "add", "multi.txt")
+    _git(repo, "commit", "-qm", "add multi")
+
+    # Unstaged edit
+    (repo / "multi.txt").write_text("L1_edit\nL2\nL3\nL4\nL5\nL6\nL7\nL8_edit\n", encoding="utf-8")
+    patch_top = (
+        "--- a/multi.txt\n"
+        "+++ b/multi.txt\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-L1\n"
+        "+L1_edit\n"
+    )
+    resp = client.post(
+        "/api/git/review/revert-patch",
+        json={"path": str(repo), "file": "multi.txt", "patch": patch_top, "staged": False},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    content = (repo / "multi.txt").read_text(encoding="utf-8")
+    assert content.startswith("L1\n")
+    assert content.endswith("L8_edit\n")
+
+    # Staged edit
+    _git(repo, "add", "multi.txt")
+    patch_bottom = (
+        "--- a/multi.txt\n"
+        "+++ b/multi.txt\n"
+        "@@ -8,1 +8,1 @@\n"
+        "-L8\n"
+        "+L8_edit\n"
+    )
+    resp2 = client.post(
+        "/api/git/review/revert-patch",
+        json={"path": str(repo), "file": "multi.txt", "patch": patch_bottom, "staged": True},
+    )
+    assert resp2.status_code == 200
+    cached_diff = subprocess.run(
+        ["git", "diff", "--cached", "--", "multi.txt"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert cached_diff == ""
+
+
+def test_review_revert_patch_rejects_traversal_and_file_mismatch(client, repo):
+    """Patch headers escaping the repo, targeting .git, or disagreeing with `file` are rejected with 400."""
+    bad_cases = [
+        {"path": str(repo), "file": "a.txt", "patch": "   ", "staged": False},
+        {"path": str(repo), "file": "a.txt", "patch": "--- a/../outside.txt\n+++ b/../outside.txt\n@@ -1 +1 @@\n-x\n+y\n", "staged": False},
+        {"path": str(repo), "file": "a.txt", "patch": "--- /etc/passwd\n+++ /etc/passwd\n@@ -1 +1 @@\n-x\n+y\n", "staged": False},
+        {"path": str(repo), "file": "a.txt", "patch": "--- a/.git/config\n+++ b/.git/config\n@@ -1 +1 @@\n-x\n+y\n", "staged": False},
+        {"path": str(repo), "file": "a.txt", "patch": "--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-x\n+y\n", "staged": False},
+    ]
+    for payload in bad_cases:
+        resp = client.post("/api/git/review/revert-patch", json=payload)
+        assert resp.status_code == 400, f"Expected 400 for {payload}, got {resp.status_code}"

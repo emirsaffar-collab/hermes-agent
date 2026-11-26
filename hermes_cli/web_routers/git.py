@@ -25,6 +25,7 @@ from hermes_cli.web_models import (
     GitFileBody,
     GitPathBody,
     GitPrListBody,
+    GitRevertPatchBody,
     GitWorktreeAddBody,
     GitWorktreeRemoveBody,
 )
@@ -184,6 +185,14 @@ async def git_revert_route(body: GitFileBody):
     return await _git_op(_web_git.review_revert, _git_path(body.path), body.file)
 
 
+@router.post("/api/git/review/revert-patch")
+async def git_revert_patch_route(body: GitRevertPatchBody):
+    cwd = _git_path(body.path)
+    if body.file:
+        _fs_path(body.file, cwd=cwd)
+    return await _git_op(_web_git.review_revert_patch, cwd, body.file, body.patch, body.staged)
+
+
 @router.post("/api/git/review/commit")
 async def git_commit_route(body: GitCommitBody):
     return await _git_op(_web_git.review_commit, _git_path(body.path), body.message, body.push)
@@ -207,6 +216,11 @@ async def git_worktree_add_route(body: GitWorktreeAddBody):
         if value
     }
     return await _git_op(_web_git.worktree_add, _git_path(body.path), options)
+
+
+@router.get("/api/git/worktree/inspect-close")
+async def git_worktree_inspect_close_route(path: str):
+    return await _git_op(_web_git.worktree_inspect_close, _git_path(path))
 
 
 @router.post("/api/git/worktree/remove")

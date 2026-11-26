@@ -380,6 +380,142 @@ def review_revert(cwd: str, file_path: str | None) -> dict:
     return {"ok": True}
 
 
+def _unquote_patch_path(raw: str) -> str:
+    """Strip git diff header timestamp suffix, optional C-style quotes, and a/b prefix."""
+    token = raw.split("\t", 1)[0].strip()
+    if len(token) >= 2 and token[0] == '"' and token[-1] == '"':
+        inner = token[1:-1]
+        # Decode standard git C-escapes (\n, \t, \\, \", \ooo octal) safely.
+        out: list[str] = []
+        i = 0
+        while i < len(inner):
+            ch = inner[i]
+            if ch == "\\" and i + 1 < len(inner):
+                nxt = inner[i + 1]
+                if nxt in ("\\", '"'):
+                    out.append(nxt)
+                    i += 2
+                    continue
+                if nxt == "t":
+                    out.append("\t")
+                    i += 2
+                    continue
+                if nxt == "n":
+                    out.append("\n")
+                    i += 2
+                    continue
+                if i + 3 < len(inner) and all(c in "01234567" for c in inner[i + 1 : i + 4]):
+                    out.append(chr(int(inner[i + 1 : i + 4], 8)))
+                    i += 4
+                    continue
+            out.append(ch)
+            i += 1
+        token = "".join(out)
+    return token
+
+
+def _validate_patch_paths(cwd: str, file_path: str | None, patch_text: str) -> None:
+    """Validate that every target path in a unified diff stays strictly inside the repo root."""
+    repo_root_str = _git_line(cwd, ["rev-parse", "--show-toplevel"], run=_git_write)
+    if not repo_root_str:
+        raise RuntimeError("Not a git repository")
+    repo_root = Path(repo_root_str).resolve()
+
+    expected_rel: str | None = None
+    if file_path is not None:
+        if not isinstance(file_path, str) or not file_path.strip() or "\0" in file_path:
+            raise RuntimeError("Invalid file path for patch revert")
+        fp = Path(file_path)
+        candidate = (fp if fp.is_absolute() else (Path(cwd) / fp)).resolve(strict=False)
+        try:
+            rel_obj = candidate.relative_to(repo_root)
+        except ValueError as exc:
+            raise RuntimeError("Patch target escapes repository root") from exc
+        expected_rel = rel_obj.as_posix()
+        if not expected_rel or expected_rel == "." or expected_rel == ".git" or expected_rel.startswith(".git/"):
+            raise RuntimeError("Invalid patch target path")
+
+    found_paths: list[str] = []
+    for line in patch_text.splitlines():
+        raw_target: str | None = None
+        strip_ab = False
+        if line.startswith("--- ") or line.startswith("+++ "):
+            raw_target = _unquote_patch_path(line[4:])
+            strip_ab = True
+        elif line.startswith("rename from ") or line.startswith("rename to "):
+            raw_target = _unquote_patch_path(line.split(" ", 2)[2])
+        elif line.startswith("diff --git "):
+            rest = line[len("diff --git ") :].strip()
+            parts = rest.split(" ")
+            if len(parts) == 2:
+                for tok in parts:
+                    cleaned = _unquote_patch_path(tok)
+                    if cleaned.startswith(("a/", "b/")):
+                        cleaned = cleaned[2:]
+                    if cleaned and cleaned != "/dev/null":
+                        found_paths.append(cleaned)
+            continue
+
+        if raw_target is None or raw_target == "/dev/null":
+            continue
+        if strip_ab and raw_target.startswith(("a/", "b/")):
+            raw_target = raw_target[2:]
+        found_paths.append(raw_target)
+
+    if not found_paths:
+        raise RuntimeError("Patch contains no valid target file headers")
+
+    for rel in found_paths:
+        if not rel or "\0" in rel:
+            raise RuntimeError("Invalid path in patch header")
+        if rel.startswith(("/", "\\", "~")) or re.match(r"^[A-Za-z]:", rel):
+            raise RuntimeError(f"Absolute path forbidden in patch header: {rel}")
+        norm_rel = rel.replace("\\", "/")
+        parts = [seg for seg in norm_rel.split("/") if seg]
+        if not parts or ".." in parts or parts[0] == ".git":
+            raise RuntimeError(f"Unsafe path in patch header: {rel}")
+        target_path = (repo_root / norm_rel).resolve(strict=False)
+        try:
+            resolved_rel = target_path.relative_to(repo_root).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(f"Patch path escapes repository root: {rel}") from exc
+        if resolved_rel == ".git" or resolved_rel.startswith(".git/"):
+            raise RuntimeError(f"Patch path targets .git metadata: {rel}")
+        if expected_rel is not None and resolved_rel != expected_rel:
+            raise RuntimeError(f"Patch header path '{resolved_rel}' does not match requested file '{expected_rel}'")
+
+
+def review_revert_patch(cwd: str, file_path: str | None, patch_text: str, staged: bool = False) -> dict:
+    """Apply a synthesized minimal unified patch in reverse via stdin (Electron parity)."""
+    if not _is_dir(cwd):
+        raise RuntimeError("Working directory does not exist")
+    text = patch_text if isinstance(patch_text, str) else ""
+    if not text.strip():
+        raise RuntimeError("Cannot revert an empty patch")
+    _validate_patch_paths(cwd, file_path, text)
+
+    args = ["apply", "--reverse", *(["--cached"] if staged else []), "--unidiff-zero", "--whitespace=nowarn", "-"]
+    env = noninteractive_git_env()
+    try:
+        proc = subprocess.run(
+            ["git", *harden_git_argv(args)],
+            cwd=cwd,
+            input=text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+            env=env,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"git apply failed: {exc}") from exc
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "git apply failed")
+    return {"ok": True}
+
+
 def review_rev_parse(cwd: str, ref: str | None) -> str | None:
     return _git_line(cwd, ["rev-parse", ref or "HEAD"]) or None
 
@@ -750,6 +886,23 @@ def _worktree_for_existing(root: str, raw_name: str) -> dict:
     return {"path": target, "branch": existing, "repoRoot": root}
 
 
+def _seed_and_allocate_worktree(root: str, target: str, *, branch: str | None = None, base_ref: str | None = None) -> tuple[int | None, list[str]]:
+    """Seed .worktreeinclude files and allocate a deterministic port (fail-soft, Electron parity)."""
+    from hermes_cli.worktree_ops import allocate_worktree_port, seed_worktree_includes
+
+    seeded_files: list[str] = []
+    port: int | None = None
+    try:
+        seeded_files = seed_worktree_includes(root, target)
+    except Exception:
+        seeded_files = []
+    try:
+        port = allocate_worktree_port(target, branch=branch, base_ref=base_ref)
+    except Exception:
+        port = None
+    return port, seeded_files
+
+
 def worktree_add(cwd: str, options: dict) -> dict:
     _ensure_repo(cwd)
     root = _main_root(cwd)
@@ -759,14 +912,20 @@ def worktree_add(cwd: str, options: dict) -> dict:
         if result.get("path") != root:  # a new checkout, not a switch of the main tree
             from hermes_cli.worktree_registry import record_worktree_repo
             record_worktree_repo(root)
+            port, seeded_files = _seed_and_allocate_worktree(
+                root, result["path"], branch=result.get("branch"), base_ref=None
+            )
+            result = {**result, "port": port, "seededFiles": seeded_files}
         return result
 
     slug = _slugify(options.get("name") or f"work-{os.urandom(4).hex()}")
     branch = _sanitize_branch(options.get("branch") or "") or f"hermes/{slug}"
     target = _unique_dir(os.path.join(root, ".worktrees", slug))
     args = ["worktree", "add", "-b", branch, target]
+    base_ref: str | None = None
     if options.get("base"):
         base = str(options["base"])
+        base_ref = base
         # Fetch just that branch so a stale remote-tracking ref is fresh; fetch failures
         # (offline / no remote) are ignored — git uses the local ref or raises a clear error
         # below if it is entirely missing.
@@ -780,6 +939,8 @@ def worktree_add(cwd: str, options: dict) -> dict:
             # a standalone local branch (Electron-op parity).
             args.append("--no-track")
         args.append(base)
+    else:
+        base_ref = _git_line(root, ["rev-parse", "HEAD"], run=_git_write) or None
     code, _, err = _git_write(root, args)
     if code != 0:
         if "already exists" not in (err or "").lower():
@@ -787,7 +948,75 @@ def worktree_add(cwd: str, options: dict) -> dict:
         _git_ok(root, ["worktree", "add", target, branch])
     from hermes_cli.worktree_registry import record_worktree_repo
     record_worktree_repo(root)
-    return {"path": target, "branch": branch, "repoRoot": root}
+    port, seeded_files = _seed_and_allocate_worktree(root, target, branch=branch, base_ref=base_ref)
+    return {"path": target, "branch": branch, "repoRoot": root, "port": port, "seededFiles": seeded_files}
+
+
+def worktree_inspect_close(cwd: str) -> dict:
+    """Inspect a worktree before close/removal (exact Electron parity).
+
+    Returns ``{dirtyFiles, unpushedCommits, branch, port}``; raises RuntimeError when
+    *cwd* is not an accessible git worktree so callers never misread an error as clean.
+    """
+    from hermes_cli.worktree_ops import _is_valid_worktree_port, read_worktree_meta
+
+    if not _is_dir(cwd):
+        raise RuntimeError("Worktree directory does not exist")
+
+    status_code, status_out, status_err = _git(cwd, ["status", "--porcelain"])
+    if status_code != 0:
+        raise RuntimeError(status_err.strip() or "git status failed for worktree")
+
+    dirty_files = sum(1 for line in status_out.splitlines() if line)
+    branch_code, branch_out, _ = _git(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    branch = branch_out.strip() if branch_code == 0 and branch_out.strip() else None
+
+    meta = read_worktree_meta(cwd) or {}
+    saved_port = meta.get("port")
+    port = saved_port if _is_valid_worktree_port(saved_port) else None
+
+    def _parse_count(raw: str) -> int:
+        try:
+            val = int(raw.strip())
+            return max(0, val)
+        except (TypeError, ValueError):
+            return 0
+
+    unpushed_commits = 0
+    up_code, up_out, _ = _git(cwd, ["rev-list", "--count", "@{upstream}..HEAD"])
+    if up_code == 0:
+        unpushed_commits = _parse_count(up_out)
+    else:
+        base_candidates: list[str] = []
+        meta_base = meta.get("baseRef")
+        if isinstance(meta_base, str) and meta_base.strip():
+            base_candidates.append(meta_base.strip())
+        base_candidates.extend(("origin/HEAD", "origin/main", "origin/master", "main", "master"))
+
+        resolved_count: int | None = None
+        for candidate in base_candidates:
+            if branch and candidate == branch:
+                continue
+            rc, out, _ = _git(cwd, ["rev-list", "--count", f"{candidate}..HEAD"])
+            if rc == 0:
+                resolved_count = _parse_count(out)
+                break
+
+        if resolved_count is None:
+            rem_code, rem_out, _ = _git(cwd, ["remote"])
+            if rem_code == 0 and rem_out.strip():
+                fb_code, fb_out, _ = _git(cwd, ["rev-list", "--count", "HEAD", "--not", "--remotes"])
+                if fb_code == 0:
+                    resolved_count = _parse_count(fb_out)
+
+        unpushed_commits = resolved_count if resolved_count is not None else 0
+
+    return {
+        "dirtyFiles": dirty_files,
+        "unpushedCommits": unpushed_commits,
+        "branch": branch,
+        "port": port,
+    }
 
 
 def worktree_remove(cwd: str, worktree_path: str, force: bool) -> dict:

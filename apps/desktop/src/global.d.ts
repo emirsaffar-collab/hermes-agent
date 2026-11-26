@@ -1811,6 +1811,8 @@ export interface HermesWorktreeCloseInspection {
   unpushedCommits: number
   branch: null | string
   port: null | number
+  inspectionError?: string
+  runningServices?: Array<{ id: string; name: string; port: null | number }>
 }
 
 // A branch that the "convert a branch into a worktree" picker offers: the local

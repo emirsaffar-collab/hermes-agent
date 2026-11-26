@@ -133,4 +133,18 @@ describe('desktop git facade', () => {
       path: '/api/git/worktree/add'
     })
   })
+
+  it('routes worktreeInspectClose and review.revertPatch to backend REST routes and propagates errors', async () => {
+    $connection.set({ mode: 'remote' } as never)
+
+    await desktopGit()?.review.revertPatch('/srv/work', 'a.txt', '--- a/a.txt\n+++ b/a.txt\n', true)
+    expect(api).toHaveBeenCalledWith({
+      body: { file: 'a.txt', patch: '--- a/a.txt\n+++ b/a.txt\n', path: '/srv/work', staged: true },
+      method: 'POST',
+      path: '/api/git/review/revert-patch'
+    })
+
+    api.mockRejectedValueOnce(new Error('HTTP 400: not a git repo'))
+    await expect(desktopGit()?.worktreeInspectClose?.('/srv/bad')).rejects.toThrow('HTTP 400')
+  })
 })

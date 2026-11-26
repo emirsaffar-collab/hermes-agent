@@ -196,6 +196,12 @@ class GitFileBody(BaseModel):
     path: str
     file: Optional[str] = None
 
+class GitRevertPatchBody(BaseModel):
+    path: str
+    file: Optional[str] = None
+    patch: str
+    staged: bool = False
+
 class GitPrListBody(BaseModel):
     path: str
     branches: list[str] = []
