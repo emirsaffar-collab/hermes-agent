@@ -137,3 +137,11 @@ def test_every_auto_install_spec_is_an_exact_version():
             if not name or not re.fullmatch(exact[recipe["strategy"]], version):
                 floating.append(f"{key}: {spec}")
     assert not floating, floating
+
+
+def test_yaml_language_server_is_multi_root():
+    """yaml-language-server supports workspaceFolders and must share one process across worktrees."""
+    from agent.lsp.servers import SERVERS
+
+    yaml_srv = next(s for s in SERVERS if s.server_id == "yaml-language-server")
+    assert yaml_srv.multi_root is True

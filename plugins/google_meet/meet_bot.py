@@ -1232,14 +1232,12 @@ class _RtcTranscriber:
                     data = data[cluster:]
             with merged.open("ab") as f:
                 f.write(data)
-            active_ts = (
-                now_ts
-                if len(data) >= 2000
-                else self.state.last_audio_activity_at
-            )
+            # Do NOT bump last_audio_activity_at here on raw WebM byte length:
+            # 10s of digital silence (peak 0.0000) still produces >2 KB WebM chunks,
+            # which previously kept empty rooms extending overtime for 4h.
+            # Real audio activity is stamped after PCM decode (peak >= 0.01) / VAD.
             self.state.set(
                 audio_fragments=self.state.audio_fragments + 1,
-                last_audio_activity_at=active_ts,
             )
             _quiet(path.unlink)
             return len(data)

@@ -276,6 +276,23 @@ class _Runtime:
         self._registered = True
         atexit.register(self.shutdown)
 
+    @staticmethod
+    def _relay_session_open(session: _MetricsSession) -> bool:
+        relay_session = session.relay_session
+        with relay_session.lock:
+            return (
+                not relay_session.closing
+                and relay_session.context is not None
+                and relay_session.handle is not None
+            )
+
+    @staticmethod
+    def _is_relay_session_closed_error(exc: Exception) -> bool:
+        return isinstance(exc, RuntimeError) and str(exc) in {
+            "Hermes Relay session is closing",
+            "Hermes Relay session context is unavailable",
+        }
+
     def ensure_session(self, event: dict[str, Any]) -> _MetricsSession | None:
         session_id = _text(event, "session_id")
         if not session_id:
@@ -292,7 +309,7 @@ class _Runtime:
                 self._sessions[session_id] = session
                 self._share_spent(session)
         with session.lock:
-            return None if session.closing else session
+            return None if session.closing or not self._relay_session_open(session) else session
 
     def record_client_active(self, event: dict[str, Any]) -> None:
         """Emit one payload-free activation attempt under the session scope."""
@@ -302,7 +319,7 @@ class _Runtime:
 
     def _emit_client_active(self, session: _MetricsSession) -> None:
         with session.lock:
-            if not session.closing:
+            if not session.closing and self._relay_session_open(session):
                 self._mark(session, None, contract.CLIENT_ACTIVE_MARK, {})
                 self._safe(self._emit_install_snapshot_if_due, session)
 
@@ -322,10 +339,16 @@ class _Runtime:
         self, session: _MetricsSession, task: _TaskRun | None, name: str, data: dict[str, str]
     ) -> None:
         """Emit one Relay mark under the task scope when given, else the session scope."""
-        self._run_scoped(
-            session, task, self.relay.scope.event, name,
-            handle=_scope_handle(session, task), data=data, metadata=self._event_metadata(),
-        )
+        try:
+            self._run_scoped(
+                session, task, self.relay.scope.event, name,
+                handle=_scope_handle(session, task), data=data, metadata=self._event_metadata(),
+            )
+        except RuntimeError as exc:
+            if self._is_relay_session_closed_error(exc):
+                logger.debug("Skipping Relay mark %s for closing session %s", name, session.session_id)
+                return
+            raise
 
     def start_task(self, event: dict[str, Any]) -> _TaskRun | None:
         """Open one Relay function scope for a Hermes task run."""
@@ -352,11 +375,14 @@ class _Runtime:
                 if (
                     session.closing
                     or (turn_id and turn_id in session.retired_turn_ids)
-                    or session.relay_session.context is None
+                    or not self._relay_session_open(session)
                 ):
                     return None
                 self._emit_client_active(session)
-                task_context = session.relay_session.context.copy()
+                with session.relay_session.lock:
+                    if session.relay_session.closing or session.relay_session.context is None:
+                        return None
+                    task_context = session.relay_session.context.copy()
                 start_fields = contract.task_start_fields(_with_launch_entrypoint(event))
                 handle = task_context.run(
                     self._with_scope_stack, self.relay.scope.push,
@@ -407,7 +433,7 @@ class _Runtime:
         model_call_key = (task_id, request_id)
         fields = contract.model_call_fields(event)
         with session.lock:
-            if session.closing:
+            if session.closing or (task is None and not self._relay_session_open(session)):
                 return
             if task is not None and not self._admits(session, task, event, current=True):
                 return
@@ -428,11 +454,17 @@ class _Runtime:
                     # A real Hermes retry can advance api_request_id while carrying the
                     # retry ordinal. Count that physical attempt.
                     task.retry_count += 1
-            handle = self._run_scoped(
-                session, task, self.relay.llm.call, MODEL_CALL_SCOPE, self.relay.LLMRequest({}, {}),
-                handle=_scope_handle(session, task), metadata=self._event_metadata(),
-                model_name=contract.MODEL_CALL_PROFILE_MODEL,
-            )
+            try:
+                handle = self._run_scoped(
+                    session, task, self.relay.llm.call, MODEL_CALL_SCOPE, self.relay.LLMRequest({}, {}),
+                    handle=_scope_handle(session, task), metadata=self._event_metadata(),
+                    model_name=contract.MODEL_CALL_PROFILE_MODEL,
+                )
+            except RuntimeError as exc:
+                if self._is_relay_session_closed_error(exc):
+                    logger.debug("Skipping Relay model call start for closing session %s", session.session_id)
+                    return
+                raise
             session.model_calls[model_call_key] = _ModelCall(handle, task_id, fields)
 
     def update_model_call(self, event: dict[str, Any], *, finish: bool) -> None:
@@ -938,11 +970,22 @@ class _Runtime:
             model_call.fields, call_role="primary", outcome=outcome, error_class=error_class,
             ttft_bucket=model_call.ttft_bucket,
         )
+        def _close_call() -> None:
+            try:
+                self._run_scoped(
+                    session, session.tasks.get(model_call.task_id),
+                    self.relay.llm.call_end, model_call.handle, fields,
+                    metadata=self._event_metadata(),
+                )
+            except RuntimeError as exc:
+                if self._is_relay_session_closed_error(exc):
+                    logger.debug("Skipping Relay model call close for closing session %s", session.session_id)
+                    return
+                raise
+
         self._guarded(
             "Hermes shared-metrics model call close failed",
-            self._run_scoped, session, session.tasks.get(model_call.task_id),
-            self.relay.llm.call_end, model_call.handle, fields,
-            metadata=self._event_metadata(),
+            _close_call,
         )
 
     def _end_pending_model_calls(self, session: _MetricsSession, event: dict[str, Any]) -> None:

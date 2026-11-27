@@ -432,7 +432,7 @@ SERVERS: list[ServerDef] = [
             args=("--background-index", "--clang-tidy"), install_pkg="clangd"),
     _server("bash-language-server", (".sh", ".bash", ".zsh", ".ksh"), "Bash — bash-language-server", build_spawn=_spawn_bash_ls),
     _server("yaml-language-server", (".yaml", ".yml"), "YAML — yaml-language-server",
-            args=("--stdio",), install_pkg="yaml-language-server"),
+            args=("--stdio",), install_pkg="yaml-language-server", multi_root=True),
     _server("lua-language-server", (".lua",), "Lua — lua-language-server",
             markers=[".luarc.json", ".luarc.jsonc", ".luacheckrc", ".stylua.toml", "stylua.toml", "selene.toml", "selene.yml"],
             install_pkg="lua-language-server"),

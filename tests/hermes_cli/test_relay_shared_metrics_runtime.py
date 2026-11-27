@@ -3040,3 +3040,28 @@ def test_finite_cli_runs_report_their_own_entrypoint(direct_runtime, tmp_path, m
         ("background", "cli", "1"), ("interactive", "cli", "1"), ("interactive", "desktop", "1"),
         ("one_shot", "cli", "1"),
     ]
+
+
+def test_closing_relay_session_does_not_warn_on_late_task_or_mark(direct_runtime, caplog):
+    """Late hooks racing with RelaySession.closing must no-op silently without traceback warnings."""
+    import logging
+
+    sid = "closing-race-sess"
+    rt = relay_shared_metrics._get_runtime()
+    assert rt is not None
+    session = rt.ensure_session({"session_id": sid, "platform": "cli"})
+    assert session is not None
+    # Simulate RelayRuntime marking the underlying RelaySession closing before _MetricsSession knows.
+    with session.relay_session.lock:
+        session.relay_session.closing = True
+
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.observability.relay_shared_metrics"):
+        caplog.clear()
+        assert rt.ensure_session({"session_id": sid, "platform": "cli"}) is None
+        rt.record_client_active({"session_id": sid, "platform": "cli"})
+        assert rt.start_task({"session_id": sid, "task_id": "t1", "platform": "cli"}) is None
+        rt.start_model_call({"session_id": sid, "api_request_id": "req1", "platform": "cli"})
+        # Also verify the lock-order TOCTOU catch in _mark directly.
+        rt._mark(session, None, "client.active", {})
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
