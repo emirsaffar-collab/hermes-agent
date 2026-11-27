@@ -47,7 +47,7 @@ def _is_safe_meet_url(url: str) -> bool:
 
 
 BRIEF_URL_RE = re.compile(
-    r"^(?:https://meetings\.uropenn\.se|http://(?:100\.117\.81\.127|127\.0\.0\.1):8096)/(?:brief|studio/brief)(?:[/?#].*)?$"
+    r"^(?:https://meetings\.(?:uropenn|techzola)\.se|http://(?:100\.117\.81\.127|127\.0\.0\.1):(?:8096|8106))/(?:brief|studio/brief)(?:[/?#].*)?$"
 )
 
 
@@ -180,7 +180,11 @@ class _BotState:
         spk = self.clean_speaker_label(speaker)
         if not spk or spk.lower() in {"unknown", "you", "du", "mig", "me"}:
             return
-        if re.search(r"(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant)", spk, re.IGNORECASE):
+        if re.search(
+            r"(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+(?:assistant|meeting|agent|notetaker|bot|m[öo]tes)|meetings@techzola|moten@techzola)",
+            spk,
+            re.IGNORECASE,
+        ):
             return
         if not re.match(r"^Voice\s+\d+$", spk, re.IGNORECASE):
             self.actual_participants.add(spk)
@@ -210,7 +214,13 @@ class _BotState:
         self._seen.add(key)
         now_ts = time.time()
         self.last_caption_at = now_ts
-        vcmd = _classify_voice_control(text)
+        vc_enabled = os.environ.get("HERMES_MEET_VOICE_CONTROL", "1").strip().lower() not in {"0", "false", "no", "off"}
+        vc_allow_raw = os.environ.get("HERMES_MEET_VOICE_CONTROL_ALLOWLIST", "").strip()
+        vc_allowed = vc_enabled and (
+            not vc_allow_raw
+            or any(tok.strip().lower() in speaker.lower() for tok in vc_allow_raw.split(",") if tok.strip())
+        )
+        vcmd = _classify_voice_control(text) if vc_allowed else None
         if vcmd == "resume_capture":
             self.paused_capture = False
             print(f"[meet_bot] voice_control=resume_capture by={speaker!r}", flush=True)
@@ -233,7 +243,7 @@ class _BotState:
             self.brief_stop_requested = True
             self.brief_present_requested = False
             print(f"[meet_bot] voice_control=stop_present_brief by={speaker!r}", flush=True)
-        elif _WAKE_ADDRESS_RE.search(text):
+        elif vc_allowed and _WAKE_ADDRESS_RE.search(text):
             try:
                 out_dir_path = getattr(self, "out_dir", None)
                 if isinstance(out_dir_path, Path):
@@ -945,8 +955,21 @@ class _RtcTranscriber:
 
         if os.environ.get("HERMES_MEET_INPROC_MLX", "0").strip() != "1":
             worker_url = os.environ.get("HERMES_MEET_GPU_WORKER_URL", "http://127.0.0.1:8817/transcribe").strip()
+            worker_tok = os.environ.get("VOICE_GPU_WORKER_TOKEN", "").strip()
+            if not worker_tok:
+                tok_file = Path.home() / ".hermes" / "state" / "voice-gpu-worker.token"
+                try:
+                    if tok_file.is_file():
+                        worker_tok = tok_file.read_text(encoding="ascii").strip()
+                except OSError:
+                    worker_tok = ""
+            req_headers = {"Content-Type": "application/json"}
+            if worker_tok:
+                req_headers["X-Voice-Worker-Token"] = worker_tok
+                req_headers["Authorization"] = f"Bearer {worker_tok}"
             segs = []
             det_lang = lang_env if (lang_env and lang_env != "auto") else "sv"
+            worker_err_exc: Optional[Exception] = None
             for c_start, c_end in chunk_ranges:
                 c_pcm = np.asarray(speech_pcm[c_start:c_end], dtype=np.float32)
                 if len(c_pcm) < 3200:
@@ -962,17 +985,20 @@ class _RtcTranscriber:
                     wf.setsampwidth(2)
                     wf.setframerate(16000)
                     wf.writeframes(pcm_i16)
-                payload = json.dumps({
+                body_obj = {
                     "audio_b64": base64.b64encode(wav_buf.getvalue()).decode("ascii"),
                     "ext": "wav",
                     "fast": True,
                     "voice_gate": "off",
-                }).encode("utf-8")
+                }
+                if prompt_env:
+                    body_obj["initial_prompt"] = str(prompt_env)[:240]
+                payload = json.dumps(body_obj).encode("utf-8")
                 try:
                     req = urllib.request.Request(
                         worker_url,
                         data=payload,
-                        headers={"Content-Type": "application/json"},
+                        headers=req_headers,
                         method="POST",
                     )
                     with urllib.request.urlopen(req, timeout=18.0) as resp:
@@ -987,7 +1013,10 @@ class _RtcTranscriber:
                         segs.append(SimpleNamespace(text=txt, start=c_s, end=c_e))
                 except Exception as exc:
                     sys.stderr.write(f"meet rtc: voice_gpu_worker chunk {c_start}..{c_end} deferred ({exc})\n")
+                    worker_err_exc = exc
                     break
+            if worker_err_exc is not None and not segs:
+                raise RuntimeError(f"voice_gpu_worker failed: {worker_err_exc}") from worker_err_exc
             info = SimpleNamespace(
                 language=det_lang or "sv",
                 language_probability=0.98,
@@ -1567,7 +1596,7 @@ _CAPTION_OBSERVER_JS = r"""
     return s;
   };
   window.__hermesActiveSpeaker = () => {
-    const botRe = /(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant|fireflies|otter\.ai)/i;
+    const botRe = /(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+(?:assistant|meeting|agent|notetaker|bot|m[öo]tes)|meetings@techzola|moten@techzola|fireflies|otter\.ai)/i;
     const selfRe = /^(\s*(du|you|mig|me)\s*)$/i;
     // 1. Check active-speaker indicators on Meet & Teams participant tiles
     const tiles = Array.from(document.querySelectorAll('[data-participant-id], [data-cid="calling-participant-stream"], [data-tid="roster-participant"]'));
@@ -1645,7 +1674,7 @@ _PARTICIPANT_COUNT_JS = r"""
           if (rtc && ((rtc.streams || 0) > 0 || (rtc.pcs || 0) >= 1) && rtc.activeStreams === 0) return 1;
         } catch (e) {}
       }
-      const botRe = /(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+assistant|fireflies|otter\.ai|fathom|read\.ai|gemini\s+notes|meeting\s+bot|recording\s+bot)/i;
+      const botRe = /(notetaker|tl\s*;?\s*dv|tldv|mötesanteckningar|motesanteckningar|techzola\s+(?:assistant|meeting|agent|notetaker|bot|m[öo]tes)|meetings@techzola|moten@techzola|fireflies|otter\.ai|fathom|read\.ai|gemini\s+notes|meeting\s+bot|recording\s+bot)/i;
       const selfRe = /^(\s*(du|you|mig|me)\s*)$/i;
       // Screen-share / presentation indicator means at least one human is actively presenting
       if (/presenterar|is presenting|delar sin skärm|sharing their screen/i.test(bodyTxt)) {
@@ -1859,7 +1888,7 @@ def _config_from_env() -> _BotConfig:
         lobby_timeout=float(env("HERMES_MEET_LOBBY_TIMEOUT", "300")),
         brief_url=env("HERMES_MEET_BRIEF_URL", "").strip(),
         brief_auto_present=env("HERMES_MEET_BRIEF_AUTO_PRESENT", "0").strip().lower() in {"1", "true", "yes", "on"},
-        brief_max_seconds=float(env("HERMES_MEET_BRIEF_MAX_SECONDS", "300") or 300))
+        brief_max_seconds=float(env("HERMES_MEET_BRIEF_MAX_SECONDS", "300")))
 
 
 def _click_nowait(el, timeout: int = 2_000) -> bool:
@@ -2008,13 +2037,13 @@ def _ensure_mic_muted(page) -> str:
 _HUMAN_PRESENTING_PROBE_JS = """() => {
   const txt = (document.body && document.body.innerText) || "";
   // Never mistake our own active presentation for a human presenting
-  if (/(?:du presenterar|you(?:'re| are) presenting|sluta presentera|avsluta presentationen|stop presenting|sluta dela|stop sharing)/i.test(txt)) {
+  if (/(?:du presenterar|du delar din sk[äa]rm|you(?:'re| are) presenting|you(?:'re| are) sharing (?:your )?screen|sluta presentera|avsluta presentationen|avbryt delning|stop presenting|sluta dela|stop sharing)/i.test(txt)) {
     return false;
   }
   if (/(?:presenterar|is presenting)/i.test(txt)) {
     // Ignore toolbar tooltip / self tile labels
     const lines = txt.split(/\\n+/).filter(l => /(?:presenterar|is presenting)/i.test(l));
-    const foreign = lines.filter(l => !/(?:presentera nu|present now|u&p m[öo]tes|m[öo]tesassistent|m[öo]tesanteckningar|moten@)/i.test(l));
+    const foreign = lines.filter(l => !/(?:presentera nu|present now|u&p m[öo]tes|m[öo]tesassistent|m[öo]tesanteckningar|moten@|techzola(?:\\s+(?:meeting|ai|assistant|agent|notetaker|bot|m[öo]tes))?|meetings@techzola)/i.test(l));
     if (foreign.length > 0) return true;
   }
   return false;
@@ -2027,7 +2056,7 @@ _BRIEF_FIT_TO_FRAME_JS = """() => {
     const style = document.createElement('style');
     style.id = 'hermes-brief-fit-style';
     style.textContent = [
-      '.topbar, .toolbar, .hud-controls, .search-bar, .filter-bar, .controls, .controls-bar, .action-bar { display: none !important; }',
+      '.topbar, .top-bar, .toolbar, .hud-controls, .search-bar, .filter-bar, .controls, .controls-bar, .action-bar { display: none !important; }',
       'html, body { overflow: hidden !important; margin: 0 !important; min-height: 0 !important; height: auto !important; }',
       'body { padding: 12px 18px !important; }',
       '.shell, .card, .board, .wrap, .container, main { max-width: 1540px !important; margin: 0 auto !important; }'
@@ -2080,6 +2109,7 @@ def _refresh_brief_canvas(page, brief_state: dict, cfg: _BotConfig, state: _BotS
             b_actor = os.environ.get("HERMES_MEET_BRIEF_ACTOR", "").strip() or "moten@uropenn.se"  # health: allow HX002 -- optional actor override for meetings brief screenshare
             _quiet(b_page.set_extra_http_headers, {"X-Api-Key": b_api_key, "X-Actor-Email": b_actor})
             b_page.goto(b_url, wait_until="load", timeout=15_000)
+            _quiet(b_page.evaluate, "() => document.fonts ? Promise.race([document.fonts.ready, new Promise(r => setTimeout(r, 1500))]) : true")
             fit_info = _quiet(b_page.evaluate, _BRIEF_FIT_TO_FRAME_JS)
             _quiet(b_page.wait_for_timeout, 350)
             sys.stderr.write(f"[meet_bot] brief_fit={fit_info!r}\n")
@@ -2119,8 +2149,10 @@ def _start_brief_presentation(page, brief_state: dict, cfg: _BotConfig, state: _
     _quiet(lambda: page.locator('button[aria-label*="Stäng av kameran" i], button[aria-label*="Turn off camera" i]').first.click(timeout=1_500))
     _quiet(page.keyboard.press, "Escape")
     _quiet(page.wait_for_timeout, 300)
-    # Wake Meet's auto-hiding bottom control bar with a mouse move
-    _quiet(page.mouse.move, 640, 660)
+    # Wake Meet's auto-hiding bottom control bar across the bottom edge
+    _quiet(page.mouse.move, 640, 760)
+    _quiet(page.wait_for_timeout, 250)
+    _quiet(page.mouse.move, 640, 755)
     _quiet(page.wait_for_timeout, 400)
     console_errs: list[str] = []
     def _on_console(msg):
@@ -2132,6 +2164,7 @@ def _start_brief_presentation(page, brief_state: dict, cfg: _BotConfig, state: _
         sys.stderr.write(f"[meet_bot] brief_pre_click gdm={gdm_check!r}\n")
         sys.stderr.flush()
         btn_info = _quiet(page.evaluate, """() => {
+          document.querySelectorAll('[data-hermes-present-btn]').forEach(el => el.removeAttribute('data-hermes-present-btn'));
           const re = /(?:present now|presentera nu|share screen|dela sk[äa]rm|dela din sk[äa]rm)/i;
           const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
           for (let i = 0; i < btns.length; i++) {
@@ -2159,7 +2192,7 @@ def _start_brief_presentation(page, brief_state: dict, cfg: _BotConfig, state: _
             if not (isinstance(dbg_mid, dict) and (dbg_mid.get("getDisplayMediaCalls") or 0) > 0):
                 # Check if a dialog/menu popped up after clicking Present
                 pop = _quiet(page.evaluate, """() => {
-                  const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="dialog"] button, [role="menu"] li, [role="menu"] button'));
+                  const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], [role="dialog"] button, [role="menu"] li, [role="menu"] button'));
                   return items.map(el => ({
                     role: el.getAttribute('role') || el.tagName,
                     txt: (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 80),
@@ -2172,7 +2205,10 @@ def _start_brief_presentation(page, brief_state: dict, cfg: _BotConfig, state: _
                 sys.stderr.flush()
                 if isinstance(pop, list):
                     for item in pop:
-                        if re.search(r"(?:entire screen|hela sk[äa]rmen|f[öo]nster|window|flik|tab|forts[äa]tt|continue|dela|share|presentera|present)", item.get("txt", ""), re.IGNORECASE):
+                        txt_item = item.get("txt", "")
+                        if re.search(r"(?:sluta|stop|avbryt|cancel|ljud|audio)", txt_item, re.IGNORECASE):
+                            continue
+                        if re.search(r"(?:entire screen|hela sk[äa]rmen|f[öo]nster|window|flik|tab|presentera [äa]nd[åa]|present anyway|forts[äa]tt|continue)", txt_item, re.IGNORECASE):
                             sys.stderr.write(f"[meet_bot] brief_click_popup item={item!r}\n")
                             sys.stderr.flush()
                             _quiet(page.mouse.click, item["x"], item["y"])
@@ -2245,14 +2281,16 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
         if deadline and now > deadline:
             joined_ts = getattr(state, "joined_at", None)
             last_cap_ts = getattr(state, "last_caption_at", None)
+            last_act_ts = getattr(state, "last_audio_activity_at", None)
             is_in_call = bool(getattr(state, "in_call", False))
             in_call_elapsed = (now - float(joined_ts)) if joined_ts else 0.0
             recent_speech = bool(last_cap_ts and (now - float(last_cap_ts)) < 600.0)
+            recent_audio = bool(last_act_ts and (now - float(last_act_ts)) < 600.0)
             still_populated = bool(
                 is_in_call
                 and alone_since is None
                 and in_call_elapsed < 14400.0
-                and (last_cap_ts is None or (now - float(last_cap_ts)) < 900.0)
+                and (recent_audio or (last_cap_ts is not None and (now - float(last_cap_ts)) < 900.0))
             )
             if is_in_call and in_call_elapsed < 21600.0 and (recent_speech or still_populated):
                 deadline = now + 900.0
@@ -2279,6 +2317,23 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             elif _probe(page, _DENIED_PROBE_JS):
                 state.set(error="host denied admission", leave_reason="denied")
                 return
+            else:
+                # Dismiss late-rendered Meet recording/Gemini-notes consent dialogs after lobby admission
+                for consent_sel in (
+                    'div[role="dialog"] button:has-text("Gå med nu")',
+                    'div[role="dialog"] button:has-text("Join now")',
+                    'div[role="dialog"] button:has-text("Jag förstår")',
+                    'div[role="dialog"] button:has-text("Uppfattat")',
+                    'div[role="dialog"] button:has-text("Got it")',
+                    'div[role="dialog"] button:has-text("Fortsätt")',
+                    'div[role="dialog"] button:has-text("Continue")',
+                ):
+                    c_btn = _visible(page.locator(consent_sel))
+                    if c_btn is not None:
+                        _quiet(_click_nowait, c_btn, 2_000)
+                        if hasattr(page, "wait_for_timeout"):
+                            _quiet(page.wait_for_timeout, 400)
+                        break
         elif state.in_call and (now - last_admission_check) > 5.0:
             last_admission_check = now
             if state.mic_state == "unknown" and getattr(cfg, "rtc_audio", False) and not rt.get("enabled"):
@@ -2298,10 +2353,17 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                     and getattr(cfg, "brief_url", "")
                     and not brief_state["auto_triggered"]
                     and not getattr(state, "brief_sharing", False)
+                    and (now - float(brief_state.get("last_attempt_at") or 0.0)) >= 5.0
                 ):
-                    brief_state["auto_triggered"] = True
+                    brief_state["last_attempt_at"] = now
+                    attempts = int(brief_state.get("auto_attempts") or 0) + 1
+                    brief_state["auto_attempts"] = attempts
                     if not _probe(page, _HUMAN_PRESENTING_PROBE_JS):
-                        _start_brief_presentation(page, brief_state, cfg, state)
+                        started_ok = _start_brief_presentation(page, brief_state, cfg, state)
+                        if started_ok or attempts >= 3:
+                            brief_state["auto_triggered"] = True
+                    elif attempts >= 3:
+                        brief_state["auto_triggered"] = True
             elif isinstance(pcount, int) and pcount <= 1:
                 stay_until = float(getattr(state, "stay_override_until", 0.0) or 0.0)
                 last_act_ts = getattr(state, "last_audio_activity_at", None)
@@ -2355,12 +2417,13 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                     _stop_brief_presentation(page, brief_state, state, reason="voice_command")
             if getattr(state, "brief_sharing", False):
                 started_at = brief_state.get("started_at") or now
-                max_s = float(getattr(cfg, "brief_max_seconds", 300.0) or 300.0)
-                if _probe(page, _HUMAN_PRESENTING_PROBE_JS):
+                raw_max = getattr(cfg, "brief_max_seconds", 300.0)
+                max_s = float(raw_max) if raw_max is not None else 300.0
+                if (now - started_at) >= 5.0 and _probe(page, _HUMAN_PRESENTING_PROBE_JS):
                     _stop_brief_presentation(page, brief_state, state, reason="human_presenting_yield")
-                elif (now - started_at) >= max_s:
+                elif max_s > 0 and (now - started_at) >= max_s:
                     _stop_brief_presentation(page, brief_state, state, reason="auto_park_timeout")
-                elif (now - float(brief_state.get("last_frame_at") or 0.0)) >= 15.0:
+                elif (now - float(brief_state.get("last_frame_at") or 0.0)) >= 60.0:
                     _refresh_brief_canvas(page, brief_state, cfg, state)
             wav_q = cfg.out_dir / "say_wav_queue.jsonl" if cfg.out_dir else None
             if wav_q and wav_q.is_file() and wav_q.stat().st_size > 0:
