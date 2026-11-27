@@ -438,6 +438,11 @@ class GoogleChatAdapter(BasePlatformAdapter):
         self._typing_messages: dict[str, str] = {}
         self._clarify_state, self._rate_limit_hits = {}, {}
         self._approval_state: dict[str, dict[str, Any]] = {}
+        # Bounded cache of recently settled approvals (approved/denied/timed-out) so:
+        #  1. Late settle_exec_approval_timeout() never overwrites an already-approved card.
+        #  2. Accidental mobile double-taps on the SAME button return the cached settled card
+        #     idempotently instead of flashing a confusing "Approval Expired" message.
+        self._settled_approvals: dict[str, dict[str, Any]] = {}
         # Last inbound thread per space: DMs get a NEW thread per top-level message but users
         # see one conversation, so thread_id leaves the source (stable session key) and is cached here.
         self._last_inbound_thread: dict[str, str] = {}
@@ -1256,6 +1261,33 @@ class GoogleChatAdapter(BasePlatformAdapter):
             "intent": intent,
         }
 
+    def _record_settled_approval(
+        self,
+        *,
+        approval_id: str,
+        chat_id: str,
+        request_id: str,
+        choice: str,
+        actor_id: str,
+        card_id: str,
+        title: str,
+        card_v2: dict[str, Any],
+    ) -> None:
+        if not hasattr(self, "_settled_approvals") or self._settled_approvals is None:
+            self._settled_approvals = {}
+        if len(self._settled_approvals) >= self._EA_MAX_PENDING:
+            oldest = next(iter(self._settled_approvals))
+            self._settled_approvals.pop(oldest, None)
+        self._settled_approvals[approval_id] = {
+            "chat_id": chat_id,
+            "request_id": request_id,
+            "choice": choice,
+            "actor_id": actor_id,
+            "card_id": card_id,
+            "title": title,
+            "card_v2": card_v2,
+        }
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str, description: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
@@ -1470,10 +1502,18 @@ class GoogleChatAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="missing message_id")
 
         matched_state: Optional[dict[str, Any]] = None
+        matched_aid = ""
         if request_id:
+            # Guard against race: if the user already approved or denied this request_id
+            # via button tap, NEVER overwrite their settled card with "Approval Timed Out".
+            settled_map = getattr(self, "_settled_approvals", None) or {}
+            for settled in settled_map.values():
+                if (settled.get("request_id") or "") == request_id and settled.get("chat_id") == chat_id:
+                    return SendResult(success=True, message_id=message_id)
             for aid, st in list(self._approval_state.items()):
                 if (st.get("request_id") or "") == request_id and st.get("chat_id") == chat_id:
                     matched_state = self._approval_state.pop(aid, None)
+                    matched_aid = aid
                     break
 
         window = format_approval_window(timeout_s)
@@ -1501,6 +1541,17 @@ class GoogleChatAdapter(BasePlatformAdapter):
             intent=intent,
             detail_note=f"Timed out after {window} — the command was NOT run.",
         )
+        if matched_aid:
+            self._record_settled_approval(
+                approval_id=matched_aid,
+                chat_id=chat_id,
+                request_id=request_id or "",
+                choice="timeout",
+                actor_id="",
+                card_id=card_id,
+                title="Approval Timed Out",
+                card_v2=card_v2,
+            )
         try:
             return await self._patch_message(message_id, {"text": "", "cardsV2": [card_v2]})
         except HttpError as exc:
@@ -1700,8 +1751,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 repo_label = repo_label or fallback_summary.repo_label
                 workdir_display = workdir_display or fallback_summary.workdir_display
                 intent = intent or fallback_summary.intent
+            card_id = state.get("card_id", f"approval-{approval_id}")
             card_v2 = build_settled_exec_approval_card(
-                card_id=state.get("card_id", f"approval-{approval_id}"),
+                card_id=card_id,
                 status="denied" if choice == "deny" else "approved",
                 title=title,
                 subtitle=summary_title,
@@ -1711,9 +1763,19 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 intent=intent,
                 detail_note="Denied — command was NOT run." if choice == "deny" else f"Approved ({choice}).",
             )
+            self._record_settled_approval(
+                approval_id=approval_id,
+                chat_id=space_name,
+                request_id=state.get("request_id") or "",
+                choice=choice,
+                actor_id=actor,
+                card_id=card_id,
+                title=title,
+                card_v2=card_v2,
+            )
             return self._settled_card_response(
                 is_addon=is_addon,
-                card_id=state.get("card_id", f"approval-{approval_id}"),
+                card_id=card_id,
                 title=title,
                 card_v2=card_v2,
             )

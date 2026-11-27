@@ -22,15 +22,20 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# Hard UTF-8 wire-payload cap for a single Google Chat Cards v2 approval card.
+# Hard ASCII wire-payload cap for a single Google Chat Cards v2 approval card.
 # Official Google Chat API limit is 32,000 bytes (32 KB) for cards + cardsV2;
-# keeping 4 KB headroom avoids HTTP 400 payload rejections on escaping expansion.
+# googleapiclient serializes JSON with ensure_ascii=True, expanding non-ASCII
+# chars (Swedish åäö, emoji, CJK) to 6-12 ASCII bytes (\uXXXX). Keeping 4 KB
+# headroom under 32,000 bytes avoids HTTP 400 payload rejections on the wire.
 MAX_APPROVAL_CARD_BYTES = 28_000
 _INLINE_COMMAND_MAX_CHARS = 160
 _INLINE_COMMAND_MAX_LINES = 3
+# Google Chat Cards v2 enforces a 4,000-character limit per textParagraph widget
+# AFTER HTML entity escaping (e.g. " -> &quot;, < -> &lt;). Keep headroom below 4,000.
+_CODE_WIDGET_MAX_HTML_CHARS = 3_800
 _CODE_WIDGET_CHUNK_CHARS = 3_600
 _MAX_CODE_WIDGETS = 24
-_LLM_SUMMARY_TIMEOUT_S = 2.5
+_LLM_SUMMARY_TIMEOUT_S = 5.0
 _LLM_SUMMARY_MIN_CHARS = 220
 
 # Google Material Blue 600 for primary Allow button; subtle neutral/red for Deny.
@@ -41,8 +46,10 @@ _MUTED_TEXT_HEX = "#5F6368"
 _WARN_TEXT_HEX = "#B06000"
 
 _REPO_FLAG_RE = re.compile(r"--repo(?:=|\s+)['\"]?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)['\"]?")
-_GIT_C_RE = re.compile(r"\bgit\s+-C\s+(?:'([^']+)'|\"([^\"]+)\"|(\S+))")
-_CD_RE = re.compile(r"(?:^|[;&\n])\s*cd\s+(?:'([^']+)'|\"([^\"]+)\"|([^\s;&|]+))")
+_GIT_C_RE = re.compile(r"\bgit\s+-C\s+(?:'([^']+)'|\"([^\"]+)\"|((?:\\.|[^\s;&|])+))")
+_CD_RE = re.compile(r"(?:^|[;&\n])\s*cd\s+(?:'([^']+)'|\"([^\"]+)\"|((?:\\.|[^\s;&|])+))")
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SIMPLE_VAR_ASSIGN_RE = re.compile(r"(?:^|[;\n])\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(?:'([^']*)'|\"([^\"]*)\"|([^\s;&|]+))")
 _GH_PR_MERGE_RE = re.compile(r"\bgh\s+pr\s+merge\b([^\n;&|]*)")
 _GH_PR_CREATE_RE = re.compile(r"\bgh\s+pr\s+create\b([^\n;&|]*)")
 _GH_PR_READ_RE = re.compile(r"\bgh\s+(?:pr\s+(?:list|view|checks|status|diff)|run\s+(?:list|view|watch))\b")
@@ -55,19 +62,52 @@ _DEPLOY_RE = re.compile(
 )
 _DESTRUCTIVE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\brm\s+[^\n;&|]*-[^\s]*[rf]", re.IGNORECASE), "delete files (rm -r/-f)"),
-    (re.compile(r"\bgit\s+push\b[^\n;&|]*(?:--force(?:-with-lease)?|-f\b)"), "force push"),
-    (re.compile(r"\bgit\s+reset\s+--hard\b"), "git reset --hard"),
+    (re.compile(r"\bgit\b[^\n;&|]*\bpush\b[^\n;&|]*(?:--force(?:-with-lease)?|-f\b)"), "force push"),
+    (re.compile(r"\bgit\b[^\n;&|]*\breset\b[^\n;&|]*--hard\b"), "git reset --hard"),
+    (re.compile(r"\bgit\b[^\n;&|]*\bclean\b[^\n;&|]*-[^\s]*[fd]"), "git clean -f/-d"),
+    (re.compile(r"\bgit\b[^\n;&|]*\bbranch\b[^\n;&|]*(?:-[dD]\b|--delete\b)"), "delete git branch"),
     (re.compile(r"\b(?:DROP\s+(?:TABLE|DATABASE)|TRUNCATE\s+TABLE|DELETE\s+FROM)\b", re.IGNORECASE), "destructive SQL"),
     (re.compile(r"\b(?:launchctl\s+(?:bootout|kickstart|unload)|kill\s+-9|pkill\b)"), "process/service control"),
     (re.compile(r"\bgh\s+pr\s+merge\b[^\n;&|]*--admin\b"), "PR merge with --admin"),
+    (re.compile(r"\bkubectl\b[^\n;&|]*\b(?:delete|apply|replace|patch|scale|rollout\s+restart)\b"), "kubectl cluster write"),
+    (re.compile(r"\bterraform\b[^\n;&|]*\b(?:destroy|apply)\b"), "terraform apply/destroy"),
+    (re.compile(r"(?:^|[;&|\n])\s*sudo\b"), "sudo privileged command"),
+    (re.compile(r"\bchmod\b[^\n;&|]*\b777\b"), "chmod 777"),
+    (re.compile(r"\b(?:curl|wget)\b[^\n;&|]*\|\s*(?:env\s+)?(?:ba?sh|zsh|sh|python\d*|perl|ruby|node)\b"), "pipe to shell/interpreter"),
 )
 _FILE_PATH_HINT_RE = re.compile(
     r"(?:['\"])([A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|json|yaml|yml|md|sh|sql|html|css|toml))(?:['\"])"
 )
-_READ_ONLY_LEAD_RE = re.compile(
-    r"^\s*(?:git\s+(?:-C\s+(?:'[^']+'|\"[^\"]+\"|\S+)\s+)?(?:status|log|diff|branch|show|rev-parse)\b|"
-    r"gh\s+(?:pr\s+(?:list|view|checks|status|diff)|run\s+(?:list|view)|api\s+(?!-X\s*(?:POST|PUT|PATCH|DELETE)))|"
-    r"ls\b|pwd\b|hostname\b|cat\b|head\b|tail\b|wc\b|stat\b|which\b|env\b|ps\b|lsof\b|curl\s+(?:-sS?\s+)?(?:--max-time\s+\d+\s+)?https?://)"
+# Benign stderr-to-/dev/null redirections allowed in read-only pipelines.
+_BENIGN_STDERR_DEVNULL_RE = re.compile(r"\b2\s*>\s*/dev/null\b")
+_HEREDOC_START_RE = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+# Pure read-only single-segment commands (checked AFTER splitting chains/pipes).
+_SAFE_PIPE_FILTER_RE = re.compile(
+    r"^\s*(?:head|tail|grep|egrep|fgrep|rg|wc|sort|uniq|cut|tr|cat|less|column|jq)\b"
+)
+_SAFE_SED_READ_RE = re.compile(r"^\s*sed\s+(?:-[nreE]+\s+)*['\"][^'\"]*['\"]\s*$")
+_SAFE_GIT_READ_SUBCMD_RE = re.compile(
+    r"^\s*git\s+(?:-[Cc]\s+(?:'[^']+'|\"[^\"]+\"|(?:\\.|[^\s;&|])+)\s+)*"
+    r"(?:status|log|diff|show|rev-parse|describe|remote\s+-v)\b"
+)
+_SAFE_GIT_BRANCH_READ_RE = re.compile(
+    r"^\s*git\s+(?:-[Cc]\s+(?:'[^']+'|\"[^\"]+\"|(?:\\.|[^\s;&|])+)\s+)*"
+    r"branch(?:\s+(?:--show-current|--list|-a|--all|-r|--remotes|-v|-vv|--merged|--no-merged))*\s*$"
+)
+_SAFE_GH_READ_RE = re.compile(
+    r"^\s*gh\s+(?:pr\s+(?:list|view|checks|status|diff)|run\s+(?:list|view|watch)|issue\s+(?:list|view)|repo\s+view)\b"
+)
+_SAFE_GH_API_RE = re.compile(r"^\s*gh\s+api\b")
+_GH_API_MUTATE_RE = re.compile(
+    r"(?:^|\s)(?:-[fF]\b|--(?:raw-)?field\b|--input\b|(?:--method|-X)(?:=|\s+)(?!['\"]?GET\b))"
+)
+_SAFE_CURL_RE = re.compile(r"^\s*curl\b")
+_CURL_MUTATE_RE = re.compile(
+    r"(?:^|\s)(?:-[dFTIoO]\b|--data(?:-[a-z]+)?\b|--json\b|--form(?:-[a-z]+)?\b|--upload-file\b|--output\b|"
+    r"(?:--request|-X)(?:=|\s+)(?!['\"]?(?:GET|HEAD)\b))"
+)
+_SAFE_SIMPLE_READ_RE = re.compile(
+    r"^\s*(?:ls|pwd|hostname|cat|head|tail|wc|stat|which|ps|lsof|whoami|id|uname|date|df|du|uptime)\b"
 )
 
 
@@ -111,8 +151,31 @@ def _repo_name_from_path(raw_path: str) -> str:
     return name or cleaned
 
 
+def _unescape_shell_path(raw_path: str) -> str:
+    """Unescape shell backslash-escaped whitespace/chars inside unquoted paths."""
+    return re.sub(r"\\([ \t'\"()])", r"\1", str(raw_path or ""))
+
+
+def _resolve_simple_dir_var(path_str: str, shell_text: str) -> str:
+    """Resolve a simple ``$VAR`` or ``${VAR}`` if assigned literally earlier, else empty."""
+    cleaned = path_str.strip().strip("'\"")
+    if "$" not in cleaned:
+        return cleaned
+    # Never display raw unexpanded shell variable names like $REPO_DIR as a repo label.
+    m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", cleaned)
+    if not m:
+        return ""
+    var_name = m.group(1)
+    for assign in _SIMPLE_VAR_ASSIGN_RE.finditer(shell_text):
+        if assign.group(1) == var_name:
+            val = next((g for g in assign.groups()[1:] if g is not None), "")
+            if val and "$" not in val:
+                return _unescape_shell_path(val)
+    return ""
+
+
 def _extract_repo_and_dir(command: str, workdir: Optional[str]) -> tuple[str, str]:
-    """Return ``(repo_label, workdir_display)`` from explicit workdir or command hints."""
+    """Return ``(repo_label, workdir_display)`` from explicit workdir or non-comment command hints."""
     wd = str(workdir or "").strip()
     repo_match = _REPO_FLAG_RE.search(command)
     git_c_match = _GIT_C_RE.search(command)
@@ -120,9 +183,11 @@ def _extract_repo_and_dir(command: str, workdir: Optional[str]) -> tuple[str, st
 
     extracted_dir = ""
     if git_c_match:
-        extracted_dir = next((g for g in git_c_match.groups() if g), "")
+        raw_dir = next((g for g in git_c_match.groups() if g), "")
+        extracted_dir = _resolve_simple_dir_var(_unescape_shell_path(raw_dir), command)
     elif cd_match:
-        extracted_dir = next((g for g in cd_match.groups() if g), "")
+        raw_dir = next((g for g in cd_match.groups() if g), "")
+        extracted_dir = _resolve_simple_dir_var(_unescape_shell_path(raw_dir), command)
 
     if wd:
         repo = repo_match.group(1) if repo_match else _repo_name_from_path(wd)
@@ -153,6 +218,92 @@ def _strip_shell_comments(command: str) -> str:
     )
 
 
+def _strip_heredoc_bodies(command: str) -> str:
+    """Keep only shell-level lines (excluding heredoc bodies) for shell-verb classification."""
+    out: list[str] = []
+    end_marker: Optional[str] = None
+    for line in command.splitlines():
+        if end_marker is not None:
+            if line.strip() == end_marker:
+                end_marker = None
+            continue
+        out.append(line)
+        m = _HEREDOC_START_RE.search(line)
+        if m:
+            end_marker = m.group(1)
+    return "\n".join(out)
+
+
+def _is_single_segment_read_only(segment: str, *, is_pipe_rhs: bool = False) -> bool:
+    """Return True only if one simple command segment is provably read-only."""
+    seg = segment.strip()
+    if not seg:
+        return False
+    # Strip benign `2>/dev/null` before checking for any redirection.
+    seg_clean = _BENIGN_STDERR_DEVNULL_RE.sub("", seg).strip()
+    # Any remaining redirection (> / >> / <> / >| / &>), command substitution, or subshell fails closed.
+    if any(tok in seg_clean for tok in (">", "$(", "`", "<<", "<(")):
+        return False
+    if is_pipe_rhs:
+        return bool(_SAFE_PIPE_FILTER_RE.match(seg_clean) or _SAFE_SED_READ_RE.match(seg_clean))
+    if _SAFE_GIT_READ_SUBCMD_RE.match(seg_clean):
+        return True
+    if _SAFE_GIT_BRANCH_READ_RE.match(seg_clean):
+        return True
+    if _SAFE_GH_READ_RE.match(seg_clean):
+        return True
+    if _SAFE_GH_API_RE.match(seg_clean):
+        return not bool(_GH_API_MUTATE_RE.search(seg_clean))
+    if _SAFE_CURL_RE.match(seg_clean):
+        return not bool(_CURL_MUTATE_RE.search(seg_clean))
+    if _SAFE_SIMPLE_READ_RE.match(seg_clean):
+        return True
+    return False
+
+
+def _is_strictly_read_only(stripped: str) -> bool:
+    """Fail-closed check: True ONLY when every chained segment and pipe stage is read-only."""
+    text = stripped.strip()
+    if not text:
+        return False
+    # Strip benign `2>/dev/null` first so we can safely inspect for any redirections or substitutions.
+    no_devnull = _BENIGN_STDERR_DEVNULL_RE.sub("", text)
+    if any(tok in no_devnull for tok in (">", "$(", "`", "<<", "<(", "\n")):
+        return False
+    # Reject backgrounding (`&` not part of `&&`).
+    if re.search(r"(?<!&)&(?!&)", no_devnull):
+        return False
+    # Split on command-chain separators (`&&`, `||`, `;`).
+    chain_parts = [p.strip() for p in re.split(r"&&|\|\||;", no_devnull)]
+    if not chain_parts or any(not p for p in chain_parts):
+        return False
+    for part in chain_parts:
+        # Allow leading `cd <dir>` only when followed by another chained read-only segment.
+        if re.match(r"^\s*cd\s+\S+", part) and len(chain_parts) > 1:
+            continue
+        pipe_stages = [s.strip() for s in part.split("|")]
+        if not pipe_stages or any(not s for s in pipe_stages):
+            return False
+        if not _is_single_segment_read_only(pipe_stages[0], is_pipe_rhs=False):
+            return False
+        for rhs in pipe_stages[1:]:
+            if not _is_single_segment_read_only(rhs, is_pipe_rhs=True):
+                return False
+    return True
+
+
+def _first_executable_token(stripped: str) -> str:
+    """Return the first command token, skipping leading ``KEY=VALUE`` env assignments."""
+    for tok in stripped.split():
+        if _ENV_ASSIGN_RE.match(tok):
+            continue
+        cleaned = tok.rstrip(";&|")
+        if "/" in cleaned:
+            cleaned = os.path.basename(cleaned) or cleaned
+        return cleaned or "command"
+    return "command"
+
+
 def analyze_command(
     command: str,
     workdir: Optional[str] = None,
@@ -163,11 +314,13 @@ def analyze_command(
     """Deterministically classify a shell command into a human-scannable summary."""
     raw = str(command or "")
     stripped = _strip_shell_comments(raw)
+    shell_lines = _strip_heredoc_bodies(stripped)
     lines = raw.splitlines() or [raw]
     line_count = len(lines)
     char_count = len(raw)
 
-    repo_label, workdir_display = _extract_repo_and_dir(raw, workdir)
+    # Extract repo/dir from non-comment lines so comments cannot spoof --repo or cd.
+    repo_label, workdir_display = _extract_repo_and_dir(stripped, workdir)
     touched_files = _extract_touched_files(raw)
 
     dangerous_flags: list[str] = []
@@ -179,13 +332,14 @@ def analyze_command(
     steps: list[str] = []
     title = ""
 
-    merge_match = _GH_PR_MERGE_RE.search(stripped)
-    create_match = _GH_PR_CREATE_RE.search(stripped)
-    push_match = _GIT_PUSH_RE.search(stripped)
-    deploy_match = _DEPLOY_RE.search(stripped)
-    test_matches = sorted({m.group(1).split()[0] for m in _TEST_CMD_RE.finditer(stripped)})
-    has_heredoc = "<<" in stripped
-    has_commit = bool(_GIT_COMMIT_RE.search(stripped))
+    merge_match = _GH_PR_MERGE_RE.search(shell_lines)
+    create_match = _GH_PR_CREATE_RE.search(shell_lines)
+    push_match = _GIT_PUSH_RE.search(shell_lines)
+    deploy_match = _DEPLOY_RE.search(shell_lines)
+    test_matches = sorted({m.group(1).split()[0] for m in _TEST_CMD_RE.finditer(shell_lines)})
+    has_heredoc = "<<" in shell_lines
+    has_commit = bool(_GIT_COMMIT_RE.search(shell_lines))
+    is_read_only = (not dangerous_flags) and _is_strictly_read_only(stripped)
 
     if merge_match:
         tail = merge_match.group(1) or ""
@@ -225,7 +379,7 @@ def analyze_command(
         title = "High-Impact Command" + (f" · {repo_label}" if repo_label else "")
         risk_badges.append("High Impact")
         steps.append(f"Runs sensitive operation: {', '.join(dangerous_flags)}")
-    elif has_heredoc and ("python" in stripped or "node" in stripped):
+    elif has_heredoc and ("python" in shell_lines or "node" in shell_lines):
         title = "Run Script" + (f" · {repo_label}" if repo_label else "")
         risk_badges.append("Local Script")
         if touched_files:
@@ -237,23 +391,28 @@ def analyze_command(
             steps.append("Create git commit")
         if not steps:
             steps.append(f"Execute inline script ({line_count} lines)")
-    elif _GH_PR_READ_RE.search(stripped) and not (has_commit or push_match or has_heredoc):
+    elif is_read_only and _GH_PR_READ_RE.search(stripped):
         title = "Check GitHub PR / CI" + (f" · {repo_label}" if repo_label else "")
         risk_badges.append("Read-Only")
         steps.append("Inspect GitHub pull request or workflow status")
-    elif _READ_ONLY_LEAD_RE.search(stripped) and not (has_heredoc or has_commit or push_match or dangerous_flags):
+    elif is_read_only:
         first_cmd = (stripped.splitlines()[0].strip() if stripped.splitlines() else raw.strip())[:48]
         title = "Read-Only Check" + (f" · {repo_label}" if repo_label else "")
         risk_badges.append("Read-Only")
         steps.append(f"Inspect state ({first_cmd})")
     else:
-        first_tok = (stripped.split() or ["command"])[0]
+        first_tok = _first_executable_token(shell_lines or stripped)
         title = f"Run {first_tok}" + (f" · {repo_label}" if repo_label else "")
         risk_badges.append("Shell Command")
         if test_matches:
             steps.append(f"Run {', '.join(test_matches[:3])}")
         else:
             steps.append(f"Run shell command ({line_count} line{'s' if line_count != 1 else ''})")
+
+    # Never swallow a chained deployment step behind an earlier merge/create/push branch.
+    if deploy_match and "Deploy" not in risk_badges:
+        risk_badges.append("Deploy")
+        steps.append(f"Run deployment step ({deploy_match.group(1)})")
 
     if dangerous_flags and "High Impact" not in risk_badges:
         risk_badges.insert(0, "High Impact")
@@ -331,6 +490,7 @@ async def maybe_enrich_summary(
                 max_tokens=120,
                 temperature=0.0,
                 timeout=max(1.0, timeout_s),
+                reasoning_config={"enabled": False},
             ),
             timeout=timeout_s,
         )
@@ -339,6 +499,9 @@ async def maybe_enrich_summary(
         if choices:
             msg = getattr(choices[0], "message", None)
             content = str(getattr(msg, "content", "") or "").strip()
+        # Strip any model chain-of-thought tags (<think>...</think>) defensively.
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.IGNORECASE | re.DOTALL)
+        content = re.sub(r"<think>.*", "", content, flags=re.IGNORECASE | re.DOTALL)
         # Strip any markdown fences or newlines to keep the card crisp.
         content = re.sub(r"[`*_]+", "", content)
         content = re.sub(r"\s+", " ", content).strip()[:240]
@@ -368,21 +531,55 @@ def _escape(text: str) -> str:
     return html.escape(str(text or ""), quote=True)
 
 
+def _escaped_code_widget_len(chunk: str) -> int:
+    return len("<pre><code>") + len(_escape(chunk)) + len("</code></pre>")
+
+
+def _max_prefix_fitting_html(text: str, max_html_chars: int) -> int:
+    """Return the largest prefix length ``n`` with ``_escaped_code_widget_len(text[:n]) <= max_html_chars``."""
+    hi = min(len(text), _CODE_WIDGET_CHUNK_CHARS)
+    if _escaped_code_widget_len(text[:hi]) <= max_html_chars:
+        return hi
+    lo = 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _escaped_code_widget_len(text[:mid]) <= max_html_chars:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def _chunk_command_for_widgets(command: str) -> list[str]:
+    """Split ``command`` into chunks whose HTML-escaped ``<pre><code>`` widgets stay <= 3,800 chars.
+
+    Preserves every character and consecutive blank line verbatim across line-boundary splits
+    (consumes only the single newline separating adjacent widgets, never ``lstrip("\\n")``).
+    """
     if not command:
         return [""]
     chunks: list[str] = []
     remaining = command
     while remaining and len(chunks) < _MAX_CODE_WIDGETS:
-        if len(remaining) <= _CODE_WIDGET_CHUNK_CHARS:
+        if len(remaining) <= _CODE_WIDGET_CHUNK_CHARS and _escaped_code_widget_len(remaining) <= _CODE_WIDGET_MAX_HTML_CHARS:
             chunks.append(remaining)
             remaining = ""
             break
-        cut = remaining.rfind("\n", 0, _CODE_WIDGET_CHUNK_CHARS)
-        if cut < _CODE_WIDGET_CHUNK_CHARS // 2:
-            cut = _CODE_WIDGET_CHUNK_CHARS
-        chunks.append(remaining[:cut])
-        remaining = remaining[cut:].lstrip("\n")
+        end = _max_prefix_fitting_html(remaining, _CODE_WIDGET_MAX_HTML_CHARS)
+        if end <= 0:
+            return []
+        if end >= len(remaining):
+            chunks.append(remaining)
+            remaining = ""
+            break
+        nl = remaining.rfind("\n", 0, min(len(remaining), end + 1))
+        if nl >= end // 2:
+            chunks.append(remaining[:nl])
+            # Consume ONLY the single newline represented by the boundary between widgets.
+            remaining = remaining[nl + 1:]
+        else:
+            chunks.append(remaining[:end])
+            remaining = remaining[end:]
     if remaining:
         return []  # Signals caller that widget count exceeded cap
     return chunks
@@ -417,7 +614,8 @@ def _build_action_button(
 
 
 def _card_byte_size(card_v2: dict[str, Any]) -> int:
-    return len(json.dumps({"cardsV2": [card_v2]}, ensure_ascii=False).encode("utf-8"))
+    """Measure wire payload bytes using ``ensure_ascii=True`` to match googleapiclient serialization."""
+    return len(json.dumps({"cardsV2": [card_v2]}, ensure_ascii=True).encode("utf-8"))
 
 
 def build_exec_approval_card(
