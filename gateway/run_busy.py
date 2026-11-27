@@ -1117,6 +1117,18 @@ class GatewayBusySessionMixin:
         1. ``busy_handler`` — special mid-run variant (e.g. /goal's control-verb whitelist, /queue's FIFO
         enqueue, /model's custom reject text). 2. 3. See #5057, #6252, #10370.
         """
+        from tools.approval_context import (
+            BUTTON_ONLY_ALLOWED_SLASH_COMMANDS,
+            is_button_only_approval_platform,
+        )
+        platform = source.platform.value if source and source.platform else ""
+        async with self._async_profile_scope_for_source(source):
+            button_only = is_button_only_approval_platform(platform)
+        if button_only and getattr(cmd_def, "name", "") not in BUTTON_ONLY_ALLOWED_SLASH_COMMANDS:
+            return (
+                f"Command '/{cmd_def.name}' is disabled on button-only platform '{platform}'. "
+                "Only read-only queries and /deny or /stop are permitted via text."
+            )
         kind, target = self._busy_slash_route(cmd_def)
         if kind == "special":
             return await getattr(self, target)(event, quick_key, source)

@@ -218,6 +218,22 @@ TOOLSETS = {
     "hermes-wecom": _bundle("WeCom bot toolset - enterprise WeChat messaging (full access)"),
     "hermes-wecom-callback": _bundle("WeCom callback toolset - enterprise self-built app messaging (full access)"),
     "hermes-sms": _bundle("SMS bot toolset - interact with Hermes via SMS (Twilio)"),
+    "hermes-google-chat-readonly": _ts(
+        "Google Chat read/draft-only toolset — text-initiated turns cannot mutate files, "
+        "cron, memory, skills, or browser; terminal writes require interactive button approval",
+        [
+            "read_file",
+            "search_files",
+            "web_search",
+            "web_extract",
+            "vision_analyze",
+            "session_search",
+            "skills_list",
+            "skill_view",
+            "todo_list",
+            "terminal",
+        ],
+    ),
     "hermes-webhook": _ts("Webhook toolset - receive and process external webhook events", _HERMES_WEBHOOK_SAFE_TOOLS),
     "hermes-gateway": _ts(
         "Gateway toolset - union of all messaging platform tools",

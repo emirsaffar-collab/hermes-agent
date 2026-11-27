@@ -50,11 +50,16 @@ HttpError: Any = Exception  # type: ignore
 
 _google_modules_loaded: bool = False
 # (global name, module, attribute-or-None) rebound by ``_load_google_modules``.
+# Pub/Sub deps are optional so HTTP-only callback mode works without ``google-cloud-pubsub``.
 _GOOGLE_IMPORTS = (
-    ("httplib2", "httplib2", None), ("pubsub_v1", "google.cloud.pubsub_v1", None),
-    ("gax_exceptions", "google.api_core.exceptions", None), ("service_account", "google.oauth2.service_account", None),
+    ("httplib2", "httplib2", None),
+    ("service_account", "google.oauth2.service_account", None),
     ("AuthorizedHttp", "google_auth_httplib2", "AuthorizedHttp"), ("build_service", "googleapiclient.discovery", "build"),
     ("HttpError", "googleapiclient.errors", "HttpError"), ("MediaFileUpload", "googleapiclient.http", "MediaFileUpload"),
+)
+_GOOGLE_PUBSUB_IMPORTS = (
+    ("pubsub_v1", "google.cloud.pubsub_v1", None),
+    ("gax_exceptions", "google.api_core.exceptions", None),
 )
 _GOOGLE_ID_TOKEN_CERTS_TTL_SECONDS = 300
 _google_id_token_request: Any = None
@@ -119,6 +124,12 @@ def _load_google_modules() -> bool:
         GOOGLE_CHAT_AVAILABLE = False
         return False
     globals().update(loaded)
+    for name, module, attr in _GOOGLE_PUBSUB_IMPORTS:
+        try:
+            mod = importlib.import_module(module)
+            globals()[name] = getattr(mod, attr) if attr else mod
+        except ImportError:
+            globals()[name] = None
     GOOGLE_CHAT_AVAILABLE = True
     return True
 
@@ -129,9 +140,9 @@ from gateway.config import Platform, PlatformConfig
 Platform("google_chat")
 from gateway.platforms.helpers import MessageDeduplicator, numbered_clarify_choices
 from gateway.platforms.base import (
-    gateway_trust_env, BasePlatformAdapter, SendResult, describe_proxy_error, env_proxy_for_redaction,
-    cache_audio_from_bytes_async, cache_document_from_bytes_async, cache_image_from_bytes_async,
-    cache_video_from_bytes_async,
+    gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt, SendResult, describe_proxy_error,
+    env_proxy_for_redaction, cache_audio_from_bytes_async, cache_document_from_bytes_async,
+    cache_image_from_bytes_async, cache_video_from_bytes_async,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
@@ -426,6 +437,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
         self._shutting_down = False
         self._typing_messages: dict[str, str] = {}
         self._clarify_state, self._rate_limit_hits = {}, {}
+        self._approval_state: dict[str, dict[str, Any]] = {}
         # Last inbound thread per space: DMs get a NEW thread per top-level message but users
         # see one conversation, so thread_id leaves the source (stable session key) and is cached here.
         self._last_inbound_thread: dict[str, str] = {}
@@ -659,8 +671,16 @@ class GoogleChatAdapter(BasePlatformAdapter):
             await asyncio.to_thread(self._thread_count_store.load)
         except Exception:
             logger.warning("[GoogleChat] thread-count store load failed (treating all threads as fresh)", exc_info=True)
-        if subscription_path is not None and not await self._check_subscription(subscription_path, credentials):
-            return False
+        if subscription_path is not None:
+            if pubsub_v1 is None or gax_exceptions is None:
+                self._set_fatal_error(
+                    code="missing_deps",
+                    retryable=False,
+                    message="google-cloud-pubsub is required for Pub/Sub inbound mode",
+                )
+                return False
+            if not await self._check_subscription(subscription_path, credentials):
+                return False
         # Resolve bot user_id (eager): cache first, then members.list.
         self._bot_user_id = self._load_cached_bot_id()
         if not self._bot_user_id:
@@ -873,6 +893,19 @@ class GoogleChatAdapter(BasePlatformAdapter):
 
     async def dispatch_http_event(self, envelope: dict[str, Any]) -> dict[str, Any]:
         from gateway.parked_route_refusal import ParkedRouteRefused, retryable_ingress
+        if self._extract_button_click(envelope) is not None:
+            return await self._handle_button_click(envelope)
+        raw_chat = envelope.get("chat")
+        if isinstance(raw_chat, dict) and isinstance(raw_chat.get("addedToSpacePayload"), dict):
+            added: dict[str, Any] = raw_chat["addedToSpacePayload"]
+            raw_m = added.get("membership")
+            raw_membership: dict[str, Any] = raw_m if isinstance(raw_m, dict) else {}
+            raw_mem = raw_membership.get("member")
+            member: dict[str, Any] = raw_mem if isinstance(raw_mem, dict) else {}
+            if member.get("type") == "BOT" and not self._bot_user_id and member.get("name"):
+                self._bot_user_id = str(member["name"])
+                self._save_cached_bot_id(self._bot_user_id)
+            return {}
         prepared = self._prepare_inbound(envelope)
         if prepared is None:
             return {}
@@ -921,11 +954,17 @@ class GoogleChatAdapter(BasePlatformAdapter):
             # The intercept skips the runner's allowlist, so it serves only a sender that check
             # accepts; anyone else goes to handle_message and gets the runner's deny/pairing path.
             # The sender email (user_id_alt) is the per-user OAuth token key.
-            if text.startswith("/setup-files") and event.source is not None and self._is_sender_authorized(
-                event.source.user_id, event.source.chat_type, event.source.chat_id,
-            ) is True and await self._handle_setup_files_command(
-                chat_id=event.source.chat_id, thread_id=event.source.thread_id, raw_text=text,
-                sender_email=event.source.user_id_alt or None,
+            if (
+                not self._is_button_only()
+                and text.startswith("/setup-files")
+                and event.source is not None
+                and self._is_sender_authorized(
+                    event.source.user_id, event.source.chat_type, event.source.chat_id,
+                ) is True
+                and await self._handle_setup_files_command(
+                    chat_id=event.source.chat_id, thread_id=event.source.thread_id, raw_text=text,
+                    sender_email=event.source.user_id_alt or None,
+                )
             ):
                 return
             await self.handle_message(event)
@@ -1149,6 +1188,261 @@ class GoogleChatAdapter(BasePlatformAdapter):
         except Exception as exc:  # the traceback repeats the text _exc_text hides
             logger.debug("[GoogleChat] send_card failed", exc_info=not _proxy_error(exc))
             return SendResult(success=False, error=_exc_text(exc), retryable=_is_retryable_error(exc))
+
+    _EA_ACTION_FUNC = "hermes_exec_approval"
+    _EA_VALID_CHOICES = frozenset({"once", "session", "always", "deny"})
+    _EA_BUTTON_ONLY_CHOICES = frozenset({"once", "deny"})
+    _EA_MAX_PENDING = 512
+
+    def _is_button_only(self) -> bool:
+        """Evaluate ``is_button_only_approval_platform`` inside this adapter's profile scope."""
+        from tools.approval_context import is_button_only_approval_platform
+
+        ctx = getattr(self, "_scope_ctx", None)
+        if ctx is not None:
+            return bool(ctx.copy().run(is_button_only_approval_platform, self.name))
+        return bool(is_button_only_approval_platform(self.name))
+
+    async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
+        """Render an interactive Google Chat Cards v2 approval card for a pending command."""
+        import uuid
+
+        button_only = self._is_button_only()
+        allowed = self._EA_BUTTON_ONLY_CHOICES if button_only else self._EA_VALID_CHOICES
+        actions = [(label, choice, style) for label, choice, style in prompt.actions if choice in allowed]
+        if not actions:
+            # Fail closed: never synthesize an Approve button when the caller omitted approval actions
+            # (e.g. Deny-only cards when the full command could not be previewed).
+            actions = [("Deny", "deny", "danger")]
+
+        approval_id = uuid.uuid4().hex[:16]
+        # Google Workspace Add-ons extending Chat require action.function to be the full HTTPS
+        # callback URL and leave commonEventObject.invokedFunction empty — carry the logical
+        # action identifier inside action.parameters as well.
+        action_target = self._http_events_url or self._EA_ACTION_FUNC
+        buttons = [
+            {
+                "text": label,
+                "action": action_target,
+                "parameters": {
+                    "action": self._EA_ACTION_FUNC,
+                    "approval_id": approval_id,
+                    "choice": choice,
+                    "request_id": prompt.request_id or "",
+                },
+            }
+            for label, choice, _style in actions
+        ]
+        card = card_spec_to_cards_v2({
+            "card_id": f"approval-{approval_id}",
+            "header": {
+                "title": "Command Approval Required",
+                "subtitle": "Interactive button approval",
+            },
+            "sections": [
+                {
+                    "widgets": [
+                        {"type": "text", "text": prompt.text},
+                        {"type": "buttons", "buttons": buttons},
+                    ]
+                }
+            ],
+        })
+        result = await self.send_card(prompt.chat_id, card, metadata=prompt.metadata)
+        if result.success:
+            if len(self._approval_state) >= self._EA_MAX_PENDING:
+                oldest = next(iter(self._approval_state))
+                self._approval_state.pop(oldest, None)
+            self._approval_state[approval_id] = {
+                "session_key": prompt.session_key,
+                "request_id": prompt.request_id or "",
+                "chat_id": prompt.chat_id,
+                "command": prompt.command,
+                "description": prompt.description,
+                "card_id": f"approval-{approval_id}",
+            }
+        return result
+
+    @classmethod
+    def _extract_button_click(cls, envelope: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Parse both Workspace Add-on ``chat.buttonClickedPayload`` and legacy ``CARD_CLICKED``."""
+        if not isinstance(envelope, dict):
+            return None
+        chat_obj = envelope.get("chat")
+        if isinstance(chat_obj, dict) and isinstance(chat_obj.get("buttonClickedPayload"), dict):
+            payload: dict[str, Any] = chat_obj["buttonClickedPayload"]
+            raw_common = envelope.get("commonEventObject")
+            common: dict[str, Any] = raw_common if isinstance(raw_common, dict) else {}
+            raw_params = common.get("parameters")
+            params = {str(k): str(v) for k, v in raw_params.items()} if isinstance(raw_params, dict) else {}
+            raw_user = chat_obj.get("user")
+            user: dict[str, Any] = raw_user if isinstance(raw_user, dict) else {}
+            raw_space = payload.get("space")
+            space: dict[str, Any] = raw_space if isinstance(raw_space, dict) else {}
+            return {
+                "is_addon": True,
+                "action_fn": str(common.get("invokedFunction") or ""),
+                "params": params,
+                "user": user,
+                "space": space,
+            }
+        if envelope.get("type") == "CARD_CLICKED":
+            raw_action = envelope.get("action")
+            action: dict[str, Any] = raw_action if isinstance(raw_action, dict) else {}
+            raw_list = action.get("parameters")
+            params = (
+                {
+                    str(item.get("key")): str(item.get("value", ""))
+                    for item in raw_list if isinstance(item, dict) and item.get("key")
+                }
+                if isinstance(raw_list, list)
+                else {}
+            )
+            raw_user = envelope.get("user")
+            user = raw_user if isinstance(raw_user, dict) else {}
+            raw_space = envelope.get("space")
+            space = raw_space if isinstance(raw_space, dict) else {}
+            return {
+                "is_addon": False,
+                "action_fn": str(action.get("actionMethodName") or ""),
+                "params": params,
+                "user": user,
+                "space": space,
+            }
+        return None
+
+    @staticmethod
+    def _settled_card_response(*, is_addon: bool, card_id: str, title: str, body: str) -> dict[str, Any]:
+        """Return a synchronous card update response stripping interactive buttons."""
+        card_v2 = card_spec_to_cards_v2({
+            "card_id": card_id or "approval-settled",
+            "header": {"title": title},
+            "sections": [{"widgets": [{"type": "text", "text": body}]}],
+        })
+        if is_addon:
+            return {
+                "hostAppDataAction": {
+                    "chatDataAction": {
+                        "updateMessageAction": {
+                            "message": {
+                                "cardsV2": [card_v2],
+                            }
+                        }
+                    }
+                }
+            }
+        return {
+            "actionResponse": {"type": "UPDATE_MESSAGE"},
+            "cardsV2": [card_v2],
+        }
+
+    async def _handle_button_click(self, envelope: dict[str, Any]) -> dict[str, Any]:
+        """Verify clicker identity + state binding, resolve pending exec approval, update card."""
+        from tools.approval import resolve_gateway_approval_card
+
+        click = self._extract_button_click(envelope)
+        if click is None:
+            return {}
+        raw_fn = click["action_fn"]
+        param_fn = click["params"].get("action", "")
+        valid_fn = (
+            raw_fn == self._EA_ACTION_FUNC
+            or (
+                param_fn == self._EA_ACTION_FUNC
+                and raw_fn in ("", self._EA_ACTION_FUNC, self._http_events_url)
+            )
+        )
+        if not valid_fn:
+            return {}
+
+        is_addon = bool(click["is_addon"])
+        params = click["params"]
+        user = click["user"]
+        space = click["space"]
+
+        approval_id = params.get("approval_id", "").strip()
+        choice = params.get("choice", "").strip().lower()
+        request_id = params.get("request_id", "").strip()
+
+        user_id = str(user.get("name") or "").strip()
+        user_email = str(user.get("email") or "").strip()
+        is_bot = str(user.get("type") or "").upper() == "BOT"
+        space_name = str(space.get("name") or "").strip()
+        space_type = str(space.get("spaceType") or space.get("type") or "").upper()
+        chat_type = "dm" if space_type in ("DIRECT_MESSAGE", "DM") else "group"
+
+        # Strict fail-closed sender authorization: never trust bots or unverified callers,
+        # and NEVER pop _approval_state on unauthorized clicks (prevents DoS of pending card).
+        authorized = False
+        if not is_bot and (
+            (user_id and self._is_sender_authorized(user_id, chat_type, space_name) is True)
+            or (user_email and self._is_sender_authorized(user_email, chat_type, space_name) is True)
+        ):
+            authorized = True
+
+        if not authorized:
+            logger.warning(
+                "[GoogleChat] Rejected unauthorized approval button click (user=%s email=%s space=%s)",
+                user_id or "?", user_email or "?", space_name or "?",
+            )
+            return {}
+
+        allowed = (
+            self._EA_BUTTON_ONLY_CHOICES
+            if self._is_button_only()
+            else self._EA_VALID_CHOICES
+        )
+        if choice not in allowed:
+            logger.warning("[GoogleChat] Rejected disallowed approval choice %r on %s", choice, space_name)
+            return {}
+
+        state = self._approval_state.get(approval_id)
+        if not state:
+            return self._settled_card_response(
+                is_addon=is_addon,
+                card_id=f"approval-{approval_id or 'expired'}",
+                title="Approval Expired",
+                body="This approval request is no longer pending (already resolved or timed out).",
+            )
+
+        if state["chat_id"] != space_name or (state.get("request_id") or "") != request_id:
+            logger.warning(
+                "[GoogleChat] Rejected mismatched approval callback (approval_id=%s space=%s expected=%s)",
+                approval_id, space_name, state["chat_id"],
+            )
+            return {}
+
+        actor = user_id or user_email
+        resolved = resolve_gateway_approval_card(
+            state["session_key"],
+            choice,
+            state.get("request_id") or None,
+            actor_id=actor,
+            extra=self.config.extra,
+            admitted=True,
+        )
+        if resolved > 0:
+            self._approval_state.pop(approval_id, None)
+            title = "Command Denied" if choice == "deny" else f"Command Approved ({choice})"
+            body = (
+                f"Decision: {choice}\n"
+                f"Actor: {user_email or actor}\n"
+                f"Command: `{state['command'][:240]}`"
+            )
+            return self._settled_card_response(
+                is_addon=is_addon,
+                card_id=state.get("card_id", f"approval-{approval_id}"),
+                title=title,
+                body=body,
+            )
+
+        self._approval_state.pop(approval_id, None)
+        return self._settled_card_response(
+            is_addon=is_addon,
+            card_id=state.get("card_id", f"approval-{approval_id}"),
+            title="Approval Expired",
+            body="No pending command matched this approval card.",
+        )
 
     async def send_clarify(
         self, chat_id: str, question: str, choices: Optional[list], clarify_id: str, session_key: str,

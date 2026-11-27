@@ -1092,6 +1092,19 @@ class GatewayInboundMixin(
     ) -> tuple[bool, Optional[str]]:
         """Dispatch built-in idle-path commands → ``(handled, result)``; prompt-rewriting commands
         mutate ``event.text`` and return ``(False, None)`` to fall through to the agent."""
+        if canonical:
+            from tools.approval_context import (
+                BUTTON_ONLY_ALLOWED_SLASH_COMMANDS,
+                is_button_only_approval_platform,
+            )
+            platform = source.platform.value if source and source.platform else ""
+            async with self._async_profile_scope_for_source(source):
+                button_only = is_button_only_approval_platform(platform)
+            if button_only and canonical not in BUTTON_ONLY_ALLOWED_SLASH_COMMANDS:
+                return True, (
+                    f"Command '/{canonical}' is disabled on button-only platform '{platform}'. "
+                    "Only read-only queries and /deny or /stop are permitted via text."
+                )
         plain_handler = (
             self._gateway_plain_command_handlers().get(canonical)
             or self._gateway_idle_command_handlers().get(canonical)
@@ -1241,6 +1254,19 @@ class GatewayInboundMixin(
         _handled, _result, command, canonical = await self._hm_resolve_command(event, source, _quick_key)
         if not _handled:
             _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)
+        if not _handled and command:
+            from tools.approval_context import (
+                BUTTON_ONLY_ALLOWED_SLASH_COMMANDS,
+                is_button_only_approval_platform,
+            )
+            platform = source.platform.value if source and source.platform else ""
+            async with self._async_profile_scope_for_source(source):
+                _button_only = is_button_only_approval_platform(platform)
+            if _button_only and command.replace("_", "-") not in BUTTON_ONLY_ALLOWED_SLASH_COMMANDS:
+                return True, (
+                    f"Command '/{command}' is disabled on button-only platform '{platform}'. "
+                    "Only read-only queries and /deny or /stop are permitted via text."
+                )
         if not _handled:
             _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command)
         if not _handled:

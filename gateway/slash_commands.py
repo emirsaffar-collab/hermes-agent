@@ -1229,6 +1229,17 @@ class GatewaySlashCommandsMixin(
         """Handle /approve — unblock waiting agent thread(s). They block inside tools/approval.py;
         signalling the event resumes them so the command executes inline (same flow as the CLI)."""
         from tools.approval import resolve_gateway_approval
+        from tools.approval_context import is_button_only_approval_platform
+        platform_name = event.source.platform.value if event.source and event.source.platform else ""
+        if is_button_only_approval_platform(platform_name):
+            logger.warning(
+                "Rejected plain-text /approve on button-only platform %s (user=%s)",
+                platform_name, getattr(event.source, "user_id", "?"),
+            )
+            return (
+                "Text /approve is disabled on this platform. "
+                "Use the interactive Approve/Deny button on the approval card."
+            )
         # Args: "all", "all session", "all always", "session", "always" ("always" beats "session").
         args = event.get_command_args().strip().lower().split()
         session_key, stale, request_ids = self._blocking_approval_or_stale(

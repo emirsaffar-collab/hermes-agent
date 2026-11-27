@@ -1355,22 +1355,40 @@ def check_dangerous_command(command: str, env_type: str,
     """Detect a dangerous command and handle approval (pattern layer only). ``has_host_access``:
     a Docker sandbox that bind-mounts host paths must not skip approval.
     Returns ``{"approved": True/False, "message": str or None, ...}``."""
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+    button_only = approval_context.is_button_only_approval_platform()
+    if not button_only and _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
     blocked = _floor_block(command)
     if blocked is not None:
         return blocked
     unread = hardline_scan_incomplete(command)
-    if _yolo_active() or approval_context._get_approval_mode() == "off":
+    if not button_only and (_yolo_active() or approval_context._get_approval_mode() == "off"):
         return _scan_incomplete_block(_NO_REVIEWER_BYPASS) if unread else _approved()
     if unread:
         _approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
         if not (is_cli or is_gateway or is_ask):
             return _scan_incomplete_block(_NO_REVIEWER_PRESENT)
-    elif _command_matches_permanent_allowlist(command):
+    elif not button_only and _command_matches_permanent_allowlist(command):
         return _allowlisted(command)
     session_key = get_current_session_key()
     findings = _command_findings(command)
+    if button_only:
+        if not findings:
+            platform = approval_context._get_session_platform() or "gateway"
+            findings = [("button_required:terminal",
+                         f"Terminal execution requires interactive button approval on {platform}")]
+        keys = [key for key, _ in findings]
+        description = "; ".join(desc for _, desc in findings)
+        return _run_approval_gate(
+            pattern_key=keys[0], pattern_keys=keys, description=description, display_target=command,
+            approval_callback=approval_callback,
+            subject=f"Command requires button approval ({description})", noun="commands",
+            advice="Wait for interactive button approval.",
+            autoapprove_log_prefix="BLOCKED button-only command in non-interactive context",
+            fail_closed_when_no_human=True,
+            force_prompt=True,
+            one_shot=True,
+        )
     scopes = {key: _approval_scope(session_key, key) for key, _ in findings}
     pending = _pending_findings(findings, lambda key: scopes[key] is not None)
     if pending is None:
@@ -1428,7 +1446,8 @@ def check_all_command_guards(command: str, env_type: str,
     """Run all pre-exec security checks and return a single approval decision. Plugins that
     want to veto or escalate a command do it from ``pre_tool_call``.
     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+    button_only = approval_context.is_button_only_approval_platform()
+    if not button_only and _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
     blocked = _floor_block(command, sudo_guard=True)
@@ -1444,15 +1463,23 @@ def check_all_command_guards(command: str, env_type: str,
     # A command the hardline scan could not finish is human-only: no bypass, allowlist glob,
     # unattended approve-mode or guardian LLM approves it (see _human_decision).
     unread = hardline_scan_incomplete(command)
-    if _yolo_active() or approval_mode == "off":
+    if not button_only and (_yolo_active() or approval_mode == "off"):
         return _scan_incomplete_block(_NO_REVIEWER_BYPASS) if unread else _approved()
-    if not unread and _command_matches_permanent_allowlist(command):
+    if not button_only and not unread and _command_matches_permanent_allowlist(command):
         return _allowlisted(command)
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
+        if button_only:
+            return {
+                "approved": False,
+                "message": (
+                    "Blocked: interactive button approval is required on this platform, "
+                    "but no human reviewer is connected."
+                ),
+            }
         if unread:
             return _scan_incomplete_block(_NO_REVIEWER_PRESENT)
         for ctx in _unattended_contexts():
@@ -1463,6 +1490,22 @@ def check_all_command_guards(command: str, env_type: str,
 
     session_key = get_current_session_key()
     findings = _command_findings(command)
+    if button_only:
+        # Forged-text-DM protection: every terminal execution requires an explicit one-shot
+        # button tap (no allowlist, no session/always reuse, no smart auto-approve).
+        if not findings:
+            platform = approval_context._get_session_platform() or "gateway"
+            findings = [("button_required:terminal",
+                         f"Terminal execution requires interactive button approval on {platform}")]
+        keys = [key for key, _ in findings]
+        description = "; ".join(desc for _, desc in findings)
+        return _human_decision(
+            _COMMAND_GATE, command=command, description=description,
+            pattern_key=keys[0], pattern_keys=keys,
+            session_key=session_key, approval_callback=approval_callback,
+            is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+            smart=False, force_one_shot=True,
+        )
     scopes = {key: _approval_scope(session_key, key) for key, _ in findings}
     pending = _pending_findings(findings, lambda key: scopes[key] is not None)
     if pending is None:

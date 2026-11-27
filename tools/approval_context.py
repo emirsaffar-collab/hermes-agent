@@ -304,6 +304,25 @@ def _get_approval_config() -> dict:
         return {}
 
 
+def get_require_button_platforms() -> frozenset[str]:
+    """Platforms configured in ``approvals.require_button_platforms`` where EVERY terminal
+    command requires an interactive button approval (forged plain-text DM protection) and
+    typed ``/approve`` text commands are rejected."""
+    raw = _get_approval_config().get("require_button_platforms")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(str(p).strip().lower() for p in raw if str(p).strip())
+
+
+def is_button_only_approval_platform(platform: str | None = None) -> bool:
+    """True when ``platform`` (default: active session platform) requires interactive button
+    approval for every terminal command and rejects plain-text ``/approve``."""
+    target = (platform if platform is not None else _get_session_platform()).strip().lower()
+    return bool(target) and target in get_require_button_platforms()
+
+
 def _get_approval_mode() -> str:
     """Return 'manual', 'smart', or 'off' (a hosted-room policy overrides config).
 
@@ -391,6 +410,16 @@ def _get_unattended_approval_mode() -> str:
     deny — an unattended session never silently runs a flagged action unless the
     operator explicitly trusts it."""
     return _binary_approval_mode("unattended_mode")
+
+
+# Fail-safe read-only + abort slash commands allowed via plain text on button-only
+# platforms (e.g. Google Chat when user OAuth tokens could forge DM text). Every
+# other slash command (/approve, /yolo, /approvals, /restart, /update, /platform,
+# /pause, /skills, /memory, /profile, /set-home, /model, /reset, etc.) fails closed.
+BUTTON_ONLY_ALLOWED_SLASH_COMMANDS: frozenset[str] = frozenset({
+    "help", "commands", "status", "whoami", "version", "sessions", "diff",
+    "deny", "stop", "btw",
+})
 
 
 def _get_approval_transport_config() -> tuple[str, str | None]:
