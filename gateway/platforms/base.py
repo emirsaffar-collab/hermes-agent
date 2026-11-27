@@ -1560,6 +1560,7 @@ class ExecApprovalPrompt:
     smart_denied: bool
     metadata: Optional[dict[str, Any]] = None
     request_id: Optional[str] = None  # the ``tools.approval`` request this card answers (and only that one)
+    workdir: Optional[str] = None  # working directory / repo where the command will execute
 
     @property
     def choices(self) -> list[str]:
@@ -1893,6 +1894,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         self._streaming_tts_completed_turns: set[str] = set()
         # Chats whose typing indicator is paused (approval waits); _keep_typing skips them.
         self._typing_paused: set = set()
+        # Ref-count for nested pause_typing_for_chat / resume_typing_for_chat calls (e.g.
+        # GoogleChatAdapter.send() inside send_full_command() during an active approval wait).
+        self._typing_pause_counts: dict[Any, int] = {}
         # Per-chat status phrase; the regular _keep_typing refresh renders it (no extra API calls).
         self._status_text: dict[str, str] = {}
 
@@ -2744,7 +2748,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str, description: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
-        smart_denied: bool = False, request_id: Optional[str] = None,
+        smart_denied: bool = False, request_id: Optional[str] = None, workdir: Optional[str] = None,
     ) -> SendResult:
         """Interactive exec-approval prompt; a press resolves via ``tools.approval.resolve_gateway_approval``.
         Text and choice set are shared; adapters render them natively in ``_send_exec_approval_prompt``.
@@ -2761,7 +2765,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             actions = [row for row in actions if row[1] == "deny"]
         return await self._send_exec_approval_prompt(ExecApprovalPrompt(
             chat_id=chat_id, session_key=session_key, metadata=metadata, command=command, description=description,
-            smart_denied=smart_denied, request_id=request_id, text=text, actions=actions))
+            smart_denied=smart_denied, request_id=request_id, text=text, actions=actions, workdir=workdir))
 
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Render ``prompt`` with the platform's native buttons; the default has none."""
@@ -3281,7 +3285,12 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         finally:
             # A send_typing after an outer stop_typing() may have recreated the platform loop.
             await self._stop_typing_quietly(chat_id, metadata)
-            self._typing_paused.difference_update((chat_id, typing_pause_key(chat_id, metadata)))
+            tkey = typing_pause_key(chat_id, metadata)
+            self._typing_paused.difference_update((chat_id, tkey))
+            counts = getattr(self, "_typing_pause_counts", None)
+            if isinstance(counts, dict):
+                counts.pop(chat_id, None)
+                counts.pop(tkey, None)
             # getattr-guard: tests build adapters via object.__new__ without _status_text.
             getattr(self, "_status_text", {}).pop(str(chat_id), None)
 
@@ -3302,7 +3311,12 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                     await asyncio.sleep(0)
                 await self._stop_typing_quietly(chat_id, metadata)
         finally:
-            self._typing_paused.difference_update((chat_id, typing_pause_key(chat_id, metadata)))
+            tkey = typing_pause_key(chat_id, metadata)
+            self._typing_paused.difference_update((chat_id, tkey))
+            counts = getattr(self, "_typing_pause_counts", None)
+            if isinstance(counts, dict):
+                counts.pop(chat_id, None)
+                counts.pop(tkey, None)
 
     async def _stop_typing_quietly(self, chat_id: str, metadata=None) -> None:
         """Best-effort platform stop_typing; adapter errors are swallowed."""
@@ -3310,11 +3324,24 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             await self._stop_typing_with_metadata(chat_id, metadata)
 
     def pause_typing_for_chat(self, chat_id: str) -> None:
-        """Pause typing for a chat (approval waits); GIL-safe from the sync agent thread."""
+        """Pause typing for a chat (approval waits / chunked sends); ref-counted so nested
+        sends never clear an outer approval pause."""
+        counts = getattr(self, "_typing_pause_counts", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            self._typing_pause_counts = counts
+        counts[chat_id] = counts.get(chat_id, 0) + 1
         self._typing_paused.add(chat_id)
 
     def resume_typing_for_chat(self, chat_id: str) -> None:
-        """Resume typing indicator for a chat after approval resolves."""
+        """Decrement pause ref-count and resume typing only when no outer pause remains."""
+        counts = getattr(self, "_typing_pause_counts", None)
+        if isinstance(counts, dict) and chat_id in counts:
+            remaining = counts[chat_id] - 1
+            if remaining > 0:
+                counts[chat_id] = remaining
+                return
+            counts.pop(chat_id, None)
         self._typing_paused.discard(chat_id)
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str, metadata=None) -> None:

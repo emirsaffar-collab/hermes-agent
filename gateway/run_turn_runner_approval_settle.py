@@ -54,14 +54,15 @@ def register_timeout_notice(
         if callable(still_current) and not still_current():
             return
         runner._schedule(
-            _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s, flagged),
+            _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s, flagged, request_id=request_id),
             "Approval timeout notice scheduling error")
 
     register_gateway_settle(session_key, request_id, settle)
 
 
 async def _post_timeout_notice(
-        ctx, command: str, card_message_id: Optional[str], timeout_s: int, reason: str = "") -> None:
+        ctx, command: str, card_message_id: Optional[str], timeout_s: int, reason: str = "",
+        *, request_id: Optional[str] = None) -> None:
     from gateway.run import _interim_metadata
 
     from gateway.bot_peer_notices import automatic_notices_allowed
@@ -72,6 +73,18 @@ async def _post_timeout_notice(
     notice = format_approval_timed_out_notice(timeout_s)
     metadata = _interim_metadata(ctx._status_thread_metadata)
     try:
+        settle_card: Optional[Callable[..., Any]] = getattr(adapter, "settle_exec_approval_timeout", None)
+        if card_message_id and callable(settle_card):
+            res = await settle_card(
+                ctx._status_chat_id,
+                card_message_id,
+                request_id=request_id,
+                timeout_s=timeout_s,
+                command=command,
+                reason=reason,
+            )
+            if bool(getattr(res, "success", res)):
+                return
         # Plain markdown, not the card's platform markup: ``edit_message`` re-formats it itself.
         if card_message_id and await _edit_card(adapter, ctx._status_chat_id, card_message_id, notice, command, reason):
             return

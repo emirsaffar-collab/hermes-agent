@@ -1174,8 +1174,19 @@ class GoogleChatAdapter(BasePlatformAdapter):
         finally:
             self.resume_typing_for_chat(chat_id)
 
-    async def send_card(self, chat_id: str, card: dict[str, Any], metadata: Optional[dict[str, Any]] = None) -> SendResult:
+    async def send_card(
+        self,
+        chat_id: str,
+        card: dict[str, Any],
+        metadata: Optional[dict[str, Any]] = None,
+        *,
+        fallback_text: Optional[str] = None,
+    ) -> SendResult:
         body: dict[str, Any] = {"cardsV2": [card]}
+        if fallback_text:
+            clean_fb = str(fallback_text).strip()
+            if clean_fb:
+                body["fallbackText"] = clean_fb[:200]
         thread_id = self._resolve_thread_id(None, metadata, chat_id=chat_id)
         if thread_id:
             body["thread"] = {"name": thread_id}
@@ -1203,65 +1214,302 @@ class GoogleChatAdapter(BasePlatformAdapter):
             return bool(ctx.copy().run(is_button_only_approval_platform, self.name))
         return bool(is_button_only_approval_platform(self.name))
 
+    def _filter_exec_approval_actions(
+        self, raw_actions: list[tuple[str, str, str]],
+    ) -> list[tuple[str, str, str]]:
+        allowed = self._EA_BUTTON_ONLY_CHOICES if self._is_button_only() else self._EA_VALID_CHOICES
+        actions = [(label, choice, style) for label, choice, style in raw_actions if choice in allowed]
+        if not actions:
+            # Fail closed: never synthesize an Approve button when the caller omitted approval actions
+            # (e.g. Deny-only cards when the full command could not be previewed).
+            return [("Deny", "deny", "danger")]
+        return actions
+
+    def _record_approval_state(
+        self,
+        *,
+        approval_id: str,
+        session_key: str,
+        request_id: str,
+        chat_id: str,
+        command: str,
+        description: str,
+        card_id: str,
+        summary_title: str = "",
+        repo_label: str = "",
+        workdir_display: str = "",
+        intent: str = "",
+    ) -> None:
+        if len(self._approval_state) >= self._EA_MAX_PENDING:
+            oldest = next(iter(self._approval_state))
+            self._approval_state.pop(oldest, None)
+        self._approval_state[approval_id] = {
+            "session_key": session_key,
+            "request_id": request_id,
+            "chat_id": chat_id,
+            "command": command,
+            "description": description,
+            "card_id": card_id,
+            "summary_title": summary_title,
+            "repo_label": repo_label,
+            "workdir_display": workdir_display,
+            "intent": intent,
+        }
+
+    async def send_exec_approval(
+        self, chat_id: str, command: str, session_key: str, description: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
+        smart_denied: bool = False, request_id: Optional[str] = None, workdir: Optional[str] = None,
+    ) -> SendResult:
+        """Render a human-first Google Chat Cards v2 approval card with collapsible verbatim command.
+
+        Commands fitting inside Google Chat's 28 KB wire-payload budget stay inside a
+        collapsible section on the card (zero timeline spam) while still lifting the
+        Deny-only gate through ``card_shows_whole_command``. Commands exceeding the card
+        wire cap fall back to ``send_full_command()`` and drop to Deny-only if that fails.
+        """
+        import uuid
+
+        from gateway.platforms.base_exec_approval import (
+            approval_timeout_seconds,
+            card_shows_whole_command,
+            ea_default_reason_text,
+            format_approval_deadline_line,
+            format_approval_window,
+        )
+        from plugins.platforms.google_chat.approval_summary import (
+            analyze_command,
+            build_exec_approval_card,
+            maybe_enrich_summary,
+        )
+
+        description = ea_default_reason_text() if description is None else description
+        command = str(command or "")
+        timeout_s = approval_timeout_seconds()
+        timeout_window = format_approval_window(timeout_s)
+        deadline_line = format_approval_deadline_line(timeout_s)
+
+        summary = analyze_command(command, workdir=workdir, description=description, timeout_window=timeout_window)
+        summary = await maybe_enrich_summary(summary, command)
+
+        raw_actions = self._exec_approval_actions(
+            allow_permanent=allow_permanent, allow_session=allow_session, smart_denied=smart_denied,
+        )
+        actions = self._filter_exec_approval_actions(raw_actions)
+        approval_id = uuid.uuid4().hex[:16]
+        card_id = f"approval-{approval_id}"
+        action_target = self._http_events_url or self._EA_ACTION_FUNC
+
+        card, fits_whole = build_exec_approval_card(
+            card_id=card_id,
+            approval_id=approval_id,
+            request_id=request_id or "",
+            action_target=action_target,
+            action_func=self._EA_ACTION_FUNC,
+            actions=actions,
+            command=command,
+            summary=summary,
+            deadline_line=deadline_line,
+            smart_denied=smart_denied,
+            full_command_inline=True,
+        )
+
+        whole_ok = await card_shows_whole_command(
+            self, chat_id, session_key, request_id, command, metadata, truncated=not fits_whole,
+        )
+        if not fits_whole:
+            if whole_ok:
+                card, _ = build_exec_approval_card(
+                    card_id=card_id,
+                    approval_id=approval_id,
+                    request_id=request_id or "",
+                    action_target=action_target,
+                    action_func=self._EA_ACTION_FUNC,
+                    actions=actions,
+                    command=command,
+                    summary=summary,
+                    deadline_line=deadline_line,
+                    smart_denied=smart_denied,
+                    full_command_inline=False,
+                    full_command_sent_above=True,
+                )
+            else:
+                deny_actions = [row for row in actions if row[1] == "deny"] or [("Deny", "deny", "danger")]
+                card, _ = build_exec_approval_card(
+                    card_id=card_id,
+                    approval_id=approval_id,
+                    request_id=request_id or "",
+                    action_target=action_target,
+                    action_func=self._EA_ACTION_FUNC,
+                    actions=deny_actions,
+                    command=command,
+                    summary=summary,
+                    deadline_line=deadline_line,
+                    smart_denied=smart_denied,
+                    full_command_inline=False,
+                    full_command_sent_above=False,
+                    deny_only_reason=(
+                        f"Full command ({summary.char_count:,} chars) could not be displayed — "
+                        "only Deny is offered."
+                    ),
+                )
+
+        result = await self.send_card(
+            chat_id, card, metadata=metadata, fallback_text=summary.fallback_text,
+        )
+        if result.success:
+            self._record_approval_state(
+                approval_id=approval_id,
+                session_key=session_key,
+                request_id=request_id or "",
+                chat_id=chat_id,
+                command=command,
+                description=description,
+                card_id=card_id,
+                summary_title=summary.title,
+                repo_label=summary.repo_label,
+                workdir_display=summary.workdir_display,
+                intent=summary.intent,
+            )
+        return result
+
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Render an interactive Google Chat Cards v2 approval card for a pending command."""
         import uuid
 
-        button_only = self._is_button_only()
-        allowed = self._EA_BUTTON_ONLY_CHOICES if button_only else self._EA_VALID_CHOICES
-        actions = [(label, choice, style) for label, choice, style in prompt.actions if choice in allowed]
-        if not actions:
-            # Fail closed: never synthesize an Approve button when the caller omitted approval actions
-            # (e.g. Deny-only cards when the full command could not be previewed).
-            actions = [("Deny", "deny", "danger")]
+        from gateway.platforms.base_exec_approval import (
+            approval_timeout_seconds,
+            format_approval_deadline_line,
+            format_approval_window,
+        )
+        from plugins.platforms.google_chat.approval_summary import (
+            analyze_command,
+            build_exec_approval_card,
+        )
 
+        actions = self._filter_exec_approval_actions(prompt.actions)
         approval_id = uuid.uuid4().hex[:16]
+        card_id = f"approval-{approval_id}"
         # Google Workspace Add-ons extending Chat require action.function to be the full HTTPS
         # callback URL and leave commonEventObject.invokedFunction empty — carry the logical
         # action identifier inside action.parameters as well.
         action_target = self._http_events_url or self._EA_ACTION_FUNC
-        buttons = [
-            {
-                "text": label,
-                "action": action_target,
-                "parameters": {
-                    "action": self._EA_ACTION_FUNC,
-                    "approval_id": approval_id,
-                    "choice": choice,
-                    "request_id": prompt.request_id or "",
-                },
-            }
-            for label, choice, _style in actions
-        ]
-        card = card_spec_to_cards_v2({
-            "card_id": f"approval-{approval_id}",
-            "header": {
-                "title": "Command Approval Required",
-                "subtitle": "Interactive button approval",
-            },
-            "sections": [
-                {
-                    "widgets": [
-                        {"type": "text", "text": prompt.text},
-                        {"type": "buttons", "buttons": buttons},
-                    ]
-                }
-            ],
-        })
-        result = await self.send_card(prompt.chat_id, card, metadata=prompt.metadata)
+        timeout_s = approval_timeout_seconds()
+        summary = analyze_command(
+            prompt.command,
+            workdir=getattr(prompt, "workdir", None),
+            description=prompt.description,
+            timeout_window=format_approval_window(timeout_s),
+        )
+        card, fits_whole = build_exec_approval_card(
+            card_id=card_id,
+            approval_id=approval_id,
+            request_id=prompt.request_id or "",
+            action_target=action_target,
+            action_func=self._EA_ACTION_FUNC,
+            actions=actions,
+            command=prompt.command,
+            summary=summary,
+            deadline_line=format_approval_deadline_line(timeout_s),
+            smart_denied=prompt.smart_denied,
+            full_command_inline=True,
+        )
+        if not fits_whole:
+            card, _ = build_exec_approval_card(
+                card_id=card_id,
+                approval_id=approval_id,
+                request_id=prompt.request_id or "",
+                action_target=action_target,
+                action_func=self._EA_ACTION_FUNC,
+                actions=actions,
+                command=prompt.command,
+                summary=summary,
+                deadline_line=format_approval_deadline_line(timeout_s),
+                smart_denied=prompt.smart_denied,
+                full_command_inline=False,
+                full_command_sent_above=True,
+            )
+        result = await self.send_card(
+            prompt.chat_id, card, metadata=prompt.metadata, fallback_text=summary.fallback_text,
+        )
         if result.success:
-            if len(self._approval_state) >= self._EA_MAX_PENDING:
-                oldest = next(iter(self._approval_state))
-                self._approval_state.pop(oldest, None)
-            self._approval_state[approval_id] = {
-                "session_key": prompt.session_key,
-                "request_id": prompt.request_id or "",
-                "chat_id": prompt.chat_id,
-                "command": prompt.command,
-                "description": prompt.description,
-                "card_id": f"approval-{approval_id}",
-            }
+            self._record_approval_state(
+                approval_id=approval_id,
+                session_key=prompt.session_key,
+                request_id=prompt.request_id or "",
+                chat_id=prompt.chat_id,
+                command=prompt.command,
+                description=prompt.description,
+                card_id=card_id,
+                summary_title=summary.title,
+                repo_label=summary.repo_label,
+                workdir_display=summary.workdir_display,
+                intent=summary.intent,
+            )
         return result
+
+    async def settle_exec_approval_timeout(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        request_id: Optional[str] = None,
+        timeout_s: int = 300,
+        command: str = "",
+        reason: str = "",
+    ) -> SendResult:
+        """Replace a timed-out approval card via ``updateMask=text,cardsV2`` so stale
+        interactive buttons are removed and pending state is cleaned up."""
+        from gateway.platforms.base_exec_approval import format_approval_window
+        from plugins.platforms.google_chat.approval_summary import (
+            analyze_command,
+            build_settled_exec_approval_card,
+        )
+
+        if not message_id:
+            return SendResult(success=False, error="missing message_id")
+
+        matched_state: Optional[dict[str, Any]] = None
+        if request_id:
+            for aid, st in list(self._approval_state.items()):
+                if (st.get("request_id") or "") == request_id and st.get("chat_id") == chat_id:
+                    matched_state = self._approval_state.pop(aid, None)
+                    break
+
+        window = format_approval_window(timeout_s)
+        if matched_state:
+            subtitle = matched_state.get("summary_title") or ""
+            repo_label = matched_state.get("repo_label") or ""
+            workdir_display = matched_state.get("workdir_display") or ""
+            intent = matched_state.get("intent") or ""
+            card_id = matched_state.get("card_id") or "approval-timed-out"
+        else:
+            summary = analyze_command(command, description=reason)
+            subtitle = summary.title
+            repo_label = summary.repo_label
+            workdir_display = summary.workdir_display
+            intent = summary.intent
+            card_id = "approval-timed-out"
+
+        card_v2 = build_settled_exec_approval_card(
+            card_id=card_id,
+            status="timeout",
+            title="Approval Timed Out",
+            subtitle=subtitle,
+            repo_label=repo_label,
+            workdir_display=workdir_display,
+            intent=intent,
+            detail_note=f"Timed out after {window} — the command was NOT run.",
+        )
+        try:
+            return await self._patch_message(message_id, {"text": "", "cardsV2": [card_v2]})
+        except HttpError as exc:
+            if _http_status(exc) == 429:
+                self._note_rate_limit(chat_id)
+            return SendResult(success=False, error=_exc_text(exc))
+        except Exception as exc:
+            logger.debug("[GoogleChat] settle_exec_approval_timeout failed", exc_info=not _proxy_error(exc))
+            return SendResult(success=False, error=_exc_text(exc))
 
     @classmethod
     def _extract_button_click(cls, envelope: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1312,13 +1560,24 @@ class GoogleChatAdapter(BasePlatformAdapter):
         return None
 
     @staticmethod
-    def _settled_card_response(*, is_addon: bool, card_id: str, title: str, body: str) -> dict[str, Any]:
+    def _settled_card_response(
+        *,
+        is_addon: bool,
+        card_id: str,
+        title: str,
+        body: str = "",
+        card_v2: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         """Return a synchronous card update response stripping interactive buttons."""
-        card_v2 = card_spec_to_cards_v2({
-            "card_id": card_id or "approval-settled",
-            "header": {"title": title},
-            "sections": [{"widgets": [{"type": "text", "text": body}]}],
-        })
+        if card_v2 is None:
+            from plugins.platforms.google_chat.approval_summary import build_settled_exec_approval_card
+
+            card_v2 = build_settled_exec_approval_card(
+                card_id=card_id or "approval-settled",
+                status="expired",
+                title=title,
+                detail_note=body,
+            )
         if is_addon:
             return {
                 "hostAppDataAction": {
@@ -1422,18 +1681,41 @@ class GoogleChatAdapter(BasePlatformAdapter):
             admitted=True,
         )
         if resolved > 0:
+            from plugins.platforms.google_chat.approval_summary import (
+                analyze_command,
+                build_settled_exec_approval_card,
+            )
+
             self._approval_state.pop(approval_id, None)
             title = "Command Denied" if choice == "deny" else f"Command Approved ({choice})"
-            body = (
-                f"Decision: {choice}\n"
-                f"Actor: {user_email or actor}\n"
-                f"Command: `{state['command'][:240]}`"
+            summary_title = state.get("summary_title") or ""
+            repo_label = state.get("repo_label") or ""
+            workdir_display = state.get("workdir_display") or ""
+            intent = state.get("intent") or ""
+            if not summary_title:
+                fallback_summary = analyze_command(
+                    state.get("command", ""), description=state.get("description", ""),
+                )
+                summary_title = fallback_summary.title
+                repo_label = repo_label or fallback_summary.repo_label
+                workdir_display = workdir_display or fallback_summary.workdir_display
+                intent = intent or fallback_summary.intent
+            card_v2 = build_settled_exec_approval_card(
+                card_id=state.get("card_id", f"approval-{approval_id}"),
+                status="denied" if choice == "deny" else "approved",
+                title=title,
+                subtitle=summary_title,
+                actor=user_email or actor,
+                repo_label=repo_label,
+                workdir_display=workdir_display,
+                intent=intent,
+                detail_note="Denied — command was NOT run." if choice == "deny" else f"Approved ({choice}).",
             )
             return self._settled_card_response(
                 is_addon=is_addon,
                 card_id=state.get("card_id", f"approval-{approval_id}"),
                 title=title,
-                body=body,
+                card_v2=card_v2,
             )
 
         self._approval_state.pop(approval_id, None)

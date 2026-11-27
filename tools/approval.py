@@ -1014,7 +1014,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False, pending_body=None,
-                    force_one_shot: bool = False) -> dict:
+                    force_one_shot: bool = False, workdir: Optional[str] = None) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``pattern_keys`` are what :func:`_persist_choice` stores on session/always; a smart-DENY
@@ -1102,6 +1102,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 "allow_permanent": not one_shot,
                 "allow_session": not one_shot,
             }
+            if workdir:
+                data["workdir"] = redact_approval_display(str(workdir))
             if smart_denied:
                 data["smart_denied"] = True
             gw_identity = f"{command}#oneshot:{os.urandom(6).hex()}" if force_one_shot else command
@@ -1442,7 +1444,8 @@ def request_tool_approval(
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             workdir: Optional[str] = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision. Plugins that
     want to veto or escalate a command do it from ``pre_tool_call``.
     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
@@ -1504,7 +1507,7 @@ def check_all_command_guards(command: str, env_type: str,
             pattern_key=keys[0], pattern_keys=keys,
             session_key=session_key, approval_callback=approval_callback,
             is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
-            smart=False, force_one_shot=True,
+            smart=False, force_one_shot=True, workdir=workdir,
         )
     scopes = {key: _approval_scope(session_key, key) for key, _ in findings}
     pending = _pending_findings(findings, lambda key: scopes[key] is not None)
@@ -1521,6 +1524,7 @@ def check_all_command_guards(command: str, env_type: str,
         # hardline scan finished still reaches a human.
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
         smart=approval_mode == "smart" and not unread and _SCAN_INCOMPLETE_DESCRIPTION not in keys,
+        workdir=workdir,
     )
 
 

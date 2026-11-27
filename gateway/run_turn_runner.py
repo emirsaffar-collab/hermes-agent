@@ -812,15 +812,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
         desc = _redact_approval_command(approval_data.get("description")) or ea_default_reason_text()
+        workdir = _redact_approval_command(approval_data.get("workdir")) or None
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
             try:
+                card_kwargs = {**flags, **({"workdir": workdir} if workdir else {})}
                 fut = self._schedule(
                     adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
                         description=desc, metadata=ctx._status_thread_metadata,
-                        request_id=approval_data.get("request_id"), **flags,
+                        request_id=approval_data.get("request_id"), **card_kwargs,
                     ),
                     "send_exec_approval scheduling error",
                 )

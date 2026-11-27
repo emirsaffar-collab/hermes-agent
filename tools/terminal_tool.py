@@ -165,11 +165,13 @@ def _docker_has_host_access(config: dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      workdir: Optional[str] = None) -> dict:
     """Delegate to the consolidated command guard with the CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  workdir=workdir)
 
 
 from tools.environments.base import EnvironmentConnectionError
@@ -1187,13 +1189,14 @@ class _ApprovalVerdict:
     approved_run: bool = False
 
 
-def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *, force: bool) -> _ApprovalVerdict:
+def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *, force: bool,
+                         workdir: Optional[str] = None) -> _ApprovalVerdict:
     """Run the command guards; ``force`` skips them entirely.
     Raises :class:`_Rejected` when the command may not run (denied, or pending
     gateway approval)."""
     if force:
         return _ApprovalVerdict(approved_run=True)
-    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
+    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config), workdir=workdir)
     if not approval["approved"]:
         if approval.get("status") == "pending_approval":  # gateway ask mode
             raise _Rejected(_error_json(
@@ -1667,7 +1670,9 @@ def terminal_tool(
                 ))
             # Pre-exec security checks (floors + dangerous command detection);
             # force=True means the user already confirmed.
-            verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+            verdict = _run_approval_guards(
+                command, env_type, plan.config, force=force, workdir=workdir or cwd,
+            )
 
             pty_disabled = pty and _command_requires_pipe_stdin(command)
             if plan.promoted_from_foreground_timeout is not None:
