@@ -75,9 +75,11 @@ def test_should_skip_fallback_candidate_uses_last_routed_base_url():
 
 
 def test_vertex_regional_ttfb_stale_cap_is_150s_while_post_chunk_and_global_stay_600s():
-    """Regional Vertex endpoints (europe-west2 / asia-southeast1) cap Phase-1 pre-first-chunk
-    TTFB stale timeout at 150s so wedged regional TPU slots fail over to global in 150s instead
-    of 600s, while Phase-2 post-chunk and global endpoints retain the full 600s floor.
+    """Regional Vertex endpoints (eu / europe-west2 / asia-southeast1) cap Phase-1
+    pre-first-chunk TTFB stale timeout at 75s so wedged regional TPU slots fail over to
+    locations/global quickly, locations/global caps Phase-1 TTFB at 150s (>2x observed
+    gemini-4-neon high-effort TTFB), unbounded desktop Phase-2 retains 600s, and bounded
+    cron/subagent/run_budget_seconds Phase-2 uses 240s (never the 75s regional TTFB cap).
     """
     from typing import Any
     from types import SimpleNamespace
@@ -85,39 +87,43 @@ def test_vertex_regional_ttfb_stale_cap_is_150s_while_post_chunk_and_global_stay
     call: Any = _StreamingCall.__new__(_StreamingCall)
     call.agent = SimpleNamespace(
         provider="vertex",
-        model="google/gemini-4-argon",
+        model="google/gemini-4-neon",
         base_url="https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi",
         _last_routed_base_url="https://europe-west2-aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/europe-west2/endpoints/openapi",
         _stream_stale_timeout=None,
         _stream_inter_event_timeout=None,
     )
-    call.api_kwargs = {"model": "google/gemini-4-argon", "messages": [{"role": "user", "content": "hi"}]}
+    call.api_kwargs = {"model": "google/gemini-4-neon", "messages": [{"role": "user", "content": "hi"}]}
     diag: dict[str, float | None] = {"first_chunk_at": None}
     call.clients = SimpleNamespace(diag=diag)
     call._resolve_stale_timeout()
 
     assert call._stream_stale_timeout == 600.0
-    assert call._effective_stale_timeout() == 150.0
+    # Regional Phase-1 (europe-west2 and eu REP) uses 75s fast failover cap.
+    assert call._effective_stale_timeout() == 75.0
+    call.agent._last_routed_base_url = "https://aiplatform.eu.rep.googleapis.com/v1beta1/projects/uop-atlas/locations/eu/endpoints/openapi"
+    assert call._effective_stale_timeout() == 75.0
 
-    # Once first chunk arrives (Phase 2), full 600s reasoning floor applies.
+    # Once first chunk arrives (Phase 2), unbounded interactive desktop gets full 600s floor.
     diag["first_chunk_at"] = 1001.0
     assert call._effective_stale_timeout() == 600.0
 
-    # On locations/global, Phase 1 also uses the 150s pre-first-chunk TTFB cap (19/23 stale
-    # hangs occur on global before first chunk), while Phase 2 retains the full 600s floor.
+    # On locations/global, Phase 1 uses the 150s global TTFB cap (never 75s), while Phase 2 retains 600s.
     diag["first_chunk_at"] = None
     call.agent._last_routed_base_url = call.agent.base_url
     assert call._effective_stale_timeout() == 150.0
     diag["first_chunk_at"] = 1002.0
     assert call._effective_stale_timeout() == 600.0
 
-    # On cron / run_budget_seconds-bounded Vertex runs, Phase-2 post_chunk also caps at 150s
-    # so a post-chunk stream stall cannot eat 470s+ and trip the 600s cron wall-clock timeout.
+    # On cron / subagent / run_budget_seconds-bounded Vertex runs, Phase-2 post_chunk caps at 240s
+    # (decoupled from the 75s regional TTFB cap so deep thinking is not self-killed mid-stream).
     call.agent.platform = "cron"
-    assert call._effective_stale_timeout() == 150.0
+    assert call._effective_stale_timeout() == 240.0
+    call.agent.platform = "subagent"
+    assert call._effective_stale_timeout() == 240.0
     call.agent.platform = "desktop"
     call.agent.run_budget_seconds = 600.0
-    assert call._effective_stale_timeout() == 150.0
+    assert call._effective_stale_timeout() == 240.0
 
 
 def test_vertex_warmer_prompt_split_and_credential_refresh(monkeypatch):
@@ -221,10 +227,10 @@ def test_subagent_and_cron_never_acquire_regional_slot_via_bg_review_branch():
 
 def test_vertex_inline_stream_read_timeout_honors_150s_cap_while_desktop_keeps_615s():
     """Inline Vertex streams (cron, subagent) and run_budget_seconds-bounded runs
-    must align httpx read timeout to _effective_stale_timeout() + 15s (165s) so a
-    pre-header socket wedge unwinds via ReadTimeout instead of hanging 615s+ past
-    3 stale kills. Unbounded interactive desktop turns keep read=615s for Phase-2
-    deep thinking pauses.
+    must align httpx read timeout to VERTEX_POST_CHUNK_STALE_CAP_SECONDS + 15s (255s)
+    so deep-thinking pauses up to 240s never hit ReadTimeout at 120s while a pre-header
+    socket wedge still unwinds in 255s instead of hanging 615s+ past 3 stale kills.
+    Unbounded interactive desktop turns keep read=615s for Phase-2 deep thinking pauses.
     """
     from typing import Any
     from types import SimpleNamespace
@@ -233,7 +239,7 @@ def test_vertex_inline_stream_read_timeout_honors_150s_cap_while_desktop_keeps_6
         call: Any = _StreamingCall.__new__(_StreamingCall)
         call.agent = SimpleNamespace(
             provider="vertex",
-            model="google/gemini-4-argon",
+            model="google/gemini-4-neon",
             api_mode="chat_completions",
             platform=platform,
             run_budget_seconds=run_budget_seconds,
@@ -242,23 +248,47 @@ def test_vertex_inline_stream_read_timeout_honors_150s_cap_while_desktop_keeps_6
             _stream_stale_timeout=None,
             _stream_inter_event_timeout=None,
         )
-        call.api_kwargs = {"model": "google/gemini-4-argon", "messages": [{"role": "user", "content": "hi"}]}
+        call.api_kwargs = {"model": "google/gemini-4-neon", "messages": [{"role": "user", "content": "hi"}]}
         call.clients = SimpleNamespace(diag={"first_chunk_at": None})
         call._resolve_stale_timeout()
         return call
 
     cron_call = _make_call("cron")
-    assert cron_call._stream_timeouts()[1] == 165.0
+    assert cron_call._stream_timeouts()[1] == 255.0
 
     sub_call = _make_call("subagent")
-    assert sub_call._stream_timeouts()[1] == 165.0
+    assert sub_call._stream_timeouts()[1] == 255.0
     sub_call.clients.diag["first_chunk_at"] = 1001.0
-    assert sub_call._effective_stale_timeout() == 150.0
+    assert sub_call._effective_stale_timeout() == 240.0
 
     budget_call = _make_call("desktop", run_budget_seconds=600.0)
-    assert budget_call._stream_timeouts()[1] == 165.0
+    assert budget_call._stream_timeouts()[1] == 255.0
 
     desktop_call = _make_call("desktop")
     assert desktop_call._stream_timeouts()[1] == 615.0
+
+
+def test_is_vertex_regional_url_polarity():
+    """Verify regional vs global Vertex URL classification across REP, single-region,
+    locations/global, and empty base URLs."""
+    from agent.chat_completion_stream_monitor import _is_vertex_regional_url
+
+    assert _is_vertex_regional_url(
+        "https://aiplatform.eu.rep.googleapis.com/v1beta1/projects/uop-atlas/locations/eu/endpoints/openapi"
+    ) is True
+    assert _is_vertex_regional_url(
+        "https://aiplatform.us.rep.googleapis.com/v1beta1/projects/uop-atlas/locations/us/endpoints/openapi"
+    ) is True
+    assert _is_vertex_regional_url(
+        "https://europe-west2-aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/europe-west2/endpoints/openapi"
+    ) is True
+    assert _is_vertex_regional_url(
+        "https://asia-southeast1-aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/asia-southeast1/endpoints/openapi"
+    ) is True
+    assert _is_vertex_regional_url(
+        "https://aiplatform.googleapis.com/v1beta1/projects/uop-atlas/locations/global/endpoints/openapi"
+    ) is False
+    assert _is_vertex_regional_url("") is False
+
 
 

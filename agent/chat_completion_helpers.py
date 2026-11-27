@@ -33,7 +33,11 @@ from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError
 from agent.chat_completion_local import _streams_llamacpp, stale_giveup
 from agent.chat_completion_headers import _chat_completion_capturing_headers
-from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
+from agent.chat_completion_stream_monitor import (
+    StreamingWaitMonitor,
+    StreamLifetimeExceeded,
+    VERTEX_POST_CHUNK_STALE_CAP_SECONDS,
+)
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -2977,11 +2981,14 @@ class _StreamingCall(StreamingWaitMonitor):
                 or should_use_direct_api_call(self.agent)
             )
         ):
-            # Inline cron/subagent and budget-capped Vertex streams cap both TTFB and
-            # post-chunk staleness at 150s and cannot abandon a wedged inline socket.
-            # Keep httpx's read timeout aligned (150s + 15s = 165s) so a pre-header
-            # wedge unwinds via ReadTimeout instead of hanging 615s+ until wall-clock kill.
-            stale = self._effective_stale_timeout()
+            # Inline cron/subagent and budget-capped Vertex streams cap Phase-2 post-chunk
+            # staleness at VERTEX_POST_CHUNK_STALE_CAP_SECONDS (240s) and cannot abandon a
+            # wedged inline socket. Keep httpx's read timeout aligned (240s + 15s = 255s) so
+            # deep thinking pauses up to 240s never hit ReadTimeout at 120s while a pre-header
+            # wedge still unwinds in 255s instead of 615s+.
+            stale = max(self._effective_stale_timeout(), VERTEX_POST_CHUNK_STALE_CAP_SECONDS)
+            if self._stream_stale_timeout is not None and self._stream_stale_timeout != float("inf"):
+                stale = min(stale, self._stream_stale_timeout)
         if read == 120.0 and waits_like_local(self.agent.base_url, self.agent.provider):
             read = base  # local providers prefill for minutes
             logger.debug("Local provider detected (%s) — stream read timeout raised to %.0fs", self.agent.base_url, read)

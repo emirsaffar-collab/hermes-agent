@@ -30,6 +30,41 @@ try:
 except (TypeError, ValueError):
     VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS = 75.0
 
+# Phase-1 (pre-first-chunk TTFB) stale cap on locations/global: leaves >2x headroom over
+# observed gemini-4-neon high-effort TTFB (~72s max) while still failing over wedged global
+# slots in 150s instead of 600s.
+try:
+    VERTEX_GLOBAL_TTFB_STALE_CAP_SECONDS = max(
+        30.0, float(os.environ.get("HERMES_VERTEX_GLOBAL_TTFB_STALE_CAP_SECONDS", "150.0"))
+    )
+except (TypeError, ValueError):
+    VERTEX_GLOBAL_TTFB_STALE_CAP_SECONDS = 150.0
+
+# Phase-2 (post-chunk) stale cap for cron / subagent / run_budget_seconds-bounded Vertex runs:
+# decoupled from the 75s regional TTFB cap so gemini-4-neon high-effort deep-thinking pauses
+# are not self-killed mid-stream (2026-11-27 RCA: 342/342 Broken pipe drops were 75s kills).
+try:
+    VERTEX_POST_CHUNK_STALE_CAP_SECONDS = max(
+        60.0, float(os.environ.get("HERMES_VERTEX_POST_CHUNK_STALE_CAP_SECONDS", "240.0"))
+    )
+except (TypeError, ValueError):
+    VERTEX_POST_CHUNK_STALE_CAP_SECONDS = 240.0
+
+
+def _is_vertex_regional_url(url: str) -> bool:
+    """Return True for regional/multi-region Vertex URLs (eu, us, europe-west2, ...)
+    and False for locations/global or empty URLs."""
+    if not url:
+        return False
+    host = (urlsplit(url).hostname or "").lower()
+    if host.endswith(".rep.googleapis.com") or host.endswith("-aiplatform.googleapis.com"):
+        return True
+    lowered = url.lower()
+    if "/locations/" in lowered:
+        loc = lowered.split("/locations/", 1)[1].split("/", 1)[0]
+        return bool(loc) and loc != "global"
+    return False
+
 
 class StreamingWaitMonitor:
     # Stale-kill bookkeeping: consecutive kills of the SAME dispatched attempt, and the error
@@ -65,7 +100,7 @@ class StreamingWaitMonitor:
                     or getattr(agent, "platform", None) in ("cron", "subagent")
                 )
             ):
-                return min(eff, VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS)
+                return min(eff, VERTEX_POST_CHUNK_STALE_CAP_SECONDS)
             return eff
         if getattr(agent, "provider", None) == "vertex":
             routed = str(
@@ -73,8 +108,10 @@ class StreamingWaitMonitor:
                 or getattr(agent, "base_url", None)
                 or ""
             )
-            if "aiplatform.googleapis.com" in routed or not routed:
+            if _is_vertex_regional_url(routed):
                 return min(stale, VERTEX_REGIONAL_TTFB_STALE_CAP_SECONDS)
+            if "aiplatform.googleapis.com" in routed or not routed:
+                return min(stale, VERTEX_GLOBAL_TTFB_STALE_CAP_SECONDS)
         return stale
 
     def _claims_liveness(self) -> bool:
