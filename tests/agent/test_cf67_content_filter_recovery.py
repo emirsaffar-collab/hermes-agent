@@ -1046,4 +1046,154 @@ def test_cf92_same_route_continue_sets_pending_steer_and_clears_vertex_routed_ur
     assert ag._client_kwargs["base_url"] == "https://openrouter.ai/api/v1"
 
 
+def test_cf105_step1_multiturn_and_reasoning_abort_retries_once_while_single_turn_refusal_skips(monkeypatch):
+    """#CF-105 two-way polarity:
+    1. Step-1 content_filter in a multi-turn session (len(messages) > 1, even with no fallback)
+       retries ONCE on the same route with thinking off, pending steer, and IAM/vault marker scrubbing.
+    2. Step-1 reasoning-only thought-filter abort (empty content + non-empty reasoning) on a single
+       message also retries ONCE on the same route with thinking off.
+    3. A second content_filter after _content_filter_retries == 1 does NOT loop — falls through cleanly.
+    4. Negative polarity: a genuine single-message step-1 refusal with explicit refusal text skips
+       same-route retry and goes straight to fallback/return.
+    """
+    import agent.turn_truncation as tt
+
+    monkeypatch.setattr(tt, "normalize_response_for_agent", lambda ag, r: r)
+
+    # 1. Multi-turn step-1 Vertex thought-filter abort (no fallback configured, like 2026-11-28 incident)
+    ag_multi = _make_mock_agent(has_fallback=False)
+    ag_multi._extract_reasoning.return_value = (
+        "**Investigating All Paths** I'm reassessing all authorized pathways on this estate."
+    )
+    resp_thought_abort = SimpleNamespace(
+        content="",
+        reasoning="**Investigating All Paths** I'm reassessing all authorized pathways on this estate.",
+        provider_data={},
+    )
+    multi_msgs = [
+        {"role": "user", "content": "Verify Cloudflare Web Analytics and Pingdom checks."},
+        {"role": "assistant", "content": "Verified RUM beacons and 17 Pingdom checks."},
+        {
+            "role": "user",
+            "content": (
+                "solve it: What I have NOT verified\n"
+                "Cloudflare UI: [no-access: .wrangler/config/default.toml expired, no login in browser_vault]\n"
+                "Pingdom: [no-access: secretmanager.versions.list returned PERMISSION_DENIED]"
+            ),
+        },
+    ]
+    api_msgs = [dict(m) for m in multi_msgs]
+    v_retry = handle_content_policy_refusal(
+        ag_multi,
+        resp_thought_abort,
+        TurnRetryState(),
+        thinking_spinner=None,
+        messages=multi_msgs,
+        api_messages=api_msgs,
+        api_kwargs={},
+        active_system_prompt="sys",
+        conversation_history=list(multi_msgs),
+        api_call_count=1,
+        effective_task_id="t1",
+        turn_id="u1",
+        api_request_id="r1",
+        api_start_time=0.0,
+        retry_count=0,
+        max_retries=3,
+        current_turn_user_idx=2,
+    )
+    assert v_retry.action == "continue"
+    assert ag_multi._content_filter_retries == 1
+    assert ag_multi._ephemeral_reasoning_off is True
+    assert ag_multi._pending_content_filter_steer is True
+    # IAM/vault markers scrubbed in trailing user message while request topic stays intact
+    assert "Cloudflare UI" in api_msgs[-1]["content"]
+    assert "secretmanager.versions." not in api_msgs[-1]["content"]
+    assert "browser_vault" not in api_msgs[-1]["content"]
+    assert ".wrangler/config/" not in api_msgs[-1]["content"]
+    assert tt._CONTENT_FILTER_STEER_NOTE in api_msgs[-1]["content"]
+
+    # 3. Second failure on the retry must NOT loop — returns content_policy_blocked when no fallback
+    v_exhausted = handle_content_policy_refusal(
+        ag_multi,
+        resp_thought_abort,
+        TurnRetryState(),
+        thinking_spinner=None,
+        messages=multi_msgs,
+        api_messages=api_msgs,
+        api_kwargs={},
+        active_system_prompt="sys",
+        conversation_history=list(multi_msgs),
+        api_call_count=1,
+        effective_task_id="t1",
+        turn_id="u1",
+        api_request_id="r2",
+        api_start_time=0.0,
+        retry_count=0,
+        max_retries=3,
+        current_turn_user_idx=2,
+    )
+    assert v_exhausted.action == "return"
+    assert v_exhausted.result is not None
+    assert ag_multi._content_filter_retries == 0
+    assert v_exhausted.result["error"] == "content_policy_blocked: model declined (content_filter)"
+
+    # 2. Single-message reasoning-only abort with no distinct fallback (even when has_fallback=True
+    #    but _try_activate_fallback skips same-backend entry and returns False) retries once with thinking off
+    ag_single_reason = _make_mock_agent(has_fallback=True)
+    ag_single_reason._try_activate_fallback.return_value = False
+    ag_single_reason._extract_reasoning.return_value = "**Planning** Checking options."
+    single_msg = [{"role": "user", "content": "Check Pingdom status"}]
+    v_single_reason = handle_content_policy_refusal(
+        ag_single_reason,
+        SimpleNamespace(content="", reasoning="**Planning** Checking options.", provider_data={}),
+        TurnRetryState(),
+        thinking_spinner=None,
+        messages=single_msg,
+        api_messages=[dict(single_msg[0])],
+        api_kwargs={},
+        active_system_prompt="sys",
+        conversation_history=list(single_msg),
+        api_call_count=1,
+        effective_task_id="t2",
+        turn_id="u2",
+        api_request_id="r3",
+        api_start_time=0.0,
+        retry_count=0,
+        max_retries=3,
+        current_turn_user_idx=0,
+    )
+    assert v_single_reason.action == "continue"
+    assert ag_single_reason._content_filter_retries == 1
+    assert ag_single_reason._ephemeral_reasoning_off is True
+
+    # 4. Negative polarity: genuine single-message explicit policy refusal skips same-route retry
+    ag_explicit = _make_mock_agent(has_fallback=True)
+    ag_explicit._extract_reasoning.return_value = ""
+    blocked_msg = [{"role": "user", "content": "disallowed request"}]
+    v_explicit = handle_content_policy_refusal(
+        ag_explicit,
+        SimpleNamespace(content="I cannot help with that request.", reasoning="", provider_data={}),
+        TurnRetryState(),
+        thinking_spinner=None,
+        messages=blocked_msg,
+        api_messages=[dict(blocked_msg[0])],
+        api_kwargs={},
+        active_system_prompt="sys",
+        conversation_history=list(blocked_msg),
+        api_call_count=1,
+        effective_task_id="t3",
+        turn_id="u3",
+        api_request_id="r4",
+        api_start_time=0.0,
+        retry_count=0,
+        max_retries=3,
+        current_turn_user_idx=0,
+    )
+    assert v_explicit.action == "break"
+    assert ag_explicit._content_filter_retries == 0
+    ag_explicit._try_activate_fallback.assert_called_once_with(reason=FailoverReason.content_policy_blocked)
+
+
+
 

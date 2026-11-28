@@ -832,6 +832,9 @@ _GATE_SCRIPT_FILTER_MARKERS = (
     "Download-and-run",
     "gcloud secrets",
     "secrets.versions.access",
+    "secretmanager.versions.",
+    "browser_vault",
+    ".wrangler/config/",
     "SUPERUSER_PASSWORD",
     "SUPERADMIN_PASSWORD",
     "SYNC_CRON_TOKEN",
@@ -994,11 +997,12 @@ def handle_content_policy_refusal(
     current_turn_user_idx: Any = None,
 ) -> RefusalVerdict:
     """HTTP-200 refusal (``finish_reason`` ``content_filter`` / ``guardrail_intervened``).
-    Step-1 prompt refusals are deterministic for the unchanged prompt (one configured-fallback
-    try, else surface the refusal). Mid-turn refusals (``api_call_count > 1``) occur after the
-    user prompt was already accepted and tool rounds executed — usually triggered by the model's
-    own speculative reasoning about security hooks/secrets — so retry once on the current route
-    with neutral steering, lower thinking effort, and OpenRouter cache bypass before failing over."""
+    Genuine single-turn prompt refusals (``api_call_count == 1`` with no prior history and either
+    an explicit refusal text or empty reasoning) are deterministic for the unchanged prompt (one
+    configured-fallback try, else surface the refusal). Mid-turn refusals (``api_call_count > 1``)
+    and step-1 false positives in multi-turn sessions or reasoning-only thought-filter aborts
+    (``#CF-105``) retry once on the current route with neutral steering, thinking disabled,
+    history marker scrubbing, and OpenRouter cache bypass before failing over."""
     from agent.conversation_loop import _arm_fallback_restart, _content_policy_blocked_result
 
     _refusal_result = normalize_response_for_agent(agent, response)
@@ -1028,20 +1032,34 @@ def handle_content_policy_refusal(
     _diag_text = _refusal_text or _reasoning_text
     _refusal_log = _diag_text[:500] + "..." if len(_diag_text) > 500 else _diag_text
     _prior_cf_retries = int(getattr(agent, "_content_filter_retries", 0) or 0)
-    if api_call_count > 1 and (max_retries or 0) > 0 and _prior_cf_retries < 1:
+    _is_multiturn_step1 = api_call_count == 1 and (
+        len(messages) > 1
+        or (isinstance(current_turn_user_idx, int) and current_turn_user_idx > 0)
+    )
+    _is_reasoning_only_abort = not _refusal_text and bool(_reasoning_text)
+
+    def _same_route_cf_retry(label: str) -> RefusalVerdict:
         agent._content_filter_retries = _prior_cf_retries + 1
         agent._ephemeral_reasoning_off = True
         agent._pending_content_filter_steer = True
         _inject_content_filter_steer_note(api_messages)
         logger.warning(
-            "%sModel declined to respond (finish_reason=content_filter) on mid-turn call #%d "
+            "%sModel declined to respond (finish_reason=content_filter) on %s "
             "(model=%s provider=%s) — retrying once with neutral steering and cache bypass. refusal=%s",
-            agent.log_prefix, api_call_count, agent.model, agent.provider, _refusal_log or "(no text)",
+            agent.log_prefix, label, agent.model, agent.provider, _refusal_log or "(no text)",
         )
         agent._buffer_diagnostic_status(
-            "⚠️ Upstream output filter interrupted mid-turn response — retrying with neutral steering..."
+            "⚠️ Upstream output filter interrupted response — retrying with neutral steering..."
         )
         return RefusalVerdict("continue", None, active_system_prompt)
+
+    if (api_call_count > 1 or _is_multiturn_step1) and (max_retries or 0) > 0 and _prior_cf_retries < 1:
+        _call_label = (
+            f"mid-turn call #{api_call_count}"
+            if api_call_count > 1
+            else "step-1 call #1 (multi-turn)"
+        )
+        return _same_route_cf_retry(_call_label)
 
     agent._content_filter_retries = 0
     agent._ephemeral_reasoning_off = False
@@ -1071,6 +1089,16 @@ def handle_content_policy_refusal(
         )
         active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
         return RefusalVerdict("break", None, active_system_prompt)
+
+    # Single-turn reasoning-only thought-filter abort with no distinct fallback available (#CF-105):
+    # retry once on the same route with thinking disabled instead of dying with zero retries.
+    if (
+        api_call_count == 1
+        and _is_reasoning_only_abort
+        and (max_retries or 0) > 0
+        and _prior_cf_retries < 1
+    ):
+        return _same_route_cf_retry("step-1 call #1 (reasoning-abort, no-fallback)")
 
     agent._flush_status_buffer()
     agent._emit_diagnostic_status("⚠️ The model declined to respond to this request (safety refusal).")
